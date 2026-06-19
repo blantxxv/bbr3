@@ -853,11 +853,76 @@ stage_after_reboot() {
   echo
 }
 
+
+print_manual_mode() {
+  print_banner
+
+  cat <<EOF
+${C_BOLD}Ручная установка${C_RESET}
+
+Вариант без автоматического скрипта: выполняй команды из README по разделам.
+
+README:
+  https://github.com/blantxxv/bbr3
+
+Основные этапы:
+  1. Базовые пакеты
+  2. Проверка CPU level
+  3. Установка XanMod kernel
+  4. Reboot
+  5. BBR / сетевой тюнинг
+  6. Docker
+  7. Remnawave Node
+  8. Финальная проверка
+
+Быстро открыть README на сервере можно так:
+
+  curl -fL https://raw.githubusercontent.com/blantxxv/bbr3/main/README.md | less
+
+EOF
+}
+
+main_menu() {
+  need_root
+  print_banner
+
+  echo "${C_BOLD}Выбери режим установки:${C_RESET}"
+  echo
+  echo "  ${C_GREEN}1${C_RESET}) Автоматическая установка"
+  echo "  ${C_CYAN}2${C_RESET}) Ручная установка: показать README/команды"
+  echo "  ${C_YELLOW}0${C_RESET}) Выход"
+  echo
+
+  read -rp "  Выбор [1/2/0]: " choice
+
+  case "${choice:-}" in
+    1)
+      stage_before_reboot
+      ;;
+    2)
+      print_manual_mode
+      ;;
+    0)
+      echo "Выход."
+      ;;
+    *)
+      die "Неверный выбор."
+      ;;
+  esac
+}
+
+
 case "${1:-}" in
   --continue)
     stage_after_reboot
     ;;
-  *)
+  --auto)
     stage_before_reboot
+    ;;
+  --manual)
+    print_manual_mode
+    ;;
+  *)
+    main_menu
     ;;
 esac
