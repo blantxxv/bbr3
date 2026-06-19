@@ -1,10 +1,109 @@
-# Настройка VPS: XanMod, BBR, сетевой тюнинг, Docker и Remnawave Node
+# Eclipse Node Manager
 
-> ⚠️ Перед установкой ядра убедись, что у VPS есть доступ к VNC/Rescue-консоли на случай, если сервер не загрузится после `reboot`.
->
-> Рекомендуется выполнять команды от `root`.
+## BBR3 + XanMod + Remnawave Node для VPS
+
+Автоматическая и ручная настройка VPS под Remnawave Node:
+
+- установка XanMod kernel;
+- включение BBR / BBR3;
+- сетевой тюнинг VPS;
+- Docker;
+- Remnawave Node;
+- speedtest;
+- базовая проверка системы.
+
+Канал проекта: [t.me/light_eclipse](https://t.me/light_eclipse)
 
 ---
+
+## Важно перед установкой
+
+> ⚠️ Перед установкой ядра убедись, что у VPS есть доступ к VNC/Rescue-консоли на случай, если сервер не загрузится после `reboot`.
+
+Рекомендуется выполнять команды от `root`.
+
+Проверить пользователя:
+
+```bash
+whoami
+```
+
+Если не `root`, перейди в root:
+
+```bash
+sudo -i
+```
+
+---
+
+# Быстрая установка
+
+Есть два варианта:
+
+1. **Автоматический** — скрипт сам скачивает, устанавливает, делает `reboot` и продолжает настройку после повторного SSH-входа.
+2. **Ручной** — выполняешь команды из README по шагам.
+
+---
+
+## Вариант 1. Автоматическая установка
+
+Скачать и запустить:
+
+```bash
+curl -fL -o bbr3-remnanode-auto.sh https://raw.githubusercontent.com/blantxxv/bbr3/main/bbr3-remnanode-auto.sh
+chmod +x bbr3-remnanode-auto.sh
+sudo ./bbr3-remnanode-auto.sh
+```
+
+В меню выбери:
+
+```text
+1) Автоматическая установка
+```
+
+Можно запустить автоматический режим сразу, без меню:
+
+```bash
+sudo ./bbr3-remnanode-auto.sh --auto
+```
+
+После установки XanMod kernel сервер уйдёт в `reboot`.
+
+После перезагрузки снова зайди на сервер по SSH под `root`. Скрипт автоматически продолжит установку и попросит `SECRET_KEY` от Remnawave Panel.
+
+Подробный лог установки:
+
+```bash
+/var/log/bbr3-remnanode-install.log
+```
+
+Смотреть лог в реальном времени:
+
+```bash
+tail -f /var/log/bbr3-remnanode-install.log
+```
+
+Запуск с подробным выводом всех команд:
+
+```bash
+DEBUG=1 sudo ./bbr3-remnanode-auto.sh --auto
+```
+
+---
+
+## Вариант 2. Ручная установка
+
+Можно открыть ручной режим через скрипт:
+
+```bash
+sudo ./bbr3-remnanode-auto.sh --manual
+```
+
+Или выполнять команды ниже по разделам.
+
+---
+
+# Ручная настройка VPS: XanMod, BBR, сетевой тюнинг, Docker и Remnawave Node
 
 ## 1. Базовые пакеты
 
@@ -25,7 +124,7 @@ LEVEL=$(awk 'BEGIN{while(!/flags/) if (getline<"/proc/cpuinfo"!=1) exit; level=1
 echo "$LEVEL"
 ```
 
-Даже если покажет `v4`, ставим `x64v3`, как раньше — стабильнее для VPS.
+Даже если покажет `v4`, ставим `x64v3`. Для VPS это обычно стабильнее.
 
 ---
 
@@ -37,19 +136,19 @@ cd /root/xanmod
 rm -f *.deb
 ```
 
-Скачиваем kernel image:
+Скачать kernel image:
 
 ```bash
 curl -fL -o image.deb "https://sourceforge.net/projects/xanmod/files/releases/main/6.19.14-xanmod1/6.19.14-x64v3-xanmod1/linux-image-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb/download"
 ```
 
-Скачиваем headers:
+Скачать headers:
 
 ```bash
 curl -fL -o headers.deb "https://sourceforge.net/projects/xanmod/files/releases/main/6.19.14-xanmod1/6.19.14-x64v3-xanmod1/linux-headers-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb/download"
 ```
 
-Проверяем пакеты:
+Проверить пакеты:
 
 ```bash
 file image.deb headers.deb
@@ -57,7 +156,7 @@ dpkg-deb -I image.deb | head
 dpkg-deb -I headers.deb | head
 ```
 
-Если пакеты нормальные:
+Установить:
 
 ```bash
 apt install -y ./image.deb ./headers.deb
@@ -66,7 +165,7 @@ grep -R "xanmod" /boot/grub/grub.cfg
 reboot
 ```
 
-После ребута:
+После reboot:
 
 ```bash
 uname -r
@@ -74,7 +173,7 @@ modprobe tcp_bbr
 cat /sys/module/tcp_bbr/version 2>/dev/null || modinfo tcp_bbr | grep -i version
 ```
 
-Ожидаемый результат:
+Ожидаемо:
 
 ```text
 6.19.14-x64v3-xanmod1
@@ -89,7 +188,7 @@ cat /sys/module/tcp_bbr/version 2>/dev/null || modinfo tcp_bbr | grep -i version
 modprobe tcp_bbr
 ```
 
-Создаём sysctl-конфиг:
+Создать sysctl-конфиг:
 
 ```bash
 cat >/etc/sysctl.d/99-net-tuning.conf <<'EOF_SYSCTL'
@@ -148,13 +247,13 @@ vm.min_free_kbytes = 131072
 EOF_SYSCTL
 ```
 
-Применяем:
+Применить:
 
 ```bash
 sysctl --system
 ```
 
-Проверяем:
+Проверить:
 
 ```bash
 sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_min_snd_mss
@@ -165,7 +264,7 @@ cat /sys/module/tcp_bbr/version
 
 ## 5. Отключение THP
 
-Создаём systemd-сервис:
+Создать systemd-сервис:
 
 ```bash
 cat >/etc/systemd/system/disable-thp.service <<'EOF_SERVICE'
@@ -182,20 +281,20 @@ WantedBy=multi-user.target
 EOF_SERVICE
 ```
 
-Включаем:
+Включить:
 
 ```bash
 systemctl daemon-reload
 systemctl enable --now disable-thp.service
 ```
 
-Проверяем:
+Проверить:
 
 ```bash
 cat /sys/kernel/mm/transparent_hugepage/enabled
 ```
 
-Ожидаемый результат:
+Ожидаемо:
 
 ```text
 always madvise [never]
@@ -205,7 +304,13 @@ always madvise [never]
 
 ## 6. RPS
 
-Создаём скрипт:
+Определить основной интерфейс:
+
+```bash
+ip route get 1.1.1.1
+```
+
+Создать скрипт:
 
 ```bash
 cat >/usr/local/sbin/enable-rps.sh <<'EOF_RPS'
@@ -213,36 +318,53 @@ cat >/usr/local/sbin/enable-rps.sh <<'EOF_RPS'
 set -e
 
 IFACE="${1:-eth0}"
-MASK="$(python3 - <<PY
+
+MASK="$(python3 - <<'PY'
 import os
-n=os.cpu_count() or 1
-print(hex((1 << n) - 1)[2:])
+
+n = os.cpu_count() or 1
+mask = (1 << n) - 1
+
+parts = []
+while mask:
+    parts.append(f"{mask & 0xffffffff:x}")
+    mask >>= 32
+
+print(",".join(parts) if parts else "1")
 PY
 )"
 
+echo "RPS iface: $IFACE"
 echo "RPS mask: $MASK"
 
-for q in /sys/class/net/$IFACE/queues/rx-*/rps_cpus; do
+if [[ ! -d "/sys/class/net/$IFACE" ]]; then
+  echo "Interface $IFACE not found"
+  exit 0
+fi
+
+for q in /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus; do
+  [[ -e "$q" ]] || continue
   echo "$MASK" > "$q" || true
 done
 
-for q in /sys/class/net/$IFACE/queues/rx-*/rps_flow_cnt; do
+for q in /sys/class/net/"$IFACE"/queues/rx-*/rps_flow_cnt; do
+  [[ -e "$q" ]] || continue
   echo 32768 > "$q" || true
 done
 
 echo 32768 > /proc/sys/net/core/rps_sock_flow_entries || true
 
-cat /sys/class/net/$IFACE/queues/rx-*/rps_cpus || true
+cat /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus 2>/dev/null || true
 EOF_RPS
 ```
 
-Делаем скрипт исполняемым:
+Сделать исполняемым:
 
 ```bash
 chmod +x /usr/local/sbin/enable-rps.sh
 ```
 
-Создаём systemd-сервис:
+Создать systemd-сервис. В примере используется `eth0`; при необходимости замени на свой интерфейс.
 
 ```bash
 cat >/etc/systemd/system/na-rps-lite.service <<'EOF_SERVICE'
@@ -261,14 +383,14 @@ WantedBy=multi-user.target
 EOF_SERVICE
 ```
 
-Включаем:
+Включить:
 
 ```bash
 systemctl daemon-reload
 systemctl enable --now na-rps-lite.service
 ```
 
-Проверяем:
+Проверить:
 
 ```bash
 cat /sys/class/net/eth0/queues/rx-*/rps_cpus
@@ -278,15 +400,17 @@ cat /sys/class/net/eth0/queues/rx-*/rps_cpus
 
 ## 7. Docker
 
-Устанавливаем Docker:
+Установить Docker:
 
 ```bash
 curl -fsSL https://get.docker.com | sh
 ```
 
-Создаём конфиг Docker daemon:
+Создать конфиг Docker daemon:
 
 ```bash
+mkdir -p /etc/docker
+
 cat >/etc/docker/daemon.json <<'EOF_DOCKER'
 {
   "log-driver": "json-file",
@@ -311,18 +435,20 @@ cat >/etc/docker/daemon.json <<'EOF_DOCKER'
 EOF_DOCKER
 ```
 
-Перезапускаем Docker:
+Перезапустить Docker:
 
 ```bash
+systemctl enable docker
 systemctl restart docker
 docker version
+docker compose version
 ```
 
 ---
 
 ## 8. Закрытие 5355 / LLMNR
 
-Если используется `systemd-resolved`, отключаем LLMNR и MulticastDNS:
+Если используется `systemd-resolved`, отключить LLMNR и MulticastDNS:
 
 ```bash
 mkdir -p /etc/systemd/resolved.conf.d
@@ -334,13 +460,13 @@ MulticastDNS=no
 EOF_RESOLVED
 ```
 
-Перезапускаем `systemd-resolved`:
+Перезапустить `systemd-resolved`:
 
 ```bash
 systemctl restart systemd-resolved 2>/dev/null || true
 ```
 
-Проверяем:
+Проверить:
 
 ```bash
 ss -tulpen | grep 5355 || echo "5355 закрыт"
@@ -356,6 +482,7 @@ sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_min_s
 cat /sys/module/tcp_bbr/version
 cat /sys/kernel/mm/transparent_hugepage/enabled
 docker version
+docker compose version
 ss -tulpen
 ```
 
@@ -363,19 +490,19 @@ ss -tulpen
 
 ## 10. Тест скорости
 
-Смотрим retransmits до теста:
+Счётчики до теста:
 
 ```bash
 nstat -az TcpRetransSegs TcpOutSegs
 ```
 
-Запускаем speedtest:
+Запуск speedtest:
 
 ```bash
 bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)
 ```
 
-Смотрим retransmits после теста:
+Счётчики после теста:
 
 ```bash
 nstat -az TcpRetransSegs TcpOutSegs
@@ -383,7 +510,7 @@ nstat -az TcpRetransSegs TcpOutSegs
 
 ---
 
-## 11. Selfsteal заглушка
+## 11. Selfsteal
 
 ```bash
 bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh)
@@ -393,30 +520,41 @@ bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal
 
 ## 12. Добавление Remnawave Node
 
-Создаём директории:
+Создать директории:
 
 ```bash
 mkdir -p /opt/remnanode /var/log/remnanode
 cd /opt/remnanode
 ```
 
-Скачиваем базы правил:
+Скачать базы правил:
 
 ```bash
-wget -N https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
-wget -N https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+curl -fL -o geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+curl -fL -o geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
 ```
 
-Создаём файлы логов:
+Создать файлы логов:
 
 ```bash
 touch /var/log/remnanode/access.log /var/log/remnanode/error.log
 ```
 
-Создаём `docker-compose.yml`:
+Создать `.env`:
 
 ```bash
-cat > /opt/remnanode/docker-compose.yml <<'EOF_COMPOSE'
+cat >/opt/remnanode/.env <<'EOF_ENV'
+NODE_PORT=2222
+SECRET_KEY=СЕКРЕТ_С_ПАНЕЛИ
+EOF_ENV
+
+chmod 600 /opt/remnanode/.env
+```
+
+Создать `docker-compose.yml`:
+
+```bash
+cat >/opt/remnanode/docker-compose.yml <<'EOF_COMPOSE'
 name: remnanode
 
 services:
@@ -429,22 +567,22 @@ services:
     cap_add:
       - NET_ADMIN
     volumes:
-      - './geosite.dat:/usr/local/share/xray/geosite.dat'
-      - './geoip.dat:/usr/local/share/xray/geoip.dat'
-      - '/var/log/remnanode:/var/log/remnanode'
+      - ./geosite.dat:/usr/local/share/xray/geosite.dat:ro
+      - ./geoip.dat:/usr/local/share/xray/geoip.dat:ro
+      - /var/log/remnanode:/var/log/remnanode
     ulimits:
       nofile:
         soft: 1048576
         hard: 1048576
-    environment:
-      - NODE_PORT=2222
-      - SECRET_KEY="СЕКРЕТ_С_ПАНЕЛИ"
+    env_file:
+      - .env
 EOF_COMPOSE
 ```
 
-Запускаем ноду:
+Запустить ноду:
 
 ```bash
+cd /opt/remnanode
 docker compose up -d
 ```
 
@@ -459,7 +597,7 @@ docker compose logs --tail=100
 ss -tulpen | grep 2222
 ```
 
-Если нужно смотреть логи в реальном времени:
+Логи в реальном времени:
 
 ```bash
 cd /opt/remnanode
@@ -470,7 +608,7 @@ docker compose logs -f --tail=100
 
 ## Примечание по образу ноды
 
-Оставляем именно этот образ:
+Используется образ:
 
 ```yaml
 image: remnawave/node:latest
@@ -482,5 +620,44 @@ image: remnawave/node:latest
 image: ghcr.io/remnawave/nodelatest
 ```
 
-Такой вариант ранее отдавал ошибку registry `denied`.
-# bbr3
+Этот вариант ранее отдавал ошибку registry `denied`.
+
+---
+
+# Обслуживание
+
+## Проверить статус ноды
+
+```bash
+cd /opt/remnanode
+docker compose ps
+docker compose logs --tail=100
+```
+
+## Перезапустить ноду
+
+```bash
+cd /opt/remnanode
+docker compose restart
+```
+
+## Обновить образ ноды
+
+```bash
+cd /opt/remnanode
+docker compose pull
+docker compose up -d
+```
+
+## Посмотреть активные порты
+
+```bash
+ss -tulpen
+```
+
+## Проверить BBR
+
+```bash
+sysctl net.ipv4.tcp_congestion_control
+cat /sys/module/tcp_bbr/version 2>/dev/null || true
+```
