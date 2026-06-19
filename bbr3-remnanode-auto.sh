@@ -58,10 +58,12 @@ print_banner() {
 
   cat <<EOF
 ${C_CYAN}${C_BOLD}
-╔══════════════════════════════════════════════════════════════╗
-║                  BBR3 + Remnawave Node Setup                ║
-║              XanMod Kernel · Network Tuning · Docker         ║
-╚══════════════════════════════════════════════════════════════╝
+┌──────────────────────────────────────────────────────────────┐
+│                    Eclipse Node Manager                      │
+│                  BBR3 + Remnawave Node Setup                 │
+│              XanMod Kernel · Network Tuning · Docker         │
+│                    Channel: t.me/light_eclipse               │
+└──────────────────────────────────────────────────────────────┘
 ${C_RESET}
 ${C_DIM}Log file: $LOG_FILE${C_RESET}
 
@@ -208,6 +210,37 @@ run_shell() {
 
   fail "$msg"
   log_line "FAIL: $msg rc=$rc"
+  show_last_log
+  return "$rc"
+}
+
+
+run_shell_live() {
+  local msg="$1"
+  local cmd="$2"
+
+  mkdir -p "$(dirname "$LOG_FILE")"
+  log_line "START LIVE: $msg"
+  log_line "SHELL LIVE: $cmd"
+
+  echo "${C_CYAN}  [..]${C_RESET} $msg"
+  echo "${C_DIM}  ────────────────────────────────────────────────────────────${C_RESET}"
+
+  set +e
+  bash -lc "$cmd" 2>&1 | tee -a "$LOG_FILE"
+  local rc="${PIPESTATUS[0]}"
+  set -e
+
+  echo "${C_DIM}  ────────────────────────────────────────────────────────────${C_RESET}"
+
+  if [[ "$rc" -eq 0 ]]; then
+    ok "$msg"
+    log_line "OK LIVE: $msg"
+    return 0
+  fi
+
+  fail "$msg"
+  log_line "FAIL LIVE: $msg rc=$rc"
   show_last_log
   return "$rc"
 }
@@ -645,9 +678,16 @@ optional_speedtest() {
 
   case "${ans,,}" in
     y|yes|д|да)
-      nstat -az TcpRetransSegs TcpOutSegs >> "$LOG_FILE" 2>&1 || true
-      run_shell "Запускаю iperf3 speedtest" "bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)"
-      nstat -az TcpRetransSegs TcpOutSegs >> "$LOG_FILE" 2>&1 || true
+      echo
+      echo "${C_DIM}  TCP counters before:${C_RESET}"
+      nstat -az TcpRetransSegs TcpOutSegs 2>/dev/null | tee -a "$LOG_FILE" | sed 's/^/  /' || true
+
+      run_shell_live "Запускаю iperf3 speedtest" \
+        "bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)"
+
+      echo
+      echo "${C_DIM}  TCP counters after:${C_RESET}"
+      nstat -az TcpRetransSegs TcpOutSegs 2>/dev/null | tee -a "$LOG_FILE" | sed 's/^/  /' || true
       ;;
     *)
       ok "Speedtest пропущен"
@@ -663,7 +703,7 @@ optional_selfsteal() {
 
   case "${ans,,}" in
     y|yes|д|да)
-      run_shell "Запускаю selfsteal.sh" "bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh)"
+      run_shell_live "Запускаю selfsteal.sh" "bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh)"
       ;;
     *)
       ok "Selfsteal пропущен"
