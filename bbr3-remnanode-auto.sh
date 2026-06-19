@@ -322,12 +322,17 @@ save_self() {
 clean_bad_docker_apt_sources() {
   section "Проверка APT репозиториев"
 
-  local files f changed=0
+  local bad_files invalid_files backup_dir f changed=0 ts
+  ts="$(date +%s)"
+  backup_dir="/etc/apt/sources.list.d.disabled-by-eclipse"
 
-  files="$(grep -rl "download.docker.com/linux/ubuntu" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true)"
+  mkdir -p "$backup_dir"
 
-  if [[ -z "$files" ]]; then
-    ok "Битые Docker Ubuntu repos не найдены"
+  bad_files="$(grep -rl "download.docker.com/linux/ubuntu" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true)"
+  invalid_files="$(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*.disabled*" -o -name "*.bak*" -o -name "*.save*" \) 2>/dev/null || true)"
+
+  if [[ -z "$bad_files" && -z "$invalid_files" ]]; then
+    ok "Проблемные Docker/backup APT sources не найдены"
     return 0
   fi
 
@@ -335,20 +340,29 @@ clean_bad_docker_apt_sources() {
     [[ -n "$f" ]] || continue
 
     if [[ "$f" == "/etc/apt/sources.list" ]]; then
-      warn "Комментирую неправильные строки Docker Ubuntu repo в $f"
-      cp -a "$f" "$f.bak.$(date +%s)"
+      warn "Комментирую неправильные Docker Ubuntu строки в $f"
+      cp -a "$f" "$backup_dir/sources.list.bak.$ts"
       sed -i '/download\.docker\.com\/linux\/ubuntu/s/^/# disabled by Eclipse Node Manager: /' "$f"
       changed=1
       continue
     fi
 
-    warn "Отключаю неправильный Docker Ubuntu repo: $f"
-    mv "$f" "$f.disabled.$(date +%s)"
+    warn "Переношу неправильный Docker Ubuntu repo: $f"
+    mv -f "$f" "$backup_dir/$(basename "$f").$ts"
     changed=1
-  done <<< "$files"
+  done <<< "$bad_files"
+
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    [[ -e "$f" ]] || continue
+
+    warn "Убираю backup-файл из sources.list.d, чтобы apt не ругался: $f"
+    mv -f "$f" "$backup_dir/$(basename "$f").$ts"
+    changed=1
+  done <<< "$invalid_files"
 
   if [[ "$changed" -eq 1 ]]; then
-    ok "Неправильные Docker Ubuntu repos отключены"
+    ok "APT sources очищены"
   fi
 }
 
