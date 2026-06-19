@@ -15,9 +15,13 @@ XANMOD_BASE_URL="https://sourceforge.net/projects/xanmod/files/releases/main/6.1
 IMAGE_DEB_URL="$XANMOD_BASE_URL/linux-image-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb/download"
 HEADERS_DEB_URL="$XANMOD_BASE_URL/linux-headers-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb/download"
 
-REMNANODE_DIR="/opt/remnanode"
-REMNANODE_LOG_DIR="/var/log/remnanode"
-NODE_PORT="2222"
+DEFAULT_NODE_PORT="2222"
+REMNANODE_DIR=""
+REMNANODE_LOG_DIR=""
+NODE_PORT=""
+NODE_DISPLAY_NAME=""
+COMPOSE_PROJECT_NAME=""
+CONTAINER_NAME=""
 
 DEBUG="${DEBUG:-0}"
 
@@ -214,7 +218,6 @@ run_shell() {
   return "$rc"
 }
 
-
 run_shell_live() {
   local msg="$1"
   local cmd="$2"
@@ -250,29 +253,7 @@ need_root() {
 }
 
 save_self() {
-  mkdir -p "$(dirname "$SCRIPT_PATH")"
-
-  local src
-  src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
-
-  if [[ -n "$src" && -r "$src" && "$src" != "$SCRIPT_PATH" ]]; then
-    run_cmd "Сохраняю скрипт для продолжения после reboot" cp -- "$src" "$SCRIPT_PATH"
-    chmod 700 "$SCRIPT_PATH"
-    return 0
-  fi
-
-  if [[ "$src" == "$SCRIPT_PATH" && -x "$SCRIPT_PATH" ]]; then
-    return 0
-  fi
-
-  warn "Не удалось надёжно скопировать текущий файл. Пробую скачать свежий скрипт из GitHub."
-
-  run_cmd "Скачиваю свежий скрипт из GitHub" \
-    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
-    -o "$SCRIPT_PATH" \
-    "$SELF_DOWNLOAD_URL"
-
-  chmod 700 "$SCRIPT_PATH"
+  ensure_saved_script_is_latest
 }
 
 set_state() {
@@ -298,12 +279,54 @@ docker_compose() {
   fi
 }
 
+download_self_latest() {
+  local target="$1"
+  local tmp
+
+  mkdir -p "$(dirname "$target")"
+  tmp="$(mktemp "${target}.tmp.XXXXXX")"
+
+  curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    -H 'Cache-Control: no-cache' \
+    -H 'Pragma: no-cache' \
+    -o "$tmp" \
+    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)"
+
+  if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
+    rm -f "$tmp"
+    die "Скачанный скрипт не прошёл bash -n. Обновление отменено."
+  fi
+
+  mv -f "$tmp" "$target"
+  chmod 700 "$target"
+}
+
+ensure_saved_script_is_latest() {
+  local current_src=""
+  current_src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+
+  if run_cmd "Обновляю системную копию скрипта" download_self_latest "$SCRIPT_PATH"; then
+    return 0
+  fi
+
+  if [[ -n "$current_src" && -r "$current_src" && "$current_src" != "$SCRIPT_PATH" ]]; then
+    warn "GitHub недоступен. Сохраняю текущую локальную копию для продолжения после reboot."
+    run_cmd "Сохраняю локальную копию скрипта" cp -- "$current_src" "$SCRIPT_PATH"
+    chmod 700 "$SCRIPT_PATH"
+    return 0
+  fi
+
+  die "Не удалось подготовить актуальную системную копию скрипта."
+}
+
 install_base_packages() {
   section "1/12 · Базовые пакеты"
 
-  run_cmd "Обновляю APT index" apt update
+  run_cmd "Обновляю APT index" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update
 
-  run_cmd "Устанавливаю утилиты" apt install -y \
+  run_cmd "Устанавливаю утилиты" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
     curl wget gpg ca-certificates nano vim htop btop git unzip jq \
     dnsutils iperf3 mtr-tiny iproute2 net-tools iptables ipset conntrack \
     openssl python3 file
@@ -348,7 +371,7 @@ install_xanmod_kernel() {
 
   run_shell "Проверяю deb-пакеты" "file /root/xanmod/image.deb /root/xanmod/headers.deb && dpkg-deb -I /root/xanmod/image.deb >/dev/null && dpkg-deb -I /root/xanmod/headers.deb >/dev/null"
 
-  run_cmd "Устанавливаю XanMod kernel" apt install -y ./image.deb ./headers.deb
+  run_cmd "Устанавливаю XanMod kernel" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" ./image.deb ./headers.deb
   run_cmd "Обновляю GRUB" update-grub
 }
 
@@ -367,8 +390,24 @@ tty -s || { return 0 2>/dev/null || exit 0; }
 
 if [[ "\$EUID" -eq 0 ]] && [[ -f "$STATE_FILE" ]] && grep -qx 'need_post_reboot' "$STATE_FILE"; then
   echo
-  echo "BBR3/Remnawave install: найдено незавершённое продолжение после reboot."
-  echo "Запускаю продолжение..."
+  echo "Eclipse Node Manager: найдено незавершённое продолжение после reboot."
+  echo "Обновляю скрипт из GitHub перед продолжением..."
+
+  tmp="\$(mktemp "$SCRIPT_PATH.tmp.XXXXXX")"
+
+  if curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    -H 'Cache-Control: no-cache' \
+    -H 'Pragma: no-cache' \
+    -o "\$tmp" \
+    "$SELF_DOWNLOAD_URL?ts=\$(date +%s)" && bash -n "\$tmp"; then
+    mv -f "\$tmp" "$SCRIPT_PATH"
+    chmod 700 "$SCRIPT_PATH"
+    echo "Скрипт обновлён."
+  else
+    rm -f "\$tmp"
+    echo "Не удалось обновить скрипт. Продолжаю сохранённой копией."
+  fi
+
   "$SCRIPT_PATH" --continue
 fi
 EOF
@@ -711,8 +750,99 @@ optional_selfsteal() {
   esac
 }
 
+sanitize_node_name() {
+  local raw="$1"
+
+  raw="${raw:-Unknown}"
+  raw="$(echo "$raw" | tr -cd '[:alnum:] ._-' | sed -E 's/[[:space:]_]+/-/g; s/^-+//; s/-+$//')"
+
+  if [[ -z "$raw" ]]; then
+    raw="Unknown"
+  fi
+
+  echo "$raw"
+}
+
+sanitize_compose_name() {
+  local raw="$1"
+
+  raw="${raw:-remnanode}"
+  raw="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+
+  if [[ -z "$raw" ]]; then
+    raw="remnanode"
+  fi
+
+  echo "$raw"
+}
+
+detect_country_name() {
+  local country=""
+
+  country="$(curl -fsSL --connect-timeout 4 --max-time 8 https://ipapi.co/country_name/ 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+
+  if [[ -z "$country" || "$country" == "Undefined" || "$country" == "Reserved" ]]; then
+    country="$(curl -fsSL --connect-timeout 4 --max-time 8 https://ifconfig.co/country 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+  fi
+
+  if [[ -z "$country" ]]; then
+    country="Unknown"
+  fi
+
+  echo "$country"
+}
+
+ask_node_port() {
+  local input=""
+
+  while true; do
+    read -rp "  NODE_PORT [${DEFAULT_NODE_PORT}]: " input
+    input="${input:-$DEFAULT_NODE_PORT}"
+
+    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= 65535 )); then
+      NODE_PORT="$input"
+      ok "Порт ноды: $NODE_PORT"
+      return 0
+    fi
+
+    warn "Некорректный порт. Нужно число от 1 до 65535."
+  done
+}
+
+prepare_node_paths() {
+  local detected_country country_slug suffix base_dir compose_slug
+
+  detected_country="$(detect_country_name)"
+  country_slug="$(sanitize_node_name "$detected_country")"
+
+  base_dir="/opt/${country_slug}-Node"
+
+  if [[ -e "$base_dir" ]]; then
+    suffix="$(tr -dc 'a-z0-9' </dev/urandom | head -c 4 || true)"
+    suffix="${suffix:-$RANDOM}"
+    REMNANODE_DIR="${base_dir}-${suffix}"
+  else
+    REMNANODE_DIR="$base_dir"
+  fi
+
+  NODE_DISPLAY_NAME="$(basename "$REMNANODE_DIR")"
+  compose_slug="$(sanitize_compose_name "$NODE_DISPLAY_NAME")"
+
+  COMPOSE_PROJECT_NAME="$compose_slug"
+  CONTAINER_NAME="$compose_slug"
+  REMNANODE_LOG_DIR="$REMNANODE_DIR/logs"
+
+  ok "Страна сервера: $detected_country"
+  ok "Папка ноды: $REMNANODE_DIR"
+  ok "Папка логов: $REMNANODE_LOG_DIR"
+  ok "Контейнер: $CONTAINER_NAME"
+}
+
 setup_remnanode() {
   section "12/12 · Remnawave Node"
+
+  prepare_node_paths
+  ask_node_port
 
   echo
   echo "  Вставь SECRET_KEY из панели Remnawave."
@@ -745,12 +875,12 @@ EOF_ENV
   chmod 600 "$REMNANODE_DIR/.env"
 
   cat > "$REMNANODE_DIR/docker-compose.yml" <<EOF_COMPOSE
-name: remnanode
+name: $COMPOSE_PROJECT_NAME
 
 services:
   remnanode:
-    container_name: remnanode
-    hostname: remnanode
+    container_name: $CONTAINER_NAME
+    hostname: $CONTAINER_NAME
     image: remnawave/node:latest
     network_mode: host
     restart: always
@@ -759,7 +889,7 @@ services:
     volumes:
       - ./geosite.dat:/usr/local/share/xray/geosite.dat:ro
       - ./geoip.dat:/usr/local/share/xray/geoip.dat:ro
-      - $REMNANODE_LOG_DIR:/var/log/remnanode
+      - ./logs:/var/log/remnanode
     ulimits:
       nofile:
         soft: 1048576
@@ -853,7 +983,6 @@ stage_after_reboot() {
   echo
 }
 
-
 print_manual_mode() {
   print_banner
 
@@ -872,8 +1001,9 @@ README:
   4. Reboot
   5. BBR / сетевой тюнинг
   6. Docker
-  7. Remnawave Node
-  8. Финальная проверка
+  7. Remnawave Node в папке по стране сервера
+  8. Выбор порта и динамическое имя контейнера
+  9. Финальная проверка
 
 Быстро открыть README на сервере можно так:
 
@@ -910,7 +1040,6 @@ main_menu() {
       ;;
   esac
 }
-
 
 case "${1:-}" in
   --continue)
