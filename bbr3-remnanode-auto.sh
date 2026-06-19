@@ -60,7 +60,7 @@ trap cleanup_spinner EXIT
 print_banner() {
   clear 2>/dev/null || true
 
-  cat <<EOF
+  cat <<BANNER
 ${C_CYAN}${C_BOLD}
 ┌──────────────────────────────────────────────────────────────┐
 │                    Eclipse Node Manager                      │
@@ -71,7 +71,7 @@ ${C_CYAN}${C_BOLD}
 ${C_RESET}
 ${C_DIM}Log file: $LOG_FILE${C_RESET}
 
-EOF
+BANNER
 }
 
 section() {
@@ -252,10 +252,6 @@ need_root() {
   [[ "${EUID}" -eq 0 ]] || die "Запусти скрипт от root."
 }
 
-save_self() {
-  ensure_saved_script_is_latest
-}
-
 set_state() {
   mkdir -p "$STATE_DIR"
   echo "$1" > "$STATE_FILE"
@@ -319,8 +315,47 @@ ensure_saved_script_is_latest() {
   die "Не удалось подготовить актуальную системную копию скрипта."
 }
 
+save_self() {
+  ensure_saved_script_is_latest
+}
+
+clean_bad_docker_apt_sources() {
+  section "Проверка APT репозиториев"
+
+  local files f changed=0
+
+  files="$(grep -rl "download.docker.com/linux/ubuntu" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true)"
+
+  if [[ -z "$files" ]]; then
+    ok "Битые Docker Ubuntu repos не найдены"
+    return 0
+  fi
+
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+
+    if [[ "$f" == "/etc/apt/sources.list" ]]; then
+      warn "Комментирую неправильные строки Docker Ubuntu repo в $f"
+      cp -a "$f" "$f.bak.$(date +%s)"
+      sed -i '/download\.docker\.com\/linux\/ubuntu/s/^/# disabled by Eclipse Node Manager: /' "$f"
+      changed=1
+      continue
+    fi
+
+    warn "Отключаю неправильный Docker Ubuntu repo: $f"
+    mv "$f" "$f.disabled.$(date +%s)"
+    changed=1
+  done <<< "$files"
+
+  if [[ "$changed" -eq 1 ]]; then
+    ok "Неправильные Docker Ubuntu repos отключены"
+  fi
+}
+
 install_base_packages() {
   section "1/12 · Базовые пакеты"
+
+  clean_bad_docker_apt_sources
 
   run_cmd "Обновляю APT index" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update
 
@@ -378,7 +413,7 @@ install_xanmod_kernel() {
 install_profile_continue_hook() {
   section "Автопродолжение после reboot"
 
-  cat > "$PROFILE_HOOK" <<EOF
+  cat > "$PROFILE_HOOK" <<EOF_HOOK
 #!/usr/bin/env bash
 
 case "\$-" in
@@ -395,10 +430,10 @@ if [[ "\$EUID" -eq 0 ]] && [[ -f "$STATE_FILE" ]] && grep -qx 'need_post_reboot'
 
   tmp="\$(mktemp "$SCRIPT_PATH.tmp.XXXXXX")"
 
-  if curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
-    -H 'Cache-Control: no-cache' \
-    -H 'Pragma: no-cache' \
-    -o "\$tmp" \
+  if curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \\
+    -H 'Cache-Control: no-cache' \\
+    -H 'Pragma: no-cache' \\
+    -o "\$tmp" \\
     "$SELF_DOWNLOAD_URL?ts=\$(date +%s)" && bash -n "\$tmp"; then
     mv -f "\$tmp" "$SCRIPT_PATH"
     chmod 700 "$SCRIPT_PATH"
@@ -410,7 +445,7 @@ if [[ "\$EUID" -eq 0 ]] && [[ -f "$STATE_FILE" ]] && grep -qx 'need_post_reboot'
 
   "$SCRIPT_PATH" --continue
 fi
-EOF
+EOF_HOOK
 
   chmod 755 "$PROFILE_HOOK"
   ok "Hook создан: $PROFILE_HOOK"
@@ -986,7 +1021,7 @@ stage_after_reboot() {
 print_manual_mode() {
   print_banner
 
-  cat <<EOF
+  cat <<EOF_MANUAL
 ${C_BOLD}Ручная установка${C_RESET}
 
 Вариант без автоматического скрипта: выполняй команды из README по разделам.
@@ -1009,7 +1044,7 @@ README:
 
   curl -fL https://raw.githubusercontent.com/blantxxv/bbr3/main/README.md | less
 
-EOF
+EOF_MANUAL
 }
 
 main_menu() {
