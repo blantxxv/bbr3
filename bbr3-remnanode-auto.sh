@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.2.1"
+SCRIPT_VERSION="2.2.2"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -97,14 +97,14 @@ ok() {
 }
 
 warn() {
-  mkdir -p "$(dirname "$LOG_FILE")"
-  echo -e "[$(date '+%F %T')] [WARN] $*" >> "$LOG_FILE"
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  echo -e "[$(date '+%F %T')] [WARN] $*" >> "$LOG_FILE" 2>/dev/null || true
   echo "${C_YELLOW}  [WARN]${C_RESET} $*"
 }
 
 fail() {
-  mkdir -p "$(dirname "$LOG_FILE")"
-  echo -e "[$(date '+%F %T')] [ERROR] $*" >> "$LOG_FILE"
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  echo -e "[$(date '+%F %T')] [ERROR] $*" >> "$LOG_FILE" 2>/dev/null || true
   echo "${C_RED}  [FAIL]${C_RESET} $*"
 }
 
@@ -116,8 +116,8 @@ die() {
 }
 
 log_line() {
-  mkdir -p "$(dirname "$LOG_FILE")"
-  echo -e "[$(date '+%F %T')] $*" >> "$LOG_FILE"
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  echo -e "[$(date '+%F %T')] $*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 spinner() {
@@ -280,8 +280,24 @@ docker_compose() {
   elif command -v docker-compose >/dev/null 2>&1; then
     docker-compose "$@"
   else
-    die "Docker Compose не найден. Нужен docker compose plugin или docker-compose."
+    echo "Docker Compose не найден. Нужен docker compose plugin или docker-compose." >&2
+    return 127
   fi
+}
+
+docker_compose_version_safe() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    docker compose version 2>/dev/null | head -n 1
+    return 0
+  fi
+
+  if command -v docker-compose >/dev/null 2>&1; then
+    docker-compose version 2>/dev/null | head -n 1
+    return 0
+  fi
+
+  echo "Docker Compose не найден"
+  return 0
 }
 
 download_self_latest() {
@@ -289,13 +305,22 @@ download_self_latest() {
   local tmp
 
   mkdir -p "$(dirname "$target")"
+  cleanup_old_script_copies "$target" || true
   tmp="$(mktemp "${target}.tmp.XXXXXX")"
 
-  curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+  if ! curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
     -H 'Cache-Control: no-cache' \
     -H 'Pragma: no-cache' \
     -o "$tmp" \
-    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)"
+    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
 
   if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
     rm -f "$tmp"
@@ -310,19 +335,24 @@ ensure_saved_script_is_latest() {
   local current_src current_version current_hash remote_content remote_version remote_hash tmp
 
   current_src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
-
   mkdir -p "$(dirname "$SCRIPT_PATH")"
 
-  if [[ -n "$current_src" && -r "$current_src" ]]; then
+  # Сначала сохраняем именно текущий запущенный файл. Это защищает от отката,
+  # если GitHub/CDN ещё отдаёт старую версию.
+  if [[ -n "$current_src" && -f "$current_src" && -r "$current_src" ]]; then
+    cleanup_old_script_copies || true
     tmp="$(mktemp "${SCRIPT_PATH}.tmp.XXXXXX")"
-    cp -- "$current_src" "$tmp"
+
+    if ! cp -- "$current_src" "$tmp"; then
+      rm -f "$tmp"
+      die "Не удалось скопировать текущий скрипт в временный файл."
+    fi
 
     if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
       rm -f "$tmp"
       die "Текущий локальный скрипт не прошёл bash -n. Не сохраняю его в $SCRIPT_PATH."
     fi
 
-    cleanup_old_script_copies
     mv -f "$tmp" "$SCRIPT_PATH"
     chmod 700 "$SCRIPT_PATH"
     ok "Системная копия скрипта сохранена из текущего файла: $SCRIPT_PATH"
@@ -341,12 +371,19 @@ ensure_saved_script_is_latest() {
   current_version="$SCRIPT_VERSION"
   current_hash=""
   if [[ -s "$SCRIPT_PATH" ]]; then
-    current_hash="$(sha256sum "$SCRIPT_PATH" | awk '{print $1}')"
+    current_hash="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}' || true)"
   fi
 
   if [[ -n "$remote_version" ]] && version_gt "$remote_version" "$current_version"; then
+    cleanup_old_script_copies || true
     tmp="$(mktemp "${SCRIPT_PATH}.tmp.XXXXXX")"
     printf '%s\n' "$remote_content" > "$tmp"
+
+    if [[ ! -s "$tmp" ]]; then
+      rm -f "$tmp"
+      warn "Удалённый скрипт пустой. Оставляю текущую локальную копию."
+      return 0
+    fi
 
     if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
       rm -f "$tmp"
@@ -354,14 +391,13 @@ ensure_saved_script_is_latest() {
       return 0
     fi
 
-    cleanup_old_script_copies
     mv -f "$tmp" "$SCRIPT_PATH"
     chmod 700 "$SCRIPT_PATH"
     ok "Системная копия обновлена с GitHub до версии $remote_version"
     return 0
   fi
 
-  if [[ -n "$current_hash" && "$remote_hash" != "$current_hash" && "$remote_version" == "$current_version" ]]; then
+  if [[ -n "$current_hash" && -n "$remote_hash" && "$remote_hash" != "$current_hash" && "$remote_version" == "$current_version" ]]; then
     warn "На GitHub файл отличается при той же версии $current_version. Не перезаписываю локальную копию автоматически."
   fi
 
@@ -374,8 +410,9 @@ save_self() {
 
 # Возвращает успех (0), если версия $1 строго новее версии $2.
 version_gt() {
-  local a="$1" b="$2"
+  local a="${1:-}" b="${2:-}"
 
+  [[ -n "$a" && -n "$b" ]] || return 1
   [[ "$a" == "$b" ]] && return 1
 
   local lower
@@ -383,7 +420,6 @@ version_gt() {
 
   [[ "$lower" == "$b" ]]
 }
-
 fetch_remote_script() {
   curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 --retry-all-errors \
     -H 'Cache-Control: no-cache' \
@@ -397,8 +433,16 @@ extract_script_version() {
 
 # Подчищает старые/временные копии скрипта, чтобы не было конфликта версий.
 cleanup_old_script_copies() {
-  rm -f "${SCRIPT_PATH}".tmp.* 2>/dev/null || true
-  rm -f "${SCRIPT_PATH}".bak 2>/dev/null || true
+  local keep="${1:-}"
+  local f
+
+  rm -f "${SCRIPT_PATH}.bak" 2>/dev/null || true
+
+  for f in "${SCRIPT_PATH}".tmp.*; do
+    [[ -e "$f" ]] || continue
+    [[ -n "$keep" && "$f" == "$keep" ]] && continue
+    rm -f "$f" 2>/dev/null || true
+  done
 }
 
 current_script_path() {
@@ -432,15 +476,20 @@ update_self_and_restart() {
   local tmp
 
   mkdir -p "$(dirname "$SCRIPT_PATH")"
+  cleanup_old_script_copies || true
   tmp="$(mktemp "${SCRIPT_PATH}.tmp.XXXXXX")"
   printf '%s\n' "$remote_content" > "$tmp"
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    die "Скачанный скрипт пустой. Обновление отменено."
+  fi
 
   if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
     rm -f "$tmp"
     die "Скачанный скрипт не прошёл проверку синтаксиса (bash -n). Обновление отменено."
   fi
 
-  cleanup_old_script_copies
   mv -f "$tmp" "$SCRIPT_PATH"
   chmod 700 "$SCRIPT_PATH"
 
@@ -482,7 +531,7 @@ check_for_updates() {
   info "Локальный SHA256: $(short_hash "$local_hash")"
   info "GitHub SHA256: $(short_hash "$remote_hash")"
 
-  if [[ -n "$local_hash" && "$remote_hash" == "$local_hash" ]]; then
+  if [[ -n "$local_hash" && -n "$remote_hash" && "$remote_hash" == "$local_hash" ]]; then
     ok "Установлен актуальный файл скрипта."
     return 0
   fi
@@ -544,7 +593,7 @@ notify_if_update_available() {
     return 0
   fi
 
-  if [[ -n "$local_hash" && "$remote_version" == "$SCRIPT_VERSION" && "$remote_hash" != "$local_hash" ]]; then
+  if [[ -n "$local_hash" && -n "$remote_hash" && "$remote_version" == "$SCRIPT_VERSION" && "$remote_hash" != "$local_hash" ]]; then
     echo "${C_YELLOW}  На GitHub отличается файл той же версии $SCRIPT_VERSION. Пункт меню «5» — проверить обновления.${C_RESET}"
     echo
   fi
@@ -839,7 +888,7 @@ After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled; echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/transparent_hugepage/enabled ] && echo never > /sys/kernel/mm/transparent_hugepage/enabled || true; [ -w /sys/kernel/mm/transparent_hugepage/defrag ] && echo never > /sys/kernel/mm/transparent_hugepage/defrag || true'
 
 [Install]
 WantedBy=multi-user.target
@@ -968,10 +1017,14 @@ EOF_DOCKER
 
   local docker_v compose_v
   docker_v="$(docker --version 2>/dev/null || true)"
-  compose_v="$(docker_compose version 2>/dev/null | head -n 1 || true)"
+  compose_v="$(docker_compose_version_safe)"
 
   ok "${docker_v:-Docker установлен}"
-  ok "${compose_v:-Docker Compose доступен}"
+  if [[ "$compose_v" == "Docker Compose не найден" ]]; then
+    warn "$compose_v. Установка ноды потребует docker compose plugin или docker-compose."
+  else
+    ok "$compose_v"
+  fi
 }
 
 disable_llmnr() {
@@ -997,17 +1050,27 @@ EOF_RESOLVED
 run_final_test() {
   section "9/12 · Проверка системы"
 
-  local kernel cc qdisc
-  kernel="$(uname -r)"
+  local kernel cc qdisc bbr_version thp_state docker_v compose_v
+  kernel="$(uname -r 2>/dev/null || echo unknown)"
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
   qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+  bbr_version="$(cat /sys/module/tcp_bbr/version 2>/dev/null || true)"
+  thp_state="$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true)"
+
+  if command -v docker >/dev/null 2>&1; then
+    docker_v="$(docker --version 2>/dev/null || echo 'Docker установлен, но не отвечает')"
+  else
+    docker_v="Docker не установлен"
+  fi
+
+  compose_v="$(docker_compose_version_safe)"
 
   {
     echo "uname -r:"
-    uname -r
+    uname -r 2>/dev/null || true
 
     echo
-    sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_min_snd_mss || true
+    sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_min_snd_mss 2>/dev/null || true
 
     echo
     echo "BBR version:"
@@ -1019,20 +1082,47 @@ run_final_test() {
 
     echo
     echo "Docker:"
-    docker version || true
+    if command -v docker >/dev/null 2>&1; then
+      docker version 2>/dev/null || true
+    else
+      echo "Docker не установлен"
+    fi
 
     echo
     echo "Docker Compose:"
-    docker_compose version || true
+    docker_compose_version_safe || true
 
     echo
     echo "Listening sockets:"
-    ss -tulpen || true
-  } >> "$LOG_FILE" 2>&1
+    if command -v ss >/dev/null 2>&1; then
+      ss -tulpen 2>/dev/null || true
+    else
+      echo "ss не найден"
+    fi
+  } >> "$LOG_FILE" 2>&1 || true
 
   ok "Kernel: $kernel"
   ok "TCP CC: ${cc:-unknown}"
   ok "Qdisc: ${qdisc:-unknown}"
+  ok "BBR module: ${bbr_version:-unknown}"
+
+  if [[ "$docker_v" == "Docker не установлен" ]]; then
+    warn "$docker_v"
+  else
+    ok "$docker_v"
+  fi
+
+  if [[ "$compose_v" == "Docker Compose не найден" ]]; then
+    warn "$compose_v"
+  else
+    ok "$compose_v"
+  fi
+
+  if [[ -n "$thp_state" ]]; then
+    ok "THP: $thp_state"
+  else
+    warn "THP status недоступен на этом ядре/окружении"
+  fi
 }
 
 optional_speedtest() {
@@ -1141,15 +1231,19 @@ detect_country_name() {
 
 ask_node_port() {
   local input=""
+  local port_dec=""
 
   while true; do
     read -rp "  NODE_PORT [${DEFAULT_NODE_PORT}]: " input
     input="${input:-$DEFAULT_NODE_PORT}"
 
-    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= 65535 )); then
-      NODE_PORT="$input"
-      ok "Порт ноды: $NODE_PORT"
-      return 0
+    if [[ "$input" =~ ^[0-9]{1,5}$ ]]; then
+      port_dec="$((10#$input))"
+      if (( port_dec >= 1 && port_dec <= 65535 )); then
+        NODE_PORT="$port_dec"
+        ok "Порт ноды: $NODE_PORT"
+        return 0
+      fi
     fi
 
     warn "Некорректный порт. Нужно число от 1 до 65535."
@@ -1250,7 +1344,7 @@ EOF_COMPOSE
   docker_compose ps >> "$LOG_FILE" 2>&1 || true
   docker_compose logs --tail=100 >> "$LOG_FILE" 2>&1 || true
 
-  if ss -tulpen | grep -q ":$NODE_PORT"; then
+  if command -v ss >/dev/null 2>&1 && ss -tulpen 2>/dev/null | awk -v port=":$NODE_PORT" '$0 ~ port {found=1} END{exit found ? 0 : 1}'; then
     ok "Порт $NODE_PORT слушается"
   else
     warn "Порт $NODE_PORT не слушается. Проверь: cd $REMNANODE_DIR && docker compose logs -f --tail=100"
