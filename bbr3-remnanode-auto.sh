@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.1.1"
+SCRIPT_VERSION="2.2.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -12,7 +12,7 @@ LOG_FILE="/var/log/bbr3-remnanode-install.log"
 SCRIPT_PATH="/usr/local/sbin/bbr3-remnanode-install.sh"
 PROFILE_HOOK="/etc/profile.d/bbr3-remnanode-continue.sh"
 
-SELF_DOWNLOAD_URL="https://raw.githubusercontent.com/blantxxv/bbr3/main/bbr3-remnanode-auto.sh"
+SELF_DOWNLOAD_URL="https://raw.githubusercontent.com/blantxxv/bbr3/refs/heads/main/bbr3-remnanode-auto.sh"
 WARP_INSTALL_URL="https://raw.githubusercontent.com/blantxxv/warp/main/warp-auto-install.sh"
 
 CPU_LEVEL=""
@@ -307,21 +307,65 @@ download_self_latest() {
 }
 
 ensure_saved_script_is_latest() {
-  local current_src=""
+  local current_src current_version current_hash remote_content remote_version remote_hash tmp
+
   current_src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
 
-  if run_cmd "Обновляю системную копию скрипта" download_self_latest "$SCRIPT_PATH"; then
-    return 0
-  fi
+  mkdir -p "$(dirname "$SCRIPT_PATH")"
 
-  if [[ -n "$current_src" && -r "$current_src" && "$current_src" != "$SCRIPT_PATH" ]]; then
-    warn "GitHub недоступен. Сохраняю текущую локальную копию для продолжения после reboot."
-    run_cmd "Сохраняю локальную копию скрипта" cp -- "$current_src" "$SCRIPT_PATH"
+  if [[ -n "$current_src" && -r "$current_src" ]]; then
+    tmp="$(mktemp "${SCRIPT_PATH}.tmp.XXXXXX")"
+    cp -- "$current_src" "$tmp"
+
+    if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
+      rm -f "$tmp"
+      die "Текущий локальный скрипт не прошёл bash -n. Не сохраняю его в $SCRIPT_PATH."
+    fi
+
+    cleanup_old_script_copies
+    mv -f "$tmp" "$SCRIPT_PATH"
     chmod 700 "$SCRIPT_PATH"
+    ok "Системная копия скрипта сохранена из текущего файла: $SCRIPT_PATH"
+  fi
+
+  remote_content="$(fetch_remote_script)"
+  [[ -n "$remote_content" ]] || {
+    warn "GitHub недоступен. Для продолжения после reboot сохранена текущая локальная копия."
+    [[ -s "$SCRIPT_PATH" ]] || die "Нет локальной копии скрипта для продолжения после reboot."
+    return 0
+  }
+
+  remote_version="$(extract_script_version "$remote_content")"
+  remote_hash="$(sha256_text "$remote_content")"
+
+  current_version="$SCRIPT_VERSION"
+  current_hash=""
+  if [[ -s "$SCRIPT_PATH" ]]; then
+    current_hash="$(sha256sum "$SCRIPT_PATH" | awk '{print $1}')"
+  fi
+
+  if [[ -n "$remote_version" ]] && version_gt "$remote_version" "$current_version"; then
+    tmp="$(mktemp "${SCRIPT_PATH}.tmp.XXXXXX")"
+    printf '%s\n' "$remote_content" > "$tmp"
+
+    if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
+      rm -f "$tmp"
+      warn "Удалённый скрипт новее, но не прошёл bash -n. Оставляю текущую локальную копию."
+      return 0
+    fi
+
+    cleanup_old_script_copies
+    mv -f "$tmp" "$SCRIPT_PATH"
+    chmod 700 "$SCRIPT_PATH"
+    ok "Системная копия обновлена с GitHub до версии $remote_version"
     return 0
   fi
 
-  die "Не удалось подготовить актуальную системную копию скрипта."
+  if [[ -n "$current_hash" && "$remote_hash" != "$current_hash" && "$remote_version" == "$current_version" ]]; then
+    warn "На GitHub файл отличается при той же версии $current_version. Не перезаписываю локальную копию автоматически."
+  fi
+
+  [[ -s "$SCRIPT_PATH" ]] || die "Не удалось подготовить системную копию скрипта."
 }
 
 save_self() {
@@ -357,6 +401,32 @@ cleanup_old_script_copies() {
   rm -f "${SCRIPT_PATH}".bak 2>/dev/null || true
 }
 
+current_script_path() {
+  local src
+  src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+
+  if [[ -n "$src" && -r "$src" ]]; then
+    echo "$src"
+    return 0
+  fi
+
+  if [[ -r "$SCRIPT_PATH" ]]; then
+    echo "$SCRIPT_PATH"
+    return 0
+  fi
+
+  return 1
+}
+
+sha256_text() {
+  printf '%s\n' "$1" | sha256sum | awk '{print $1}'
+}
+
+short_hash() {
+  local h="${1:-}"
+  [[ -n "$h" ]] && echo "${h:0:12}" || echo "unknown"
+}
+
 update_self_and_restart() {
   local remote_content="$1"
   local tmp
@@ -382,7 +452,8 @@ update_self_and_restart() {
 check_for_updates() {
   section "Проверка обновлений"
 
-  local remote_content remote_version
+  local remote_content remote_version remote_hash current_src local_hash ans same_version
+
   remote_content="$(fetch_remote_script)"
 
   if [[ -z "$remote_content" ]]; then
@@ -397,38 +468,61 @@ check_for_updates() {
     return 1
   fi
 
+  remote_hash="$(sha256_text "$remote_content")"
+  current_src="$(current_script_path || true)"
+  local_hash=""
+
+  if [[ -n "$current_src" && -r "$current_src" ]]; then
+    local_hash="$(sha256sum "$current_src" | awk '{print $1}')"
+  fi
+
   ok "Текущая версия: $SCRIPT_VERSION"
   ok "Версия на GitHub: $remote_version"
+  info "Локальный файл: ${current_src:-unknown}"
+  info "Локальный SHA256: $(short_hash "$local_hash")"
+  info "GitHub SHA256: $(short_hash "$remote_hash")"
 
-  if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
-    ok "Установлена последняя версия скрипта."
+  if [[ -n "$local_hash" && "$remote_hash" == "$local_hash" ]]; then
+    ok "Установлен актуальный файл скрипта."
     return 0
   fi
+
+  same_version=0
+  [[ "$remote_version" == "$SCRIPT_VERSION" ]] && same_version=1
 
   if version_gt "$remote_version" "$SCRIPT_VERSION"; then
     echo
     warn "Доступна новая версия скрипта: $remote_version (у тебя $SCRIPT_VERSION)."
-    read -rp "  Установить обновление сейчас? [y/N]: " ans
-
-    case "${ans,,}" in
-      y|yes|д|да)
-        update_self_and_restart "$remote_content"
-        ;;
-      *)
-        ok "Обновление отложено."
-        ;;
-    esac
+  elif [[ "$same_version" -eq 1 ]]; then
+    echo
+    warn "На GitHub файл отличается от локального, хотя версия одинаковая: $SCRIPT_VERSION."
+    warn "Такое бывает, если изменили код, но не подняли SCRIPT_VERSION."
   else
-    ok "Локальная версия не старше удалённой ($SCRIPT_VERSION vs $remote_version)."
+    echo
+    warn "Версия на GitHub не новее локальной ($remote_version vs $SCRIPT_VERSION). Автообновление не рекомендовано."
+    warn "Если ты точно хочешь заменить локальный файл удалённым — подтверди вручную."
   fi
+
+  read -rp "  Установить файл с GitHub сейчас? [y/N]: " ans
+
+  case "${ans,,}" in
+    y|yes|д|да)
+      update_self_and_restart "$remote_content"
+      ;;
+    *)
+      ok "Обновление отложено."
+      ;;
+  esac
 }
 
 # Тихая проверка обновлений для главного меню: не блокирует, не спрашивает,
-# просто подсказывает, что есть новая версия (пункт меню "4").
+# просто подсказывает, что есть новая версия или отличается файл (пункт меню "5").
 notify_if_update_available() {
-  local remote_content remote_version
+  local remote_content remote_version remote_hash current_src local_hash
 
-  remote_content="$(curl -fsSL --connect-timeout 3 --max-time 6 \
+  remote_content="$(curl -fsSL --connect-timeout 2 --max-time 4 \
+    -H 'Cache-Control: no-cache' \
+    -H 'Pragma: no-cache' \
     "${SELF_DOWNLOAD_URL}?ts=$(date +%s)" 2>/dev/null || true)"
 
   [[ -n "$remote_content" ]] || return 0
@@ -436,11 +530,26 @@ notify_if_update_available() {
   remote_version="$(extract_script_version "$remote_content")"
   [[ -n "$remote_version" ]] || return 0
 
+  remote_hash="$(sha256_text "$remote_content")"
+  current_src="$(current_script_path || true)"
+  local_hash=""
+
+  if [[ -n "$current_src" && -r "$current_src" ]]; then
+    local_hash="$(sha256sum "$current_src" | awk '{print $1}')"
+  fi
+
   if version_gt "$remote_version" "$SCRIPT_VERSION"; then
-    echo "${C_YELLOW}  Доступна новая версия: $remote_version (у тебя $SCRIPT_VERSION). Пункт меню «4» — обновить.${C_RESET}"
+    echo "${C_YELLOW}  Доступна новая версия: $remote_version (у тебя $SCRIPT_VERSION). Пункт меню «5» — обновить.${C_RESET}"
+    echo
+    return 0
+  fi
+
+  if [[ -n "$local_hash" && "$remote_version" == "$SCRIPT_VERSION" && "$remote_hash" != "$local_hash" ]]; then
+    echo "${C_YELLOW}  На GitHub отличается файл той же версии $SCRIPT_VERSION. Пункт меню «5» — проверить обновления.${C_RESET}"
     echo
   fi
 }
+
 
 clean_bad_docker_apt_sources() {
   section "Проверка APT репозиториев"
@@ -577,21 +686,43 @@ esac
 
 tty -s || { return 0 2>/dev/null || exit 0; }
 
+version_gt_hook() {
+  local a="\$1" b="\$2" lower
+  [[ "\$a" == "\$b" ]] && return 1
+  lower="\$(printf '%s\n%s\n' "\$a" "\$b" | sort -V | head -n 1)"
+  [[ "\$lower" == "\$b" ]]
+}
+
+extract_script_version_hook() {
+  grep -m1 '^SCRIPT_VERSION=' "\$1" 2>/dev/null | sed -E 's/^SCRIPT_VERSION="([^"]*)".*/\1/'
+}
+
 if [[ "\$EUID" -eq 0 ]] && [[ -f "$STATE_FILE" ]] && grep -qx 'need_post_reboot' "$STATE_FILE"; then
   echo
   echo "Eclipse Node Manager: найдено незавершённое продолжение после reboot."
-  echo "Обновляю скрипт из GitHub перед продолжением..."
+  echo "Проверяю обновление скрипта перед продолжением..."
 
   tmp="\$(mktemp "$SCRIPT_PATH.tmp.XXXXXX")"
 
-  if curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \\
-    -H 'Cache-Control: no-cache' \\
-    -H 'Pragma: no-cache' \\
-    -o "\$tmp" \\
+  if curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    -H 'Cache-Control: no-cache' \
+    -H 'Pragma: no-cache' \
+    -o "\$tmp" \
     "$SELF_DOWNLOAD_URL?ts=\$(date +%s)" && bash -n "\$tmp"; then
-    mv -f "\$tmp" "$SCRIPT_PATH"
-    chmod 700 "$SCRIPT_PATH"
-    echo "Скрипт обновлён."
+
+    remote_version="\$(extract_script_version_hook "\$tmp")"
+    local_version="\$(extract_script_version_hook "$SCRIPT_PATH")"
+    remote_hash="\$(sha256sum "\$tmp" | awk '{print \$1}')"
+    local_hash="\$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print \$1}')"
+
+    if [[ -n "\$remote_version" ]] && { version_gt_hook "\$remote_version" "\${local_version:-0.0.0}" || [[ "\$remote_version" == "\$local_version" && "\$remote_hash" != "\$local_hash" ]]; }; then
+      mv -f "\$tmp" "$SCRIPT_PATH"
+      chmod 700 "$SCRIPT_PATH"
+      echo "Скрипт обновлён до версии \$remote_version."
+    else
+      rm -f "\$tmp"
+      echo "Сохранённая локальная копия не старее GitHub. Продолжаю ей."
+    fi
   else
     rm -f "\$tmp"
     echo "Не удалось обновить скрипт. Продолжаю сохранённой копией."
@@ -604,6 +735,7 @@ EOF_HOOK
   chmod 755 "$PROFILE_HOOK"
   ok "Hook создан: $PROFILE_HOOK"
 }
+
 
 maybe_reboot() {
   if [[ "$KERNEL_INSTALL_SKIPPED" -eq 1 ]]; then
@@ -1227,64 +1359,112 @@ README:
 EOF_MANUAL
 }
 
+pause_menu() {
+  echo
+  read -rp "  Нажми Enter для возврата в меню..." _ || true
+}
+
 main_menu() {
   need_root
-  print_banner
 
-  notify_if_update_available
+  while true; do
+    print_banner
+    notify_if_update_available
 
-  echo "${C_BOLD}Выбери режим:${C_RESET}"
-  echo
-  echo "  ${C_GREEN}1${C_RESET}) Автоматическая установка"
-  echo "  ${C_CYAN}2${C_RESET}) Ручная установка: показать README/команды"
-  echo "  ${C_CYAN}3${C_RESET}) Настройка WARP"
-  echo "  ${C_CYAN}4${C_RESET}) Проверить обновления"
-  echo "  ${C_YELLOW}5${C_RESET}) Выход"
-  echo
+    echo "${C_BOLD}Главное меню:${C_RESET}"
+    echo
+    echo "  ${C_GREEN}1${C_RESET}) Автоматическая установка BBR3 + Remnawave Node"
+    echo "  ${C_CYAN}2${C_RESET}) Продолжить установку после reboot"
+    echo "  ${C_CYAN}3${C_RESET}) Ручная установка: показать README/команды"
+    echo "  ${C_CYAN}4${C_RESET}) Настройка WARP"
+    echo "  ${C_CYAN}5${C_RESET}) Проверить/установить обновления скрипта"
+    echo "  ${C_CYAN}6${C_RESET}) Проверить систему"
+    echo "  ${C_YELLOW}0${C_RESET}) Выход"
+    echo
 
-  read -rp "  Выбор [1/2/3/4/5]: " choice
+    read -rp "  Выбор [1/2/3/4/5/6/0]: " choice || choice="0"
 
-  case "${choice:-}" in
-    1)
-      stage_before_reboot
-      ;;
-    2)
-      print_manual_mode
-      ;;
-    3)
-      run_warp_setup
-      ;;
-    4)
-      check_for_updates
-      ;;
-    5)
-      echo "Выход."
-      ;;
-    *)
-      die "Неверный выбор."
-      ;;
-  esac
+    case "${choice:-}" in
+      1)
+        stage_before_reboot
+        pause_menu
+        ;;
+      2)
+        stage_after_reboot
+        pause_menu
+        ;;
+      3)
+        print_manual_mode
+        pause_menu
+        ;;
+      4)
+        run_warp_setup
+        pause_menu
+        ;;
+      5)
+        check_for_updates
+        pause_menu
+        ;;
+      6)
+        run_final_test
+        pause_menu
+        ;;
+      0|q|Q|exit|quit)
+        echo "Выход."
+        exit 0
+        ;;
+      *)
+        warn "Неверный выбор: ${choice:-empty}"
+        sleep 1
+        ;;
+    esac
+  done
 }
 
 case "${1:-}" in
-  --continue)
+  --continue|continue)
     stage_after_reboot
     ;;
-  --auto)
+  --auto|--install|install)
     stage_before_reboot
     ;;
-  --manual)
+  --manual|manual)
     print_manual_mode
     ;;
-  --warp)
+  --warp|warp)
     need_root
     run_warp_setup
     ;;
-  --check-update)
+  --check-update|--update|update)
     need_root
     check_for_updates
     ;;
-  *)
+  --test|test)
+    need_root
+    run_final_test
+    ;;
+  --menu|menu|"")
     main_menu
+    ;;
+  --help|-h|help)
+    print_banner
+    cat <<EOF_HELP
+Использование:
+  $0                 открыть главное меню
+  $0 --menu          открыть главное меню
+  $0 --auto          автоматическая установка
+  $0 --install       алиас для --auto
+  $0 --continue      продолжить после reboot
+  $0 --manual        показать ручной режим
+  $0 --warp          запустить настройку WARP
+  $0 --check-update  проверить обновления
+  $0 --test          проверить систему
+EOF_HELP
+    ;;
+  *)
+    print_banner
+    warn "Неизвестный аргумент: ${1:-}"
+    echo "  Используй --help для списка команд."
+    exit 1
     ;;
 esac
