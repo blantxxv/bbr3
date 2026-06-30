@@ -2,6 +2,10 @@
 
 set -Eeuo pipefail
 
+ORIGINAL_ARGS=("$@")
+
+SCRIPT_VERSION="2.1.0"
+
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
 LOG_FILE="/var/log/bbr3-remnanode-install.log"
@@ -9,6 +13,10 @@ SCRIPT_PATH="/usr/local/sbin/bbr3-remnanode-install.sh"
 PROFILE_HOOK="/etc/profile.d/bbr3-remnanode-continue.sh"
 
 SELF_DOWNLOAD_URL="https://raw.githubusercontent.com/blantxxv/bbr3/main/bbr3-remnanode-auto.sh"
+WARP_INSTALL_URL="https://raw.githubusercontent.com/blantxxv/warp/main/warp-auto-install.sh"
+
+CPU_LEVEL=""
+KERNEL_INSTALL_SKIPPED=0
 
 KERNEL_VER="6.19.14-x64v3-xanmod1"
 XANMOD_BASE_URL="https://sourceforge.net/projects/xanmod/files/releases/main/6.19.14-xanmod1/6.19.14-x64v3-xanmod1"
@@ -69,6 +77,7 @@ ${C_CYAN}${C_BOLD}
 │                    Channel: t.me/light_eclipse               │
 └──────────────────────────────────────────────────────────────┘
 ${C_RESET}
+${C_DIM}Версия скрипта: $SCRIPT_VERSION${C_RESET}
 ${C_DIM}Log file: $LOG_FILE${C_RESET}
 
 BANNER
@@ -319,6 +328,120 @@ save_self() {
   ensure_saved_script_is_latest
 }
 
+# Возвращает успех (0), если версия $1 строго новее версии $2.
+version_gt() {
+  local a="$1" b="$2"
+
+  [[ "$a" == "$b" ]] && return 1
+
+  local lower
+  lower="$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n 1)"
+
+  [[ "$lower" == "$b" ]]
+}
+
+fetch_remote_script() {
+  curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 --retry-all-errors \
+    -H 'Cache-Control: no-cache' \
+    -H 'Pragma: no-cache' \
+    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)" 2>/dev/null || true
+}
+
+extract_script_version() {
+  echo "$1" | grep -m1 '^SCRIPT_VERSION=' | sed -E 's/^SCRIPT_VERSION="([^"]*)".*/\1/'
+}
+
+# Подчищает старые/временные копии скрипта, чтобы не было конфликта версий.
+cleanup_old_script_copies() {
+  rm -f "${SCRIPT_PATH}".tmp.* 2>/dev/null || true
+  rm -f "${SCRIPT_PATH}".bak 2>/dev/null || true
+}
+
+update_self_and_restart() {
+  local remote_content="$1"
+  local tmp
+
+  mkdir -p "$(dirname "$SCRIPT_PATH")"
+  tmp="$(mktemp "${SCRIPT_PATH}.tmp.XXXXXX")"
+  printf '%s\n' "$remote_content" > "$tmp"
+
+  if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
+    rm -f "$tmp"
+    die "Скачанный скрипт не прошёл проверку синтаксиса (bash -n). Обновление отменено."
+  fi
+
+  cleanup_old_script_copies
+  mv -f "$tmp" "$SCRIPT_PATH"
+  chmod 700 "$SCRIPT_PATH"
+
+  ok "Скрипт обновлён. Перезапускаю новую версию..."
+  log_line "Self-update: restarting via $SCRIPT_PATH ${ORIGINAL_ARGS[*]:-}"
+  exec "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
+}
+
+check_for_updates() {
+  section "Проверка обновлений"
+
+  local remote_content remote_version
+  remote_content="$(fetch_remote_script)"
+
+  if [[ -z "$remote_content" ]]; then
+    warn "Не удалось получить актуальную версию скрипта с GitHub. Проверь сеть и попробуй позже."
+    return 1
+  fi
+
+  remote_version="$(extract_script_version "$remote_content")"
+
+  if [[ -z "$remote_version" ]]; then
+    warn "Не удалось определить версию в скачанном скрипте."
+    return 1
+  fi
+
+  ok "Текущая версия: $SCRIPT_VERSION"
+  ok "Версия на GitHub: $remote_version"
+
+  if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
+    ok "Установлена последняя версия скрипта."
+    return 0
+  fi
+
+  if version_gt "$remote_version" "$SCRIPT_VERSION"; then
+    echo
+    warn "Доступна новая версия скрипта: $remote_version (у тебя $SCRIPT_VERSION)."
+    read -rp "  Установить обновление сейчас? [y/N]: " ans
+
+    case "${ans,,}" in
+      y|yes|д|да)
+        update_self_and_restart "$remote_content"
+        ;;
+      *)
+        ok "Обновление отложено."
+        ;;
+    esac
+  else
+    ok "Локальная версия не старше удалённой ($SCRIPT_VERSION vs $remote_version)."
+  fi
+}
+
+# Тихая проверка обновлений для главного меню: не блокирует, не спрашивает,
+# просто подсказывает, что есть новая версия (пункт меню "4").
+notify_if_update_available() {
+  local remote_content remote_version
+
+  remote_content="$(curl -fsSL --connect-timeout 3 --max-time 6 \
+    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)" 2>/dev/null || true)"
+
+  [[ -n "$remote_content" ]] || return 0
+
+  remote_version="$(extract_script_version "$remote_content")"
+  [[ -n "$remote_version" ]] || return 0
+
+  if version_gt "$remote_version" "$SCRIPT_VERSION"; then
+    echo "${C_YELLOW}  Доступна новая версия: $remote_version (у тебя $SCRIPT_VERSION). Пункт меню «4» — обновить.${C_RESET}"
+    echo
+  fi
+}
+
 clean_bad_docker_apt_sources() {
   section "Проверка APT репозиториев"
 
@@ -394,13 +517,30 @@ check_cpu_level() {
     print "v"level
   }')"
 
-  ok "Detected CPU level: ${level:-unknown}"
-  info "Ставим x64v3. Это обычно стабильнее для VPS."
-  log_line "Detected CPU level: ${level:-unknown}"
+  CPU_LEVEL="${level:-v1}"
+
+  ok "Detected CPU level: ${CPU_LEVEL}"
+
+  if [[ "$CPU_LEVEL" == "v1" || "$CPU_LEVEL" == "v2" ]]; then
+    warn "CPU level ${CPU_LEVEL} не поддерживает x64v3. Установка XanMod x64v3 ядра будет пропущена (на v1/v2 это ломает загрузку сервера)."
+  else
+    info "Ставим x64v3. Это обычно стабильнее для VPS."
+  fi
+
+  log_line "Detected CPU level: ${CPU_LEVEL}"
 }
 
 install_xanmod_kernel() {
   section "3/12 · XanMod kernel $KERNEL_VER"
+
+  if [[ "$CPU_LEVEL" == "v1" || "$CPU_LEVEL" == "v2" ]]; then
+    KERNEL_INSTALL_SKIPPED=1
+    warn "Пропускаю установку XanMod x64v3 ядра: CPU level ${CPU_LEVEL:-unknown} ниже требуемого v3."
+    info "Сервер останется на текущем ядре, BBR v3 тюнинг сети при этом всё равно применится там, где это поддерживается текущим ядром."
+    return 0
+  fi
+
+  KERNEL_INSTALL_SKIPPED=0
 
   if uname -r | grep -q "$KERNEL_VER"; then
     ok "Уже загружено нужное ядро: $(uname -r)"
@@ -466,6 +606,11 @@ EOF_HOOK
 }
 
 maybe_reboot() {
+  if [[ "$KERNEL_INSTALL_SKIPPED" -eq 1 ]]; then
+    ok "Ребут не требуется: установка XanMod ядра была пропущена (CPU level ${CPU_LEVEL:-unknown})."
+    return 0
+  fi
+
   if uname -r | grep -q "$KERNEL_VER"; then
     ok "Ребут не нужен, уже загружено ядро $KERNEL_VER"
     return 0
@@ -770,8 +915,12 @@ optional_speedtest() {
       echo "${C_DIM}  TCP counters before:${C_RESET}"
       nstat -az TcpRetransSegs TcpOutSegs 2>/dev/null | tee -a "$LOG_FILE" | sed 's/^/  /' || true
 
-      run_shell_live "Запускаю iperf3 speedtest" \
-        "bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)"
+      if run_shell_live "Запускаю iperf3 speedtest" \
+        "bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)"; then
+        :
+      else
+        warn "Speedtest завершился с ошибкой, но это не критично — продолжаю установку."
+      fi
 
       echo
       echo "${C_DIM}  TCP counters after:${C_RESET}"
@@ -791,12 +940,29 @@ optional_selfsteal() {
 
   case "${ans,,}" in
     y|yes|д|да)
-      run_shell_live "Запускаю selfsteal.sh" "bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh)"
+      if run_shell_live "Запускаю selfsteal.sh" "bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh)"; then
+        ok "Selfsteal завершён, продолжаю установку ноды."
+      else
+        warn "Selfsteal.sh вернул ненулевой код (это может быть нормально для его собственной логики). Продолжаю установку ноды — её настройка дальше не зависит от selfsteal."
+      fi
       ;;
     *)
       ok "Selfsteal пропущен"
       ;;
   esac
+}
+
+run_warp_setup() {
+  section "Настройка WARP"
+  info "Запускаю Eclipse WARP Manager (отдельный скрипт, своё меню)."
+  info "Репозиторий: https://github.com/blantxxv/warp"
+  echo
+
+  if bash -c "bash <(curl -fsSL '$WARP_INSTALL_URL')"; then
+    ok "Eclipse WARP Manager завершил работу."
+  else
+    warn "Eclipse WARP Manager завершился с ошибкой или был прерван. Подробности — в его собственном логе: /var/log/warp-auto-install.log"
+  fi
 }
 
 sanitize_node_name() {
@@ -1065,14 +1231,18 @@ main_menu() {
   need_root
   print_banner
 
-  echo "${C_BOLD}Выбери режим установки:${C_RESET}"
+  notify_if_update_available
+
+  echo "${C_BOLD}Выбери режим:${C_RESET}"
   echo
   echo "  ${C_GREEN}1${C_RESET}) Автоматическая установка"
   echo "  ${C_CYAN}2${C_RESET}) Ручная установка: показать README/команды"
-  echo "  ${C_YELLOW}0${C_RESET}) Выход"
+  echo "  ${C_CYAN}3${C_RESET}) Настройка WARP"
+  echo "  ${C_CYAN}4${C_RESET}) Проверить обновления"
+  echo "  ${C_YELLOW}5${C_RESET}) Выход"
   echo
 
-  read -rp "  Выбор [1/2/0]: " choice
+  read -rp "  Выбор [1/2/3/4/5]: " choice
 
   case "${choice:-}" in
     1)
@@ -1081,7 +1251,13 @@ main_menu() {
     2)
       print_manual_mode
       ;;
-    0)
+    3)
+      run_warp_setup
+      ;;
+    4)
+      check_for_updates
+      ;;
+    5)
       echo "Выход."
       ;;
     *)
@@ -1099,6 +1275,14 @@ case "${1:-}" in
     ;;
   --manual)
     print_manual_mode
+    ;;
+  --warp)
+    need_root
+    run_warp_setup
+    ;;
+  --check-update)
+    need_root
+    check_for_updates
     ;;
   *)
     main_menu
