@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.2.1"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -335,8 +335,8 @@ ensure_saved_script_is_latest() {
     return 0
   }
 
-  remote_version="$(extract_script_version "$remote_content")"
-  remote_hash="$(sha256_text "$remote_content")"
+  remote_version="$(extract_script_version "$remote_content" || true)"
+  remote_hash="$(sha256_text "$remote_content" 2>/dev/null || true)"
 
   current_version="$SCRIPT_VERSION"
   current_hash=""
@@ -392,7 +392,7 @@ fetch_remote_script() {
 }
 
 extract_script_version() {
-  echo "$1" | grep -m1 '^SCRIPT_VERSION=' | sed -E 's/^SCRIPT_VERSION="([^"]*)".*/\1/'
+  awk -F'"' '/^SCRIPT_VERSION=/{print $2; found=1; exit} END{if (!found) exit 0}' <<< "${1:-}"
 }
 
 # Подчищает старые/временные копии скрипта, чтобы не было конфликта версий.
@@ -461,19 +461,19 @@ check_for_updates() {
     return 1
   fi
 
-  remote_version="$(extract_script_version "$remote_content")"
+  remote_version="$(extract_script_version "$remote_content" || true)"
 
   if [[ -z "$remote_version" ]]; then
     warn "Не удалось определить версию в скачанном скрипте."
     return 1
   fi
 
-  remote_hash="$(sha256_text "$remote_content")"
+  remote_hash="$(sha256_text "$remote_content" 2>/dev/null || true)"
   current_src="$(current_script_path || true)"
   local_hash=""
 
   if [[ -n "$current_src" && -r "$current_src" ]]; then
-    local_hash="$(sha256sum "$current_src" | awk '{print $1}')"
+    local_hash="$(sha256sum "$current_src" 2>/dev/null | awk '{print $1}' || true)"
   fi
 
   ok "Текущая версия: $SCRIPT_VERSION"
@@ -527,15 +527,15 @@ notify_if_update_available() {
 
   [[ -n "$remote_content" ]] || return 0
 
-  remote_version="$(extract_script_version "$remote_content")"
+  remote_version="$(extract_script_version "$remote_content" || true)"
   [[ -n "$remote_version" ]] || return 0
 
-  remote_hash="$(sha256_text "$remote_content")"
+  remote_hash="$(sha256_text "$remote_content" 2>/dev/null || true)"
   current_src="$(current_script_path || true)"
   local_hash=""
 
   if [[ -n "$current_src" && -r "$current_src" ]]; then
-    local_hash="$(sha256sum "$current_src" | awk '{print $1}')"
+    local_hash="$(sha256sum "$current_src" 2>/dev/null | awk '{print $1}' || true)"
   fi
 
   if version_gt "$remote_version" "$SCRIPT_VERSION"; then
@@ -1369,7 +1369,7 @@ main_menu() {
 
   while true; do
     print_banner
-    notify_if_update_available
+    notify_if_update_available || true
 
     echo "${C_BOLD}Главное меню:${C_RESET}"
     echo
