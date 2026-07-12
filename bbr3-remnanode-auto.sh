@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.2.2"
+SCRIPT_VERSION="2.3.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -30,6 +30,22 @@ NODE_PORT=""
 NODE_DISPLAY_NAME=""
 COMPOSE_PROJECT_NAME=""
 CONTAINER_NAME=""
+
+# Тип установки: "reality" (TCP+REALITY, как раньше) или "tls" (TCP+TLS со своим доменом)
+NODE_INSTALL_TYPE=""
+INSTALL_TYPE_FILE="$STATE_DIR/install_type"
+
+DOMAIN=""
+CERT_DIR=""
+CERT_OK=0
+
+DEFAULT_TLS_VLESS_PORT="443"
+DEFAULT_HY2_PORT="7443"
+TLS_VLESS_PORT=""
+HY2_PORT=""
+
+RU_GEOSITE_URL="https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat"
+RU_GEOIP_URL="https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat"
 
 DEBUG="${DEBUG:-0}"
 
@@ -268,6 +284,25 @@ set_state() {
 
 get_state() {
   cat "$STATE_FILE" 2>/dev/null || true
+}
+
+save_install_type() {
+  mkdir -p "$STATE_DIR"
+  echo "$NODE_INSTALL_TYPE" > "$INSTALL_TYPE_FILE"
+}
+
+# Загружает NODE_INSTALL_TYPE из файла состояния (нужно после reboot, когда
+# процесс скрипта, где спрашивали тип установки, уже завершился).
+# Если файла нет или значение битое — переспрашивает у пользователя.
+load_install_type() {
+  if [[ -f "$INSTALL_TYPE_FILE" ]]; then
+    NODE_INSTALL_TYPE="$(cat "$INSTALL_TYPE_FILE" 2>/dev/null || true)"
+  fi
+
+  if [[ "$NODE_INSTALL_TYPE" != "reality" && "$NODE_INSTALL_TYPE" != "tls" ]]; then
+    warn "Тип установки ноды не найден в сохранённом состоянии."
+    ask_node_install_type
+  fi
 }
 
 detect_iface() {
@@ -647,6 +682,40 @@ clean_bad_docker_apt_sources() {
   fi
 }
 
+ask_node_install_type() {
+  section "Тип установки ноды"
+
+  echo
+  echo "  Выбери, как настраивать транспорт ноды:"
+  echo
+  echo "  ${C_GREEN}1${C_RESET}) TCP + REALITY  ${C_DIM}(как раньше: маскировка через selfsteal.sh)${C_RESET}"
+  echo "  ${C_GREEN}2${C_RESET}) TCP + TLS      ${C_DIM}(свой домен, сертификат Let's Encrypt через certbot)${C_RESET}"
+  echo
+
+  local choice
+  while true; do
+    read -rp "  Выбор [1/2]: " choice
+
+    case "${choice:-}" in
+      1)
+        NODE_INSTALL_TYPE="reality"
+        ok "Выбран тип установки: TCP + REALITY"
+        break
+        ;;
+      2)
+        NODE_INSTALL_TYPE="tls"
+        ok "Выбран тип установки: TCP + TLS"
+        break
+        ;;
+      *)
+        warn "Некорректный выбор. Введи 1 или 2."
+        ;;
+    esac
+  done
+
+  save_install_type
+}
+
 install_base_packages() {
   section "1/12 · Базовые пакеты"
 
@@ -654,12 +723,21 @@ install_base_packages() {
 
   run_cmd "Обновляю APT index" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update
 
+  local packages=(
+    curl wget gpg ca-certificates nano vim htop btop git unzip jq
+    dnsutils iperf3 mtr-tiny iproute2 net-tools iptables ipset conntrack
+    openssl python3 file
+  )
+
+  if [[ "$NODE_INSTALL_TYPE" == "tls" ]]; then
+    packages+=(certbot)
+    info "Тип установки TLS: дополнительно ставлю certbot."
+  fi
+
   run_cmd "Устанавливаю утилиты" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y \
     -o Dpkg::Options::="--force-confdef" \
     -o Dpkg::Options::="--force-confold" \
-    curl wget gpg ca-certificates nano vim htop btop git unzip jq \
-    dnsutils iperf3 mtr-tiny iproute2 net-tools iptables ipset conntrack \
-    openssl python3 file
+    "${packages[@]}"
 }
 
 check_cpu_level() {
@@ -1174,6 +1252,95 @@ optional_selfsteal() {
   esac
 }
 
+ask_domain() {
+  local input=""
+
+  while true; do
+    read -rp "  Домен для сертификата (например, node.example.com): " input
+    input="$(echo "${input:-}" | tr -d '[:space:]')"
+
+    if [[ "$input" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
+      DOMAIN="$input"
+      ok "Домен: $DOMAIN"
+      return 0
+    fi
+
+    warn "Некорректный домен. Пример: node.example.com"
+  done
+}
+
+issue_tls_certificate() {
+  section "11/12 · TLS сертификат"
+
+  if ! command -v certbot >/dev/null 2>&1; then
+    run_cmd "Устанавливаю certbot" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y certbot
+  fi
+
+  echo
+  info "Перед выпуском сертификата убедись, что A-запись домена указывает на IP этого сервера."
+  info "Certbot (standalone) временно займёт порт 80 — он должен быть свободен."
+  echo
+
+  local attempt=1
+  local max_attempts=3
+
+  while true; do
+    ask_domain
+
+    run_shell "Освобождаю порт 80 (если занят nginx/apache)" \
+      "systemctl stop nginx >/dev/null 2>&1 || true; systemctl stop apache2 >/dev/null 2>&1 || true; true"
+
+    CERT_OK=0
+
+    if run_cmd "Выпускаю сертификат Let's Encrypt для $DOMAIN" \
+      certbot certonly --standalone --non-interactive --agree-tos \
+      --register-unsafely-without-email --preferred-challenges http \
+      -d "$DOMAIN"; then
+
+      if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" && -f "/etc/letsencrypt/live/$DOMAIN/privkey.pem" ]]; then
+        CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
+        CERT_OK=1
+      fi
+    fi
+
+    if [[ "$CERT_OK" -eq 1 ]]; then
+      ok "Сертификат успешно выпущен: $CERT_DIR"
+      return 0
+    fi
+
+    fail "Не удалось выпустить сертификат для домена $DOMAIN."
+
+    if [[ "$attempt" -ge "$max_attempts" ]]; then
+      warn "Достигнут лимит попыток ($max_attempts). Продолжаю установку ноды без TLS-сертификата."
+      warn "Выпусти сертификат вручную позже (certbot certonly --standalone -d $DOMAIN) и пропиши пути в конфиге инбаундов панели."
+      return 0
+    fi
+
+    echo
+    read -rp "  Попробовать снова с другим доменом? [Y/n]: " ans
+
+    case "${ans,,}" in
+      n|no|н|нет)
+        warn "Продолжаю установку ноды без TLS-сертификата."
+        return 0
+        ;;
+      *)
+        attempt=$((attempt + 1))
+        ;;
+    esac
+  done
+}
+
+# Диспетчер шага 11/12: REALITY — как раньше через selfsteal.sh,
+# TLS — выпуск сертификата через certbot.
+step_transport_setup() {
+  if [[ "$NODE_INSTALL_TYPE" == "tls" ]]; then
+    issue_tls_certificate
+  else
+    optional_selfsteal
+  fi
+}
+
 run_warp_setup() {
   section "Настройка WARP"
   info "Запускаю Eclipse WARP Manager (отдельный скрипт, своё меню)."
@@ -1229,6 +1396,22 @@ detect_country_name() {
   echo "$country"
 }
 
+detect_country_code() {
+  local code=""
+
+  code="$(curl -fsSL --connect-timeout 4 --max-time 8 https://ipapi.co/country/ 2>/dev/null | head -n 1 | tr -d '\r' | tr '[:lower:]' '[:upper:]' || true)"
+
+  if [[ ! "$code" =~ ^[A-Z]{2}$ ]]; then
+    code="$(curl -fsSL --connect-timeout 4 --max-time 8 https://ifconfig.co/country-iso 2>/dev/null | head -n 1 | tr -d '\r' | tr '[:lower:]' '[:upper:]' || true)"
+  fi
+
+  if [[ ! "$code" =~ ^[A-Z]{2}$ ]]; then
+    code="XX"
+  fi
+
+  echo "$code"
+}
+
 ask_node_port() {
   local input=""
   local port_dec=""
@@ -1279,11 +1462,199 @@ prepare_node_paths() {
   ok "Контейнер: $CONTAINER_NAME"
 }
 
+ask_tls_ports() {
+  local input=""
+
+  while true; do
+    read -rp "  Порт VLESS+TCP+TLS [${DEFAULT_TLS_VLESS_PORT}]: " input
+    input="${input:-$DEFAULT_TLS_VLESS_PORT}"
+
+    if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
+      TLS_VLESS_PORT="$((10#$input))"
+      break
+    fi
+
+    warn "Некорректный порт. Нужно число от 1 до 65535."
+  done
+
+  while true; do
+    read -rp "  Порт Hysteria2 [${DEFAULT_HY2_PORT}]: " input
+    input="${input:-$DEFAULT_HY2_PORT}"
+
+    if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )) && [[ "$((10#$input))" -ne "$TLS_VLESS_PORT" ]]; then
+      HY2_PORT="$((10#$input))"
+      break
+    fi
+
+    warn "Некорректный порт (или совпадает с портом VLESS+TLS)."
+  done
+
+  ok "Порт VLESS+TLS: $TLS_VLESS_PORT"
+  ok "Порт Hysteria2: $HY2_PORT"
+}
+
+# Генерирует готовый конфиг инбаундов для панели Remnawave: VLESS+TCP+TLS и
+# Hysteria2 (salamander), с реальными путями к сертификатам, доменом,
+# автосгенерированным паролем и автосгенерированными тегами.
+generate_tls_panel_config() {
+  section "Конфиг для панели"
+
+  local country_code vless_tag hy2_tag hy2_password config_path
+
+  country_code="$(detect_country_code)"
+  vless_tag="VLESS_TCP_TLS_${country_code}_${TLS_VLESS_PORT}"
+  hy2_tag="HYSTERIA2_SALAMANDER_${HY2_PORT}"
+  hy2_password="$(openssl rand -base64 32)"
+  config_path="$REMNANODE_DIR/panel-inbounds.json"
+
+  cat > "$config_path" <<EOF_PANEL
+{
+  "log": {
+    "loglevel": "none"
+  },
+  "inbounds": [
+    {
+      "tag": "$vless_tag",
+      "port": $TLS_VLESS_PORT,
+      "listen": "0.0.0.0",
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls"
+        ]
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": [
+            "http/1.1",
+            "h2"
+          ],
+          "serverName": "$DOMAIN",
+          "certificates": [
+            {
+              "keyFile": "$CERT_DIR/privkey.pem",
+              "certificateFile": "$CERT_DIR/fullchain.pem"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "tag": "$hy2_tag",
+      "port": $HY2_PORT,
+      "listen": "0.0.0.0",
+      "protocol": "hysteria",
+      "settings": {
+        "users": [],
+        "clients": [],
+        "version": 2,
+        "ignoreClientBandwidth": false
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      "streamSettings": {
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": [
+            "h3"
+          ],
+          "serverName": "$DOMAIN",
+          "certificates": [
+            {
+              "keyFile": "$CERT_DIR/privkey.pem",
+              "certificateFile": "$CERT_DIR/fullchain.pem"
+            }
+          ]
+        },
+        "hysteriaSettings": {
+          "obfs": {
+            "type": "salamander",
+            "password": "$hy2_password"
+          },
+          "version": 2,
+          "udpIdleTimeout": 60
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "DIRECT",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "BLOCK",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "ip": [
+          "geoip:private"
+        ],
+        "outboundTag": "BLOCK"
+      },
+      {
+        "domain": [
+          "geosite:private"
+        ],
+        "outboundTag": "BLOCK"
+      },
+      {
+        "protocol": [
+          "bittorrent"
+        ],
+        "outboundTag": "BLOCK"
+      }
+    ]
+  }
+}
+EOF_PANEL
+
+  chmod 600 "$config_path"
+
+  if command -v jq >/dev/null 2>&1; then
+    if jq empty "$config_path" >/dev/null 2>&1; then
+      ok "JSON конфиг валиден"
+    else
+      warn "JSON конфиг не прошёл проверку jq. Проверь файл вручную: $config_path"
+    fi
+  fi
+
+  ok "Готовый конфиг инбаундов сохранён: $config_path"
+  echo
+  echo "${C_DIM}────────────────────────────────────────────────────────────${C_RESET}"
+  cat "$config_path"
+  echo "${C_DIM}────────────────────────────────────────────────────────────${C_RESET}"
+  echo
+  info "Скопируй JSON выше (или файл $config_path) в конфиг инбаундов ноды в панели Remnawave."
+}
+
 setup_remnanode() {
   section "12/12 · Remnawave Node"
 
   prepare_node_paths
   ask_node_port
+
+  if [[ "$NODE_INSTALL_TYPE" == "tls" ]]; then
+    ask_tls_ports
+  fi
 
   echo
   echo "  Вставь SECRET_KEY из панели Remnawave."
@@ -1306,6 +1677,16 @@ setup_remnanode() {
     -o geoip.dat \
     https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
 
+  run_cmd "Скачиваю geosite_2.dat (RU rules)" \
+    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    -o geosite_2.dat \
+    "$RU_GEOSITE_URL"
+
+  run_cmd "Скачиваю geoip_2.dat (RU rules)" \
+    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    -o geoip_2.dat \
+    "$RU_GEOIP_URL"
+
   touch "$REMNANODE_LOG_DIR/access.log" "$REMNANODE_LOG_DIR/error.log"
 
   cat > "$REMNANODE_DIR/.env" <<EOF_ENV
@@ -1314,6 +1695,11 @@ SECRET_KEY=$SECRET_KEY
 EOF_ENV
 
   chmod 600 "$REMNANODE_DIR/.env"
+
+  local cert_volume_line=""
+  if [[ "$NODE_INSTALL_TYPE" == "tls" && "$CERT_OK" -eq 1 ]]; then
+    cert_volume_line="      - /etc/letsencrypt:/etc/letsencrypt:ro"
+  fi
 
   cat > "$REMNANODE_DIR/docker-compose.yml" <<EOF_COMPOSE
 name: $COMPOSE_PROJECT_NAME
@@ -1330,7 +1716,10 @@ services:
     volumes:
       - ./geosite.dat:/usr/local/share/xray/geosite.dat:ro
       - ./geoip.dat:/usr/local/share/xray/geoip.dat:ro
+      - ./geosite_2.dat:/usr/local/share/xray/geosite_2.dat:ro
+      - ./geoip_2.dat:/usr/local/share/xray/geoip_2.dat:ro
       - ./logs:/var/log/remnanode
+${cert_volume_line}
     ulimits:
       nofile:
         soft: 1048576
@@ -1348,6 +1737,15 @@ EOF_COMPOSE
     ok "Порт $NODE_PORT слушается"
   else
     warn "Порт $NODE_PORT не слушается. Проверь: cd $REMNANODE_DIR && docker compose logs -f --tail=100"
+  fi
+
+  if [[ "$NODE_INSTALL_TYPE" == "tls" ]]; then
+    if [[ "$CERT_OK" -eq 1 ]]; then
+      generate_tls_panel_config
+    else
+      warn "Сертификат не был выпущен — пропускаю генерацию готового конфига для панели."
+      warn "Выпусти сертификат вручную и добавь TLS-инбаунды в панели самостоятельно."
+    fi
   fi
 }
 
@@ -1374,6 +1772,8 @@ stage_before_reboot() {
     *) die "Отменено пользователем." ;;
   esac
 
+  ask_node_install_type
+
   install_base_packages
   check_cpu_level
   install_xanmod_kernel
@@ -1388,6 +1788,8 @@ stage_after_reboot() {
 
   mkdir -p "$STATE_DIR"
   touch "$LOG_FILE"
+
+  load_install_type
 
   section "Продолжение установки после reboot"
 
@@ -1406,7 +1808,7 @@ stage_after_reboot() {
   disable_llmnr
   run_final_test
   optional_speedtest
-  optional_selfsteal
+  step_transport_setup
   setup_remnanode
   cleanup_continue_hook
 
@@ -1422,6 +1824,12 @@ stage_after_reboot() {
   echo "    docker compose ps"
   echo "    docker compose logs -f --tail=100"
   echo
+
+  if [[ "$NODE_INSTALL_TYPE" == "tls" && "$CERT_OK" -eq 1 ]]; then
+    echo "  Конфиг инбаундов для панели:"
+    echo "    $REMNANODE_DIR/panel-inbounds.json"
+    echo
+  fi
 }
 
 print_manual_mode() {
