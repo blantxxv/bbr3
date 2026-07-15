@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.4.1"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -328,6 +328,25 @@ check_existing_certificate() {
   [[ -f "$cert_dir/fullchain.pem" && -f "$cert_dir/privkey.pem" ]] || return 1
 
   openssl x509 -checkend 86400 -noout -in "$cert_dir/fullchain.pem" >/dev/null 2>&1
+}
+
+# Ищет на диске все домены под /etc/letsencrypt/live с действующим
+# сертификатом — на случай, если сертификат выпустили в прошлом запуске
+# скрипта (например, до этой версии, или установка ноды упала уже после
+# выпуска сертификата), и файла состояния с доменом ещё нет.
+find_existing_certificates() {
+  local d domain
+
+  [[ -d /etc/letsencrypt/live ]] || return 0
+
+  for d in /etc/letsencrypt/live/*/; do
+    [[ -d "$d" ]] || continue
+    domain="$(basename "$d")"
+
+    if check_existing_certificate "$domain"; then
+      echo "$domain"
+    fi
+  done
 }
 
 detect_iface() {
@@ -1318,6 +1337,49 @@ issue_tls_certificate() {
       ok "Найден действующий сертификат для домена $DOMAIN. Повторный выпуск не требуется."
       return 0
     fi
+  fi
+
+  # Файла состояния с доменом нет (или он битый) — ищем на диске сертификаты,
+  # выпущенные в прошлых запусках (в том числе более старой версией скрипта,
+  # ещё не сохранявшей домен), и предлагаем переиспользовать вместо выпуска
+  # нового.
+  local found_certs found_count
+  found_certs="$(find_existing_certificates)"
+  found_count=0
+  [[ -n "$found_certs" ]] && found_count="$(echo "$found_certs" | wc -l)"
+
+  if [[ "$found_count" -gt 0 ]]; then
+    echo
+    info "На сервере уже есть действующие сертификаты Let's Encrypt:"
+    echo "$found_certs" | sed 's/^/    - /'
+    echo
+
+    local reuse_ans reuse_domain
+    read -rp "  Использовать один из них вместо выпуска нового? [Y/n]: " reuse_ans
+
+    case "${reuse_ans,,}" in
+      n|no|н|нет)
+        ;;
+      *)
+        if [[ "$found_count" -eq 1 ]]; then
+          reuse_domain="$found_certs"
+        else
+          read -rp "  Введи домен из списка выше: " reuse_domain
+          reuse_domain="$(echo "${reuse_domain:-}" | tr -d '[:space:]')"
+        fi
+
+        if check_existing_certificate "$reuse_domain"; then
+          DOMAIN="$reuse_domain"
+          CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
+          CERT_OK=1
+          save_domain
+          ok "Использую существующий сертификат: $CERT_DIR"
+          return 0
+        fi
+
+        warn "Не удалось подтвердить сертификат для '$reuse_domain'. Перехожу к обычному выпуску."
+        ;;
+    esac
   fi
 
   echo
