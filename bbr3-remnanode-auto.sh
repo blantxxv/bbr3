@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.6.1"
+SCRIPT_VERSION="2.6.2"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -1178,7 +1178,28 @@ install_docker() {
   section "7/12 · Docker"
 
   if ! command -v docker >/dev/null 2>&1; then
-    run_shell "Устанавливаю Docker" "curl -fsSL https://get.docker.com | sh"
+    if ! run_shell "Устанавливаю Docker" "curl -fsSL https://get.docker.com | sh"; then
+      warn "Официальный скрипт get.docker.com не смог доустановить Docker целиком — на старых/EOL дистрибутивах (например, Ubuntu 18.04) в его набор пакетов иногда попадает то, чего нет в репозитории для этой версии (например, docker-model-plugin)."
+      info "Docker APT-репозиторий и GPG-ключ он обычно успевает добавить до этого сбоя — пробую доустановить вручную только доступные пакеты."
+
+      local docker_packages=(docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-ce-rootless-extras docker-buildx-plugin)
+      local available_docker_packages=()
+
+      run_cmd "Обновляю APT index (Docker repo)" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update
+
+      while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] && available_docker_packages+=("$pkg")
+      done < <(filter_available_packages "${docker_packages[@]}")
+
+      [[ "${#available_docker_packages[@]}" -gt 0 ]] || die "Не удалось установить Docker: пакеты docker-ce/docker-ce-cli/containerd.io недоступны в репозитории (репозиторий Docker не подключился)."
+
+      run_cmd "Устанавливаю Docker (доступные пакеты)" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        "${available_docker_packages[@]}"
+
+      command -v docker >/dev/null 2>&1 || die "Docker всё равно не установился после ручной доустановки пакетов."
+    fi
   else
     ok "Docker уже установлен"
   fi
