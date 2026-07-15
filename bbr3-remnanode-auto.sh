@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.5.0"
+SCRIPT_VERSION="2.6.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -24,6 +24,11 @@ KERNEL_VER="6.19.14-x64v3-xanmod1"
 XANMOD_BASE_URL="https://deb.xanmod.org/pool/main/l/linux-upstream"
 IMAGE_DEB_URL="$XANMOD_BASE_URL/linux-image-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb"
 HEADERS_DEB_URL="$XANMOD_BASE_URL/linux-headers-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb"
+
+OS_ID=""
+OS_VERSION_ID=""
+OS_CODENAME=""
+OS_PRETTY_NAME=""
 
 DEFAULT_NODE_PORT="2222"
 REMNANODE_DIR=""
@@ -681,6 +686,57 @@ notify_if_update_available() {
 }
 
 
+# Определяет дистрибутив/версию из /etc/os-release и сохраняет в OS_*.
+# Нужно, чтобы видеть, на чём именно запускается скрипт (старые Ubuntu/Debian
+# часто не имеют в репах свежих пакетов вроде btop).
+detect_os_info() {
+  section "Информация об ОС"
+
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_VERSION_ID="${VERSION_ID:-unknown}"
+    OS_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-unknown}}"
+    OS_PRETTY_NAME="${PRETTY_NAME:-unknown}"
+  else
+    OS_ID="unknown"
+    OS_VERSION_ID="unknown"
+    OS_CODENAME="unknown"
+    OS_PRETTY_NAME="unknown"
+  fi
+
+  ok "ОС: $OS_PRETTY_NAME"
+  info "id=$OS_ID · version_id=$OS_VERSION_ID · codename=$OS_CODENAME"
+  log_line "OS detected: $OS_PRETTY_NAME (id=$OS_ID version_id=$OS_VERSION_ID codename=$OS_CODENAME)"
+
+  if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then
+    warn "Скрипт разрабатывался для Ubuntu/Debian. Обнаружено: $OS_PRETTY_NAME. Некоторые шаги могут не сработать."
+  fi
+}
+
+# Возвращает успех, если пакет присутствует в подключённых APT-репозиториях
+# (не факт, что установится, но хотя бы известен apt).
+apt_package_available() {
+  apt-cache show "$1" >/dev/null 2>&1
+}
+
+# Фильтрует список пакетов, оставляя только доступные в текущих репозиториях
+# этой ОС/версии. На старых релизах (например, Ubuntu 18.04) части пакетов
+# вроде btop может не быть — пропускаем их с предупреждением вместо того,
+# чтобы валить всю установку через один общий apt-get install.
+filter_available_packages() {
+  local pkg
+
+  for pkg in "$@"; do
+    if apt_package_available "$pkg"; then
+      echo "$pkg"
+    else
+      warn "Пакет '$pkg' недоступен в репозиториях этой ОС (${OS_PRETTY_NAME:-неизвестно}) — пропускаю." >&2
+    fi
+  done
+}
+
 clean_bad_docker_apt_sources() {
   section "Проверка APT репозиториев"
 
@@ -765,6 +821,7 @@ ask_node_install_type() {
 install_base_packages() {
   section "1/12 · Базовые пакеты"
 
+  detect_os_info
   clean_bad_docker_apt_sources
 
   run_cmd "Обновляю APT index" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update
@@ -780,10 +837,17 @@ install_base_packages() {
     info "Тип установки TLS: дополнительно ставлю certbot."
   fi
 
+  local available_packages=()
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] && available_packages+=("$pkg")
+  done < <(filter_available_packages "${packages[@]}")
+
+  [[ "${#available_packages[@]}" -gt 0 ]] || die "Ни один из требуемых пакетов не найден в репозиториях этой ОС. Проверь APT sources."
+
   run_cmd "Устанавливаю утилиты" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y \
     -o Dpkg::Options::="--force-confdef" \
     -o Dpkg::Options::="--force-confold" \
-    "${packages[@]}"
+    "${available_packages[@]}"
 }
 
 check_cpu_level() {
