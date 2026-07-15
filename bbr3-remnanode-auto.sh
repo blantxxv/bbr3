@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.4.1"
+SCRIPT_VERSION="2.5.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -14,6 +14,8 @@ PROFILE_HOOK="/etc/profile.d/bbr3-remnanode-continue.sh"
 
 SELF_DOWNLOAD_URL="https://raw.githubusercontent.com/blantxxv/bbr3/refs/heads/main/bbr3-remnanode-auto.sh"
 WARP_INSTALL_URL="https://raw.githubusercontent.com/blantxxv/warp/main/warp-auto-install.sh"
+TORRENT_BLOCKER_INSTALL_URL="https://raw.githubusercontent.com/mahmudali1337-lab/torrent-blocker/master/install.sh"
+TORRENT_BLOCKER_BIN="/usr/local/bin/torrent-blocker"
 
 CPU_LEVEL=""
 KERNEL_INSTALL_SKIPPED=0
@@ -1469,6 +1471,37 @@ run_warp_setup() {
   fi
 }
 
+is_torrent_blocker_installed() {
+  [[ -x "$TORRENT_BLOCKER_BIN" ]]
+}
+
+install_torrent_blocker() {
+  section "Torrent Blocker"
+
+  if is_torrent_blocker_installed; then
+    ok "Torrent Blocker уже установлен: $TORRENT_BLOCKER_BIN"
+    info "Переустанавливаю: останавливаю сервис, удаляю бинарник, ставлю заново."
+
+    run_shell "Останавливаю и удаляю старую версию Torrent Blocker" \
+      "systemctl stop torrent-blocker >/dev/null 2>&1 || true; rm -f '$TORRENT_BLOCKER_BIN'"
+  else
+    info "Torrent Blocker не найден на сервере. Устанавливаю с нуля."
+  fi
+
+  if run_shell_live "Скачиваю и устанавливаю Torrent Blocker" \
+    "curl -fsSL '$TORRENT_BLOCKER_INSTALL_URL' | bash"; then
+    ok "Установка Torrent Blocker завершена."
+
+    if systemctl is-active --quiet torrent-blocker 2>/dev/null; then
+      ok "Сервис torrent-blocker активен."
+    else
+      warn "Сервис torrent-blocker не выглядит активным. Проверь: systemctl status torrent-blocker"
+    fi
+  else
+    warn "Установка Torrent Blocker завершилась с ошибкой или была прервана. Смотри вывод выше."
+  fi
+}
+
 sanitize_node_name() {
   local raw="$1"
 
@@ -2062,10 +2095,11 @@ main_menu() {
     echo "  ${C_CYAN}4${C_RESET}) Настройка WARP"
     echo "  ${C_CYAN}5${C_RESET}) Проверить/установить обновления скрипта"
     echo "  ${C_CYAN}6${C_RESET}) Проверить систему"
+    echo "  ${C_CYAN}7${C_RESET}) Torrent Blocker (установить/переустановить)"
     echo "  ${C_YELLOW}0${C_RESET}) Выход"
     echo
 
-    read -rp "  Выбор [1/2/3/4/5/6/0]: " choice || choice="0"
+    read -rp "  Выбор [1/2/3/4/5/6/7/0]: " choice || choice="0"
 
     case "${choice:-}" in
       1)
@@ -2090,6 +2124,10 @@ main_menu() {
         ;;
       6)
         run_final_test
+        pause_menu
+        ;;
+      7)
+        install_torrent_blocker
         pause_menu
         ;;
       0|q|Q|exit|quit)
@@ -2126,6 +2164,10 @@ case "${1:-}" in
     need_root
     run_final_test
     ;;
+  --torrent-blocker|torrent-blocker)
+    need_root
+    install_torrent_blocker
+    ;;
   --menu|menu|"")
     main_menu
     ;;
@@ -2133,15 +2175,16 @@ case "${1:-}" in
     print_banner
     cat <<EOF_HELP
 Использование:
-  $0                 открыть главное меню
-  $0 --menu          открыть главное меню
-  $0 --auto          автоматическая установка
-  $0 --install       алиас для --auto
-  $0 --continue      продолжить после reboot
-  $0 --manual        показать ручной режим
-  $0 --warp          запустить настройку WARP
-  $0 --check-update  проверить обновления
-  $0 --test          проверить систему
+  $0                    открыть главное меню
+  $0 --menu             открыть главное меню
+  $0 --auto             автоматическая установка
+  $0 --install          алиас для --auto
+  $0 --continue         продолжить после reboot
+  $0 --manual           показать ручной режим
+  $0 --warp             запустить настройку WARP
+  $0 --check-update     проверить обновления
+  $0 --test             проверить систему
+  $0 --torrent-blocker  установить/переустановить Torrent Blocker
 EOF_HELP
     ;;
   *)
