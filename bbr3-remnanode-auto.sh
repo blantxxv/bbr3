@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.3.1"
+SCRIPT_VERSION="2.4.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -38,6 +38,14 @@ INSTALL_TYPE_FILE="$STATE_DIR/install_type"
 DOMAIN=""
 CERT_DIR=""
 CERT_OK=0
+DOMAIN_FILE="$STATE_DIR/domain"
+
+# Список публичных зеркал Docker Hub на случай, если registry-1.docker.io
+# отдаёт 403/недоступен (блокировка/rate limit). Пробуем по очереди.
+DOCKER_HUB_MIRRORS=(
+  "mirror.gcr.io"
+  "dockerhub.timeweb.cloud"
+)
 
 DEFAULT_TLS_VLESS_PORT="443"
 DEFAULT_HY2_PORT="7443"
@@ -303,6 +311,23 @@ load_install_type() {
     warn "Тип установки ноды не найден в сохранённом состоянии."
     ask_node_install_type
   fi
+}
+
+save_domain() {
+  mkdir -p "$STATE_DIR"
+  echo "$DOMAIN" > "$DOMAIN_FILE"
+}
+
+# Проверяет, есть ли уже действующий (не истекающий в ближайшие сутки)
+# сертификат Let's Encrypt для указанного домена.
+check_existing_certificate() {
+  local domain="$1"
+  local cert_dir="/etc/letsencrypt/live/$domain"
+
+  [[ -n "$domain" ]] || return 1
+  [[ -f "$cert_dir/fullchain.pem" && -f "$cert_dir/privkey.pem" ]] || return 1
+
+  openssl x509 -checkend 86400 -noout -in "$cert_dir/fullchain.pem" >/dev/null 2>&1
 }
 
 detect_iface() {
@@ -1074,6 +1099,9 @@ install_docker() {
     "max-size": "100m",
     "max-file": "5"
   },
+  "registry-mirrors": [
+    "https://mirror.gcr.io"
+  ],
   "default-ulimits": {
     "nofile": {
       "Name": "nofile",
@@ -1276,6 +1304,22 @@ issue_tls_certificate() {
     run_cmd "Устанавливаю certbot" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y certbot
   fi
 
+  # Если скрипт запускают повторно (например, после сбоя запуска ноды) и для
+  # ранее сохранённого домена уже есть действующий сертификат — не спрашиваем
+  # заново и не выпускаем его повторно.
+  if [[ -f "$DOMAIN_FILE" ]]; then
+    local saved_domain
+    saved_domain="$(cat "$DOMAIN_FILE" 2>/dev/null || true)"
+
+    if [[ -n "$saved_domain" ]] && check_existing_certificate "$saved_domain"; then
+      DOMAIN="$saved_domain"
+      CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
+      CERT_OK=1
+      ok "Найден действующий сертификат для домена $DOMAIN. Повторный выпуск не требуется."
+      return 0
+    fi
+  fi
+
   echo
   info "Перед выпуском сертификата убедись, что A-запись домена указывает на IP этого сервера."
   info "Certbot (standalone) временно займёт порт 80 — он должен быть свободен."
@@ -1286,6 +1330,14 @@ issue_tls_certificate() {
 
   while true; do
     ask_domain
+
+    if check_existing_certificate "$DOMAIN"; then
+      CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
+      CERT_OK=1
+      save_domain
+      ok "Найден действующий сертификат для домена $DOMAIN. Повторный выпуск не требуется."
+      return 0
+    fi
 
     run_shell "Освобождаю порт 80 (если занят nginx/apache)" \
       "systemctl stop nginx >/dev/null 2>&1 || true; systemctl stop apache2 >/dev/null 2>&1 || true; true"
@@ -1305,6 +1357,7 @@ issue_tls_certificate() {
 
     if [[ "$CERT_OK" -eq 1 ]]; then
       ok "Сертификат успешно выпущен: $CERT_DIR"
+      save_domain
       return 0
     fi
 
@@ -1621,6 +1674,20 @@ generate_tls_panel_config() {
           "bittorrent"
         ],
         "outboundTag": "BLOCK"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:category-public-tracker"
+        ],
+        "ruleTag": "TORRENT_BY_DOMAIN",
+        "outboundTag": "BLOCK"
+      },
+      {
+        "port": "6881-6889,51413,21413,17417,37305",
+        "type": "field",
+        "ruleTag": "TORRENT_BY_PORT",
+        "outboundTag": "BLOCK"
       }
     ]
   }
@@ -1644,6 +1711,39 @@ EOF_PANEL
   echo "${C_DIM}────────────────────────────────────────────────────────────${C_RESET}"
   echo
   info "Скопируй JSON выше (или файл $config_path) в конфиг инбаундов ноды в панели Remnawave."
+}
+
+# Скачивает docker-образ с несколькими попытками, а при явном отказе Docker
+# Hub (например, "403 Forbidden" от registry-1.docker.io — блокировка/лимит
+# по IP) пробует публичные зеркала из DOCKER_HUB_MIRRORS и перетегирует
+# образ обратно в исходное имя, чтобы docker compose не пытался качать его
+# заново.
+pull_docker_image_with_fallback() {
+  local image="$1"
+  local attempt mirror mirror_image
+
+  for attempt in 1 2 3; do
+    if run_cmd "Скачиваю образ $image (попытка $attempt/3)" docker pull "$image"; then
+      return 0
+    fi
+    sleep 5
+  done
+
+  warn "Не удалось скачать $image напрямую с Docker Hub (docker.io). Пробую зеркала registry..."
+
+  for mirror in "${DOCKER_HUB_MIRRORS[@]}"; do
+    mirror_image="${mirror}/${image}"
+
+    if run_cmd "Скачиваю образ через зеркало $mirror" docker pull "$mirror_image"; then
+      if run_cmd "Перетегирую образ в $image" docker tag "$mirror_image" "$image"; then
+        ok "Образ $image получен через зеркало $mirror"
+        return 0
+      fi
+    fi
+  done
+
+  fail "Не удалось скачать образ $image ни напрямую, ни через зеркала."
+  return 1
 }
 
 setup_remnanode() {
@@ -1728,7 +1828,26 @@ ${cert_volume_line}
       - .env
 EOF_COMPOSE
 
-  run_cmd "Запускаю Remnawave Node" docker_compose up -d
+  if ! pull_docker_image_with_fallback "remnawave/node:latest"; then
+    warn "Образ remnawave/node:latest не удалось скачать заранее. docker compose up всё равно попробует сам."
+  fi
+
+  local up_ok=0
+  local up_attempt
+  for up_attempt in 1 2 3; do
+    if run_cmd "Запускаю Remnawave Node (попытка $up_attempt/3)" docker_compose up -d; then
+      up_ok=1
+      break
+    fi
+    warn "Не удалось запустить контейнер. Возможно, Docker Hub временно недоступен (403/лимит). Повтор через 10 секунд..."
+    sleep 10
+  done
+
+  if [[ "$up_ok" -ne 1 ]]; then
+    warn "Не удалось запустить ноду после нескольких попыток."
+    warn "Проверь вручную: cd $REMNANODE_DIR && docker compose pull && docker compose up -d"
+    warn "Если в логе ошибка вида '403 Forbidden' от registry-1.docker.io — это блокировка/лимит Docker Hub по IP сервера. В /etc/docker/daemon.json уже настроено зеркало registry-mirrors (mirror.gcr.io), но если и оно недоступно — попробуй docker pull через VPN/другой сервер и docker save/docker load."
+  fi
 
   docker_compose ps >> "$LOG_FILE" 2>&1 || true
   docker_compose logs --tail=100 >> "$LOG_FILE" 2>&1 || true
