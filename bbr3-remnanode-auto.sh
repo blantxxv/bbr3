@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.6.0"
+SCRIPT_VERSION="2.6.1"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -63,6 +63,14 @@ RU_GEOSITE_URL="https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rule
 RU_GEOIP_URL="https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat"
 
 DEBUG="${DEBUG:-0}"
+
+# Старые curl (например, 7.58 на Ubuntu 18.04) не знают флаг --retry-all-errors
+# (появился в curl 7.71). Проверяем поддержку один раз и используем этот флаг
+# только если он реально есть, иначе просто опускаем его во всех вызовах curl.
+CURL_RETRY_ALL_ERRORS_FLAG=""
+if curl --retry-all-errors --version >/dev/null 2>&1; then
+  CURL_RETRY_ALL_ERRORS_FLAG="--retry-all-errors"
+fi
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'
@@ -394,7 +402,7 @@ download_self_latest() {
   cleanup_old_script_copies "$target" || true
   tmp="$(mktemp "${target}.tmp.XXXXXX")"
 
-  if ! curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+  if ! curl -fsSL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
     -H 'Cache-Control: no-cache' \
     -H 'Pragma: no-cache' \
     -o "$tmp" \
@@ -507,7 +515,7 @@ version_gt() {
   [[ "$lower" == "$b" ]]
 }
 fetch_remote_script() {
-  curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 --retry-all-errors \
+  curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
     -H 'Cache-Control: no-cache' \
     -H 'Pragma: no-cache' \
     "${SELF_DOWNLOAD_URL}?ts=$(date +%s)" 2>/dev/null || true
@@ -899,10 +907,10 @@ install_xanmod_kernel() {
   rm -f ./*.deb
 
   run_cmd "Скачиваю linux-image XanMod" \
-    curl -fL --retry 5 --retry-delay 2 --retry-all-errors -o image.deb "$IMAGE_DEB_URL"
+    curl -fL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG -o image.deb "$IMAGE_DEB_URL"
 
   run_cmd "Скачиваю linux-headers XanMod" \
-    curl -fL --retry 5 --retry-delay 2 --retry-all-errors -o headers.deb "$HEADERS_DEB_URL"
+    curl -fL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG -o headers.deb "$HEADERS_DEB_URL"
 
   run_shell "Проверяю deb-пакеты" "file /root/xanmod/image.deb /root/xanmod/headers.deb && dpkg-deb -I /root/xanmod/image.deb >/dev/null && dpkg-deb -I /root/xanmod/headers.deb >/dev/null"
 
@@ -941,7 +949,7 @@ if [[ "\$EUID" -eq 0 ]] && [[ -f "$STATE_FILE" ]] && grep -qx 'need_post_reboot'
 
   tmp="\$(mktemp "$SCRIPT_PATH.tmp.XXXXXX")"
 
-  if curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+  if curl -fsSL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
     -H 'Cache-Control: no-cache' \
     -H 'Pragma: no-cache' \
     -o "\$tmp" \
@@ -1927,22 +1935,22 @@ setup_remnanode() {
   cd "$REMNANODE_DIR"
 
   run_cmd "Скачиваю geosite.dat" \
-    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    curl -fsSL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
     -o geosite.dat \
     https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
 
   run_cmd "Скачиваю geoip.dat" \
-    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    curl -fsSL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
     -o geoip.dat \
     https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
 
   run_cmd "Скачиваю geosite_2.dat (RU rules)" \
-    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    curl -fsSL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
     -o geosite_2.dat \
     "$RU_GEOSITE_URL"
 
   run_cmd "Скачиваю geoip_2.dat (RU rules)" \
-    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    curl -fsSL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
     -o geoip_2.dat \
     "$RU_GEOIP_URL"
 
