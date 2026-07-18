@@ -1114,8 +1114,10 @@ EOF_SYSCTL
   # Не используем run_cmd, чтобы при этом не сыпать в терминал полный дамп
   # лога через show_last_log — это ожидаемый сценарий, а не сбой установки.
   local sysctl_out sysctl_rc skipped_count
+  set +e
   sysctl_out="$(sysctl --system 2>&1)"
   sysctl_rc=$?
+  set -e
   log_line "sysctl --system output:"
   log_line "$sysctl_out"
 
