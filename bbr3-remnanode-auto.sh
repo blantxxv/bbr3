@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.6.2"
+SCRIPT_VERSION="2.6.3"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -365,7 +365,36 @@ find_existing_certificates() {
 }
 
 detect_iface() {
-  ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+  ip route show default 2>/dev/null | awk '/default/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+}
+
+# Определяет, что скрипт выполняется внутри контейнера (LXC/OpenVZ/Docker),
+# а не на железном/полноценном виртуальном сервере со своим ядром. Внутри
+# контейнера ядро общее с хостом Proxmox: свой kernel-пакет ставить нельзя,
+# и часть sysctl/sysfs операций сети недоступна из-за ограничений
+# namespace/capabilities контейнера — это не сбой, а особенность окружения.
+is_container_env() {
+  # OpenVZ
+  [[ -f /proc/user_beancounters ]] && return 0
+
+  # systemd умеет определять контейнер напрямую (в т.ч. lxc на Proxmox)
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    local virt
+    virt="$(systemd-detect-virt --container 2>/dev/null || true)"
+    [[ -n "$virt" && "$virt" != "none" ]] && return 0
+  fi
+
+  # Переменная окружения container=, которую проставляет lxc-init/liblxc
+  if [[ -r /proc/1/environ ]] && tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -q '^container='; then
+    return 0
+  fi
+
+  # cgroup-путь процесса 1 внутри lxc/docker обычно содержит имя движка
+  if grep -qaE '(lxc|docker|containerd)' /proc/1/cgroup 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
 }
 
 docker_compose() {
@@ -887,6 +916,13 @@ check_cpu_level() {
 install_xanmod_kernel() {
   section "3/12 · XanMod kernel $KERNEL_VER"
 
+  if is_container_env; then
+    KERNEL_INSTALL_SKIPPED=1
+    warn "Обнаружено контейнерное окружение (LXC/OpenVZ) — ядро общее с хостом Proxmox, свой kernel-пакет здесь ставить нельзя и не нужно."
+    info "Пропускаю установку XanMod и связанный с ней reboot. Сетевой тюнинг всё равно применится там, где это разрешено ядром хоста и правами контейнера."
+    return 0
+  fi
+
   if [[ "$CPU_LEVEL" == "v1" || "$CPU_LEVEL" == "v2" ]]; then
     KERNEL_INSTALL_SKIPPED=1
     warn "Пропускаю установку XanMod x64v3 ядра: CPU level ${CPU_LEVEL:-unknown} ниже требуемого v3."
@@ -1002,13 +1038,17 @@ maybe_reboot() {
   echo
 
   sleep 5
-  reboot
+  reboot || warn "Команда reboot вернула ошибку (типично для среды без прав на перезагрузку хоста). Перезагрузи сервер вручную и запусти скрипт с --continue."
 }
 
 apply_network_tuning() {
   section "4/12 · Сетевой тюнинг"
 
-  modprobe tcp_bbr >> "$LOG_FILE" 2>&1 || true
+  if is_container_env; then
+    info "Обнаружено контейнерное окружение (LXC/OpenVZ) — часть sysctl-параметров (net./vm./fs.) может быть недоступна для записи из контейнера: 'Operation not permitted' или 'Read-only file system'. Это ожидаемо, не ошибка установки — скрипт применит то, что разрешено правами контейнера, и пропустит остальное."
+  fi
+
+  modprobe tcp_bbr >> "$LOG_FILE" 2>&1 || warn "Не удалось загрузить модуль tcp_bbr (ожидаемо в контейнере без CAP_SYS_MODULE) — продолжаю."
 
   cat >/etc/sysctl.d/99-net-tuning.conf <<'EOF_SYSCTL'
 net.ipv4.tcp_congestion_control = bbr
@@ -1064,7 +1104,8 @@ vm.max_map_count = 262144
 vm.min_free_kbytes = 131072
 EOF_SYSCTL
 
-  run_cmd "Применяю sysctl параметры" sysctl --system
+  run_cmd "Применяю sysctl параметры" sysctl --system \
+    || warn "Часть sysctl-параметров не применилась (типично для LXC/OpenVZ-контейнера) — не критично, продолжаю установку."
 
   local cc qdisc
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
@@ -1090,8 +1131,10 @@ ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/transparent_hugepage/enabled ] && echo
 WantedBy=multi-user.target
 EOF_SERVICE
 
-  run_cmd "Включаю disable-thp.service" systemctl daemon-reload
-  run_cmd "Отключаю THP" systemctl enable --now disable-thp.service
+  run_cmd "Включаю disable-thp.service" systemctl daemon-reload \
+    || warn "systemctl daemon-reload вернул ошибку (типично для ограниченного контейнера) — продолжаю."
+  run_cmd "Отключаю THP" systemctl enable --now disable-thp.service \
+    || warn "Не удалось включить disable-thp.service (типично для контейнера без доступа к /sys/kernel/mm) — продолжаю."
 
   local thp
   thp="$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true)"
@@ -1168,8 +1211,10 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF_SERVICE
 
-  run_cmd "Перезагружаю systemd" systemctl daemon-reload
-  run_cmd "Включаю RPS" systemctl enable --now na-rps-lite.service
+  run_cmd "Перезагружаю systemd" systemctl daemon-reload \
+    || warn "systemctl daemon-reload вернул ошибку (типично для ограниченного контейнера) — продолжаю."
+  run_cmd "Включаю RPS" systemctl enable --now na-rps-lite.service \
+    || warn "Не удалось включить na-rps-lite.service (типично для контейнера без доступа к /sys/class/net/*/queues) — продолжаю."
 
   ok "RPS настроен для $iface"
 }
