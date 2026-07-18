@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.6.3"
+SCRIPT_VERSION="2.7.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -46,6 +46,11 @@ DOMAIN=""
 CERT_DIR=""
 CERT_OK=0
 DOMAIN_FILE="$STATE_DIR/domain"
+
+# Опциональный Hysteria2 (UDP) inbound поверх REALITY-установки. Hysteria2
+# всегда использует настоящий TLS (не Reality-маскировку), поэтому даже в
+# REALITY-режиме для него нужен отдельный домен + сертификат Let's Encrypt.
+HYSTERIA2_ENABLED=0
 
 # Список публичных зеркал Docker Hub на случай, если registry-1.docker.io
 # отдаёт 403/недоступен (блокировка/rate limit). Пробуем по очереди.
@@ -1104,15 +1109,38 @@ vm.max_map_count = 262144
 vm.min_free_kbytes = 131072
 EOF_SYSCTL
 
-  run_cmd "Применяю sysctl параметры" sysctl --system \
-    || warn "Часть sysctl-параметров не применилась (типично для LXC/OpenVZ-контейнера) — не критично, продолжаю установку."
+  # sysctl --system всегда возвращает ненулевой код, если хотя бы один ключ
+  # не применился (типично для LXC — часть net./vm./fs. параметров read-only).
+  # Не используем run_cmd, чтобы при этом не сыпать в терминал полный дамп
+  # лога через show_last_log — это ожидаемый сценарий, а не сбой установки.
+  local sysctl_out sysctl_rc skipped_count
+  sysctl_out="$(sysctl --system 2>&1)"
+  sysctl_rc=$?
+  log_line "sysctl --system output:"
+  log_line "$sysctl_out"
+
+  if [[ "$sysctl_rc" -eq 0 ]]; then
+    ok "sysctl параметры применены"
+  else
+    skipped_count="$(grep -c '^sysctl: setting key' <<< "$sysctl_out" || true)"
+    warn "sysctl: пропущено параметров: ${skipped_count:-?} (недоступны в этом окружении). Подробности: $LOG_FILE"
+  fi
 
   local cc qdisc
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
   qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
 
-  ok "TCP congestion control: ${cc:-unknown}"
-  ok "Default qdisc: ${qdisc:-unknown}"
+  if [[ -n "$cc" ]]; then
+    ok "TCP congestion control: $cc"
+  else
+    warn "TCP congestion control: не удалось определить"
+  fi
+
+  if [[ -n "$qdisc" ]]; then
+    ok "Default qdisc: $qdisc"
+  else
+    warn "Default qdisc: не удалось определить"
+  fi
 }
 
 disable_thp() {
@@ -1367,9 +1395,24 @@ run_final_test() {
   } >> "$LOG_FILE" 2>&1 || true
 
   ok "Kernel: $kernel"
-  ok "TCP CC: ${cc:-unknown}"
-  ok "Qdisc: ${qdisc:-unknown}"
-  ok "BBR module: ${bbr_version:-unknown}"
+
+  if [[ -n "$cc" ]]; then
+    ok "TCP CC: $cc"
+  else
+    warn "TCP CC: не удалось определить"
+  fi
+
+  if [[ -n "$qdisc" ]]; then
+    ok "Qdisc: $qdisc"
+  else
+    warn "Qdisc: не удалось определить"
+  fi
+
+  if [[ -n "$bbr_version" ]]; then
+    ok "BBR module: $bbr_version"
+  else
+    warn "BBR module: не загружен (типично для LXC-контейнера без CAP_SYS_MODULE)"
+  fi
 
   if [[ "$docker_v" == "Docker не установлен" ]]; then
     warn "$docker_v"
@@ -1586,13 +1629,35 @@ issue_tls_certificate() {
   done
 }
 
-# Диспетчер шага 11/12: REALITY — как раньше через selfsteal.sh,
-# TLS — выпуск сертификата через certbot.
+ask_enable_hysteria2() {
+  echo
+  read -rp "  Добавить Hysteria2 (UDP) inbound к этой ноде? [y/N]: " ans
+
+  case "${ans,,}" in
+    y|yes|д|да)
+      HYSTERIA2_ENABLED=1
+      ok "Hysteria2 будет добавлен."
+      info "Hysteria2 использует настоящий TLS (не Reality-маскировку) — потребуется отдельный домен и сертификат Let's Encrypt."
+      ;;
+    *)
+      HYSTERIA2_ENABLED=0
+      ok "Hysteria2 пропущен."
+      ;;
+  esac
+}
+
+# Диспетчер шага 11/12: REALITY — как раньше через selfsteal.sh (+ опционально
+# Hysteria2 поверх), TLS — выпуск сертификата через certbot.
 step_transport_setup() {
   if [[ "$NODE_INSTALL_TYPE" == "tls" ]]; then
     issue_tls_certificate
   else
     optional_selfsteal
+    ask_enable_hysteria2
+
+    if [[ "$HYSTERIA2_ENABLED" -eq 1 ]]; then
+      issue_tls_certificate
+    fi
   fi
 }
 
@@ -1748,6 +1813,29 @@ prepare_node_paths() {
   ok "Контейнер: $CONTAINER_NAME"
 }
 
+# TCP и UDP — независимые пространства портов ядра: сервис на TCP:443 и
+# сервис на UDP:443 не конфликтуют. Поэтому здесь намеренно нет проверки
+# "порт Hysteria2 не должен совпадать с портом VLESS+TLS" — совпадение
+# номера порта совершенно нормально (именно так делает Reality+Hysteria2
+# на 443 в примере пользователя).
+ask_hysteria2_port() {
+  local input=""
+
+  while true; do
+    read -rp "  Порт Hysteria2 (UDP) [${DEFAULT_HY2_PORT}]: " input
+    input="${input:-$DEFAULT_HY2_PORT}"
+
+    if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
+      HY2_PORT="$((10#$input))"
+      break
+    fi
+
+    warn "Некорректный порт. Нужно число от 1 до 65535."
+  done
+
+  ok "Порт Hysteria2 (UDP): $HY2_PORT"
+}
+
 ask_tls_ports() {
   local input=""
 
@@ -1763,20 +1851,11 @@ ask_tls_ports() {
     warn "Некорректный порт. Нужно число от 1 до 65535."
   done
 
-  while true; do
-    read -rp "  Порт Hysteria2 [${DEFAULT_HY2_PORT}]: " input
-    input="${input:-$DEFAULT_HY2_PORT}"
+  ask_hysteria2_port
 
-    if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )) && [[ "$((10#$input))" -ne "$TLS_VLESS_PORT" ]]; then
-      HY2_PORT="$((10#$input))"
-      break
-    fi
-
-    warn "Некорректный порт (или совпадает с портом VLESS+TLS)."
-  done
-
-  ok "Порт VLESS+TLS: $TLS_VLESS_PORT"
-  ok "Порт Hysteria2: $HY2_PORT"
+  if [[ "$HY2_PORT" -eq "$TLS_VLESS_PORT" ]]; then
+    info "Hysteria2 (UDP) и VLESS+TLS (TCP) используют один и тот же номер порта $HY2_PORT — это нормально, TCP и UDP независимы."
+  fi
 }
 
 # Генерирует готовый конфиг инбаундов для панели Remnawave: VLESS+TCP+TLS и
@@ -1946,6 +2025,88 @@ EOF_PANEL
   info "Скопируй JSON выше (или файл $config_path) в конфиг инбаундов ноды в панели Remnawave."
 }
 
+# Генерирует Hysteria2-инбаунд (JSON-фрагмент) для REALITY-установок.
+# Сам VLESS+REALITY inbound управляется отдельно (selfsteal.sh / вручную в
+# панели), поэтому здесь только объект инбаунда Hysteria2 — его нужно
+# добавить в массив "inbounds" существующего конфига ноды в панели, рядом
+# с REALITY-инбаундом. Порт Hysteria2 (UDP) может совпадать по номеру с
+# портом REALITY (TCP) — это разные протоколы, конфликта нет.
+generate_hysteria2_panel_config() {
+  section "Конфиг Hysteria2 для панели"
+
+  local hy2_tag hy2_password config_path
+
+  hy2_tag="HYSTERIA2_SALAMANDER_${HY2_PORT}"
+  hy2_password="$(openssl rand -base64 32)"
+  config_path="$REMNANODE_DIR/panel-inbound-hysteria2.json"
+
+  cat > "$config_path" <<EOF_HY2
+{
+  "tag": "$hy2_tag",
+  "port": $HY2_PORT,
+  "listen": "0.0.0.0",
+  "protocol": "hysteria",
+  "settings": {
+    "users": [],
+    "clients": [],
+    "version": 2,
+    "ignoreClientBandwidth": false
+  },
+  "sniffing": {
+    "enabled": true,
+    "destOverride": [
+      "http",
+      "tls",
+      "quic"
+    ]
+  },
+  "streamSettings": {
+    "network": "hysteria",
+    "security": "tls",
+    "tlsSettings": {
+      "alpn": [
+        "h3"
+      ],
+      "serverName": "$DOMAIN",
+      "certificates": [
+        {
+          "keyFile": "$CERT_DIR/privkey.pem",
+          "certificateFile": "$CERT_DIR/fullchain.pem"
+        }
+      ]
+    },
+    "hysteriaSettings": {
+      "obfs": {
+        "type": "salamander",
+        "password": "$hy2_password"
+      },
+      "version": 2,
+      "udpIdleTimeout": 60
+    }
+  }
+}
+EOF_HY2
+
+  chmod 600 "$config_path"
+
+  if command -v jq >/dev/null 2>&1; then
+    if jq empty "$config_path" >/dev/null 2>&1; then
+      ok "JSON инбаунда Hysteria2 валиден"
+    else
+      warn "JSON инбаунда Hysteria2 не прошёл проверку jq. Проверь файл вручную: $config_path"
+    fi
+  fi
+
+  ok "Готовый инбаунд Hysteria2 сохранён: $config_path"
+  echo
+  echo "${C_DIM}────────────────────────────────────────────────────────────${C_RESET}"
+  cat "$config_path"
+  echo "${C_DIM}────────────────────────────────────────────────────────────${C_RESET}"
+  echo
+  info "Добавь этот объект в массив \"inbounds\" конфига ноды в панели Remnawave — рядом с существующим VLESS+REALITY инбаундом."
+  info "Порт $HY2_PORT/UDP (Hysteria2) может совпадать по номеру с портом REALITY по TCP — это независимые протоколы."
+}
+
 # Скачивает docker-образ с несколькими попытками, а при явном отказе Docker
 # Hub (например, "403 Forbidden" от registry-1.docker.io — блокировка/лимит
 # по IP) пробует публичные зеркала из DOCKER_HUB_MIRRORS и перетегирует
@@ -1987,6 +2148,8 @@ setup_remnanode() {
 
   if [[ "$NODE_INSTALL_TYPE" == "tls" ]]; then
     ask_tls_ports
+  elif [[ "$HYSTERIA2_ENABLED" -eq 1 ]]; then
+    ask_hysteria2_port
   fi
 
   echo
@@ -2098,6 +2261,13 @@ EOF_COMPOSE
       warn "Сертификат не был выпущен — пропускаю генерацию готового конфига для панели."
       warn "Выпусти сертификат вручную и добавь TLS-инбаунды в панели самостоятельно."
     fi
+  elif [[ "$HYSTERIA2_ENABLED" -eq 1 ]]; then
+    if [[ "$CERT_OK" -eq 1 ]]; then
+      generate_hysteria2_panel_config
+    else
+      warn "Сертификат для Hysteria2 не был выпущен — пропускаю генерацию инбаунда."
+      warn "Выпусти сертификат вручную и добавь Hysteria2-инбаунд в панели самостоятельно."
+    fi
   fi
 }
 
@@ -2180,6 +2350,10 @@ stage_after_reboot() {
   if [[ "$NODE_INSTALL_TYPE" == "tls" && "$CERT_OK" -eq 1 ]]; then
     echo "  Конфиг инбаундов для панели:"
     echo "    $REMNANODE_DIR/panel-inbounds.json"
+    echo
+  elif [[ "$HYSTERIA2_ENABLED" -eq 1 && "$CERT_OK" -eq 1 ]]; then
+    echo "  Конфиг инбаунда Hysteria2 для панели:"
+    echo "    $REMNANODE_DIR/panel-inbound-hysteria2.json"
     echo
   fi
 }
