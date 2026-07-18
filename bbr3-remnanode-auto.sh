@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.7.0"
+SCRIPT_VERSION="2.7.0.1"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -1281,7 +1281,21 @@ install_docker() {
 
   mkdir -p /etc/docker
 
-  cat >/etc/docker/daemon.json <<'EOF_DOCKER'
+  # В LXC-контейнере ulimit -Hn/-Hu ограничены потолком родительского
+  # контейнера — фиксированные 1048576 как default-ulimits дают "operation
+  # not permitted" при старте ЛЮБОГО контейнера без явных своих ulimits.
+  # Берём реально достижимый потолок этого окружения (на bare metal/VM он
+  # обычно и есть 1048576+, так что поведение там не меняется).
+  local docker_nofile_limit docker_nproc_limit
+  docker_nofile_limit="$(ulimit -Hn 2>/dev/null || true)"
+  [[ "$docker_nofile_limit" =~ ^[0-9]+$ ]] || docker_nofile_limit=1048576
+  (( docker_nofile_limit > 1048576 )) && docker_nofile_limit=1048576
+
+  docker_nproc_limit="$(ulimit -Hu 2>/dev/null || true)"
+  [[ "$docker_nproc_limit" =~ ^[0-9]+$ ]] || docker_nproc_limit=1048576
+  (( docker_nproc_limit > 1048576 )) && docker_nproc_limit=1048576
+
+  cat >/etc/docker/daemon.json <<EOF_DOCKER
 {
   "log-driver": "json-file",
   "log-opts": {
@@ -1294,13 +1308,13 @@ install_docker() {
   "default-ulimits": {
     "nofile": {
       "Name": "nofile",
-      "Hard": 1048576,
-      "Soft": 1048576
+      "Hard": $docker_nofile_limit,
+      "Soft": $docker_nofile_limit
     },
     "nproc": {
       "Name": "nproc",
-      "Hard": 1048576,
-      "Soft": 1048576
+      "Hard": $docker_nproc_limit,
+      "Soft": $docker_nproc_limit
     }
   },
   "live-restore": true
@@ -2199,6 +2213,22 @@ EOF_ENV
     cert_volume_line="      - /etc/letsencrypt:/etc/letsencrypt:ro"
   fi
 
+  # runc не может поднять rlimit контейнера выше жёсткого потолка своего
+  # родительского процесса ("operation not permitted", errno EPERM для
+  # setrlimit). В LXC-контейнере этот потолок (ulimit -Hn) обычно намного
+  # ниже 1048576, поэтому вместо фиксированного значения берём то, что
+  # реально достижимо в этом окружении — на bare metal/полноценной VM
+  # ulimit -Hn обычно и есть 1048576+, так что поведение не меняется.
+  local nofile_limit
+  nofile_limit="$(ulimit -Hn 2>/dev/null || true)"
+  if [[ -z "$nofile_limit" || "$nofile_limit" == "unlimited" ]] || ! [[ "$nofile_limit" =~ ^[0-9]+$ ]]; then
+    nofile_limit=1048576
+  fi
+  if (( nofile_limit > 1048576 )); then
+    nofile_limit=1048576
+  fi
+  info "Лимит nofile для контейнера ноды: $nofile_limit (потолок этого окружения: $(ulimit -Hn 2>/dev/null || echo unknown))"
+
   cat > "$REMNANODE_DIR/docker-compose.yml" <<EOF_COMPOSE
 name: $COMPOSE_PROJECT_NAME
 
@@ -2220,8 +2250,8 @@ services:
 ${cert_volume_line}
     ulimits:
       nofile:
-        soft: 1048576
-        hard: 1048576
+        soft: $nofile_limit
+        hard: $nofile_limit
     env_file:
       - .env
 EOF_COMPOSE
