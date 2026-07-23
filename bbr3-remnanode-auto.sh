@@ -3427,14 +3427,37 @@ ufw_allow_if_active() {
   ufw allow "$spec" >/dev/null 2>&1 || true
 }
 
+# Открывает порт(ы) уже установленных нод (NODE_PORT из их .env) — через них
+# панель Remnawave достукивается до ноды. Контейнер поднят с network_mode: host,
+# поэтому нода слушает этот порт прямо на хосте. Печатает открытые порты.
+firewall_allow_node_ports() {
+  local d port opened=()
+
+  for d in /opt/remnanode /root/remnanode /home/*/remnanode /opt/*-Node; do
+    [[ -f "$d/.env" && -f "$d/docker-compose.yml" ]] || continue
+    grep -q 'remnawave/node' "$d/docker-compose.yml" 2>/dev/null || continue
+
+    port="$(grep -E '^NODE_PORT=' "$d/.env" 2>/dev/null | head -n1 | cut -d= -f2 | tr -d '[:space:]')"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || continue
+
+    ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+    opened+=("$port")
+  done
+
+  [[ ${#opened[@]} -gt 0 ]] && info "Порты нод (NODE_PORT) открыты: ${opened[*]}"
+  return 0
+}
+
 # По умолчанию всегда открыты 22/tcp (SSH), 80/tcp, 443/tcp и 443/udp
-# (QUIC/HTTP3/Hysteria2 идут по UDP). SSH первым — чтобы не потерять доступ
-# при включении фаервола.
+# (QUIC/HTTP3/Hysteria2 идут по UDP), плюс порты установленных нод. SSH первым —
+# чтобы не потерять доступ при включении фаервола.
 apply_firewall_defaults() {
   ufw allow 22/tcp  >/dev/null 2>&1 || true
   ufw allow 80/tcp  >/dev/null 2>&1 || true
   ufw allow 443/tcp >/dev/null 2>&1 || true
   ufw allow 443/udp >/dev/null 2>&1 || true
+
+  firewall_allow_node_ports
 }
 
 firewall_show() {
@@ -3462,7 +3485,7 @@ manage_firewall() {
     return 1
   fi
 
-  info "По умолчанию всегда открыты 22/tcp (SSH), 80/tcp, 443/tcp и 443/udp."
+  info "По умолчанию открыты 22/tcp (SSH), 80/tcp, 443/tcp, 443/udp и порты установленных нод."
   apply_firewall_defaults
 
   local choice port
@@ -3510,7 +3533,7 @@ manage_firewall() {
       3)
         apply_firewall_defaults
         if ufw --force enable >/dev/null 2>&1; then
-          ok "UFW включён (22/tcp, 80/tcp, 443/tcp, 443/udp и добавленные порты открыты)."
+          ok "UFW включён (22/tcp, 80/tcp, 443/tcp, 443/udp, порты нод и добавленные порты открыты)."
         else
           warn "Не удалось включить UFW."
         fi
