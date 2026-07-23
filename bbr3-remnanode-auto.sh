@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.2.3"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -1091,20 +1091,26 @@ setup_xanmod_repo() {
     return 1
   fi
 
-  echo "deb [signed-by=$XANMOD_KEYRING] http://deb.xanmod.org releases main" > "$XANMOD_REPO_LIST"
+  # Пробуем и http, и https — иногда у deb.xanmod.org (за Cloudflare) битый
+  # только один из эндпоинтов. apt-get update гоняем тихо: недоступный XanMod
+  # это не сбой установки (нода поставится и без своего ядра), поэтому не
+  # используем run_cmd, чтобы не пугать красным [FAIL] и не дампить лог.
+  local scheme
+  for scheme in https http; do
+    echo "deb [signed-by=$XANMOD_KEYRING] ${scheme}://deb.xanmod.org releases main" > "$XANMOD_REPO_LIST"
+    log_line "XanMod repo: пробую ${scheme}://deb.xanmod.org"
+    if env DEBIAN_FRONTEND=noninteractive apt-get update >> "$LOG_FILE" 2>&1; then
+      ok "Репозиторий XanMod подключён (${scheme})."
+      return 0
+    fi
+  done
 
-  # Если репозиторий XanMod недоступен (404/нет Release — бывает при проблемах
-  # CDN), сразу убираем его .list, чтобы он не сломал apt на следующих шагах
-  # (Docker, пакеты и т.д.).
-  if ! run_cmd "Обновляю APT index (XanMod repo)" \
-    env DEBIAN_FRONTEND=noninteractive apt-get update; then
-    warn "Репозиторий XanMod сейчас недоступен — убираю его, чтобы не мешал остальной установке."
-    rm -f "$XANMOD_REPO_LIST"
-    env DEBIAN_FRONTEND=noninteractive apt-get update >> "$LOG_FILE" 2>&1 || true
-    return 1
-  fi
-
-  return 0
+  # Оба варианта не сработали — убираем .list, чтобы он не ломал apt на
+  # следующих шагах, и восстанавливаем чистый индекс.
+  warn "Репозиторий XanMod сейчас недоступен (deb.xanmod.org отдаёт 404 — временная проблема их CDN). Пропускаю ядро, продолжаю без него."
+  rm -f "$XANMOD_REPO_LIST"
+  env DEBIAN_FRONTEND=noninteractive apt-get update >> "$LOG_FILE" 2>&1 || true
+  return 1
 }
 
 install_xanmod_kernel() {
