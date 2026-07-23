@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.8.1"
+SCRIPT_VERSION="2.9.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -57,6 +57,16 @@ REALITY_TARGET_PORT=""
 # Репозиторий ядра Xray-core (для пункта меню «Обновление ядра xray»).
 XRAY_CORE_REPO="XTLS/Xray-core"
 XRAY_CORE_ASSET="Xray-linux-64.zip"
+
+# Случайный суффикс для тегов инбаундов (схема: протокол+порт+рандом), чтобы
+# имена были уникальными между нодами и их не приходилось править руками.
+# Заполняется один раз при установке ноды.
+TAG_SUFFIX=""
+
+# Строка монтирования кастомного ядра Xray в docker-compose (пусто = ядро,
+# встроенное в образ remnawave/node). Заполняется, если при установке выбрали
+# конкретную версию ядра.
+XRAY_VOLUME_LINE=""
 
 # Тип установки: "reality" (TCP+REALITY, как раньше) или "tls" (TCP+TLS со своим доменом)
 NODE_INSTALL_TYPE=""
@@ -1892,6 +1902,14 @@ sanitize_compose_name() {
   echo "$raw"
 }
 
+# Короткий случайный суффикс (4 символа a-z0-9) для уникальности тегов.
+gen_tag_suffix() {
+  local s
+  s="$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 4 || true)"
+  [[ -n "$s" ]] || s="$(printf '%04x' "$((RANDOM % 65536))")"
+  echo "$s"
+}
+
 ask_node_port() {
   local input=""
   local port_dec=""
@@ -2051,10 +2069,11 @@ ask_tls_ports() {
 generate_tls_panel_config() {
   section "Конфиг для панели"
 
-  local vless_tag hy2_tag hy2_password config_path
+  local vless_tag hy2_tag hy2_password config_path suffix
 
-  vless_tag="VLESS_TCP_TLS_${TLS_VLESS_PORT}"
-  hy2_tag="HYSTERIA2_SALAMANDER_${HY2_PORT}"
+  suffix="${TAG_SUFFIX:-$(gen_tag_suffix)}"
+  vless_tag="VLESS_TCP_TLS_${TLS_VLESS_PORT}_${suffix}"
+  hy2_tag="HYSTERIA2_SALAMANDER_${HY2_PORT}_${suffix}"
   hy2_password="$(openssl rand -base64 32)"
   config_path="$REMNANODE_DIR/panel-inbounds.json"
 
@@ -2220,9 +2239,10 @@ EOF_PANEL
 generate_hysteria2_panel_config() {
   section "Конфиг Hysteria2 для панели"
 
-  local hy2_tag hy2_password config_path
+  local hy2_tag hy2_password config_path suffix
 
-  hy2_tag="HYSTERIA2_SALAMANDER_${HY2_PORT}"
+  suffix="${TAG_SUFFIX:-$(gen_tag_suffix)}"
+  hy2_tag="HYSTERIA2_SALAMANDER_${HY2_PORT}_${suffix}"
   hy2_password="$(openssl rand -base64 32)"
   config_path="$REMNANODE_DIR/panel-inbound-hysteria2.json"
 
@@ -2367,8 +2387,9 @@ generate_reality_keys() {
 generate_reality_panel_config() {
   section "Конфиг REALITY для панели"
 
-  local short_id keys priv_key pub_key config_path
+  local short_id keys priv_key pub_key config_path suffix
 
+  suffix="${TAG_SUFFIX:-$(gen_tag_suffix)}"
   short_id="$(openssl rand -hex 8)"
 
   keys="$(generate_reality_keys || true)"
@@ -2391,7 +2412,7 @@ generate_reality_panel_config() {
   },
   "inbounds": [
     {
-      "tag": "VLESS_REALITY_${REALITY_PORT}",
+      "tag": "VLESS_REALITY_${REALITY_PORT}_${suffix}",
       "port": $REALITY_PORT,
       "listen": "0.0.0.0",
       "protocol": "vless",
@@ -2578,6 +2599,9 @@ setup_remnanode() {
   save_node_dir
   cd "$REMNANODE_DIR"
 
+  # Один суффикс на ноду — все её теги инбаундов будут уникальны между нодами.
+  TAG_SUFFIX="$(gen_tag_suffix)"
+
   run_cmd "Скачиваю geosite.dat" \
     curl -fsSL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
     -o geosite.dat \
@@ -2606,6 +2630,9 @@ SECRET_KEY=$SECRET_KEY
 EOF_ENV
 
   chmod 600 "$REMNANODE_DIR/.env"
+
+  # Выбор ядра Xray до старта контейнера (может смонтировать своё ядро).
+  setup_xray_core_for_install
 
   local cert_volume_line=""
   if [[ "$NODE_INSTALL_TYPE" == "tls" && "$CERT_OK" -eq 1 ]]; then
@@ -2647,6 +2674,7 @@ services:
       - ./geoip_2.dat:/usr/local/share/xray/geoip_2.dat:ro
       - ./logs:/var/log/remnanode
 ${cert_volume_line}
+${XRAY_VOLUME_LINE}
     ulimits:
       nofile:
         soft: $nofile_limit
@@ -2749,6 +2777,137 @@ ensure_xray_volume_mounted() {
   return 1
 }
 
+# Показывает меню выбора версии ядра Xray и печатает выбранный тег в stdout
+# (пусто = пропустить/оставить как есть). Всё меню и подсказки идут в stderr,
+# чтобы не мешать захвату результата через $(...). $1="1" добавляет пункт
+# «оставить встроенное в образ ядро» вместо «Отмена».
+select_xray_version() {
+  local allow_keep="${1:-0}"
+  local releases_json stable_ver actual_ver choice target_ver input keep_label
+
+  releases_json="$(fetch_xray_releases_json)"
+  if [[ -z "$releases_json" ]]; then
+    warn "Не удалось получить список релизов Xray с GitHub. Проверь сеть." >&2
+    return 1
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    actual_ver="$(echo "$releases_json" | jq -r '.[0].tag_name' 2>/dev/null || true)"
+    stable_ver="$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false)][0].tag_name' 2>/dev/null || true)"
+  else
+    actual_ver="$(echo "$releases_json" | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')"
+    stable_ver="$actual_ver"
+  fi
+
+  [[ "$actual_ver" == "null" ]] && actual_ver=""
+  [[ "$stable_ver" == "null" ]] && stable_ver=""
+
+  if [[ -z "$actual_ver" && -z "$stable_ver" ]]; then
+    warn "Не удалось определить версии релизов Xray." >&2
+    return 1
+  fi
+
+  if [[ "$allow_keep" == "1" ]]; then
+    keep_label="  ${C_GREEN}0${C_RESET}) Оставить ядро, встроенное в образ (по умолчанию)"
+  else
+    keep_label="  ${C_YELLOW}0${C_RESET}) Отмена"
+  fi
+
+  {
+    echo
+    echo "  Доступные версии ядра Xray:"
+    echo
+    echo "  ${C_GREEN}1${C_RESET}) Стабильная: ${stable_ver:-неизвестно}"
+    echo "  ${C_GREEN}2${C_RESET}) Актуальная (последний релиз, возможно pre-release): ${actual_ver:-неизвестно}"
+    echo "  ${C_GREEN}3${C_RESET}) Ввести версию вручную (например, v1.8.24)"
+    echo "$keep_label"
+    echo
+  } >&2
+
+  while true; do
+    read -rp "  Выбор [1/2/3/0]: " choice
+    case "${choice:-}" in
+      1) target_ver="$stable_ver"; break ;;
+      2) target_ver="$actual_ver"; break ;;
+      3)
+        read -rp "  Тег версии (с v, например v1.8.24): " input
+        input="$(echo "${input:-}" | tr -d '[:space:]')"
+        if [[ "$input" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+          [[ "$input" == v* ]] || input="v$input"
+          target_ver="$input"
+          break
+        fi
+        warn "Некорректный тег версии." >&2
+        ;;
+      0) echo ""; return 0 ;;
+      *) warn "Некорректный выбор." >&2 ;;
+    esac
+  done
+
+  echo "$target_ver"
+}
+
+# Скачивает бинарник ядра Xray указанного тега и кладёт в <dest_dir>/xray
+# (исполняемым). Возвращает 0 при успехе.
+download_xray_core() {
+  local tag="$1" dest_dir="$2"
+  local url tmpdir
+
+  url="https://github.com/${XRAY_CORE_REPO}/releases/download/${tag}/${XRAY_CORE_ASSET}"
+  tmpdir="$(mktemp -d)"
+
+  if ! run_cmd "Скачиваю Xray $tag" \
+    curl -fL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG -o "$tmpdir/xray.zip" "$url"; then
+    rm -rf "$tmpdir"
+    warn "Не удалось скачать ядро Xray $tag. Проверь, что такой релиз существует."
+    return 1
+  fi
+
+  if ! run_cmd "Распаковываю Xray" unzip -o "$tmpdir/xray.zip" -d "$tmpdir"; then
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  if [[ ! -f "$tmpdir/xray" ]]; then
+    rm -rf "$tmpdir"
+    warn "В архиве не найден бинарник xray."
+    return 1
+  fi
+
+  install -m 0755 "$tmpdir/xray" "$dest_dir/xray"
+  rm -rf "$tmpdir"
+  ok "Бинарник ядра сохранён: $dest_dir/xray"
+}
+
+# Спрашивает и (при выборе) скачивает конкретное ядро Xray в папку ноды ещё
+# до первого запуска контейнера. «Оставить встроенное» — ничего не монтируем,
+# нода берёт xray из образа. Заполняет XRAY_VOLUME_LINE для docker-compose.
+setup_xray_core_for_install() {
+  section "Ядро Xray для ноды"
+  info "Можно поставить конкретную версию ядра Xray сразу, либо оставить встроенное в образ (обновишь позже пунктом меню «Обновление ядра Xray»)."
+
+  XRAY_VOLUME_LINE=""
+
+  local target_ver
+  if ! target_ver="$(select_xray_version 1)"; then
+    warn "Не удалось получить версии ядра — оставляю ядро, встроенное в образ."
+    return 0
+  fi
+
+  if [[ -z "$target_ver" ]]; then
+    ok "Оставляю ядро, встроенное в образ remnawave/node."
+    return 0
+  fi
+
+  ok "Выбрана версия ядра: $target_ver"
+
+  if download_xray_core "$target_ver" "$REMNANODE_DIR"; then
+    XRAY_VOLUME_LINE="      - ./xray:/usr/local/bin/xray:ro"
+  else
+    warn "Не удалось скачать ядро $target_ver — нода запустится со встроенным в образ ядром."
+  fi
+}
+
 update_xray_core() {
   section "Обновление ядра Xray"
 
@@ -2778,90 +2937,19 @@ update_xray_core() {
     info "Текущую версию Xray определить не удалось (контейнер не запущен или xray недоступен) — продолжаю."
   fi
 
-  local releases_json stable_ver actual_ver
-  releases_json="$(fetch_xray_releases_json)"
-
-  if [[ -z "$releases_json" ]]; then
-    warn "Не удалось получить список релизов Xray с GitHub. Проверь сеть."
+  local target_ver
+  if ! target_ver="$(select_xray_version 0)"; then
     return 1
   fi
 
-  if command -v jq >/dev/null 2>&1; then
-    actual_ver="$(echo "$releases_json" | jq -r '.[0].tag_name' 2>/dev/null || true)"
-    stable_ver="$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false)][0].tag_name' 2>/dev/null || true)"
-  else
-    actual_ver="$(echo "$releases_json" | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')"
-    stable_ver="$actual_ver"
+  if [[ -z "$target_ver" ]]; then
+    ok "Отменено."
+    return 0
   fi
-
-  [[ "$actual_ver" == "null" ]] && actual_ver=""
-  [[ "$stable_ver" == "null" ]] && stable_ver=""
-
-  if [[ -z "$actual_ver" && -z "$stable_ver" ]]; then
-    warn "Не удалось определить версии релизов Xray."
-    return 1
-  fi
-
-  echo
-  echo "  Доступные версии ядра Xray:"
-  echo
-  echo "  ${C_GREEN}1${C_RESET}) Стабильная: ${stable_ver:-неизвестно}"
-  echo "  ${C_GREEN}2${C_RESET}) Актуальная (последний релиз, возможно pre-release): ${actual_ver:-неизвестно}"
-  echo "  ${C_GREEN}3${C_RESET}) Ввести версию вручную (например, v1.8.24)"
-  echo "  ${C_YELLOW}0${C_RESET}) Отмена"
-  echo
-
-  local choice target_ver input
-  while true; do
-    read -rp "  Выбор [1/2/3/0]: " choice
-    case "${choice:-}" in
-      1) target_ver="$stable_ver"; break ;;
-      2) target_ver="$actual_ver"; break ;;
-      3)
-        read -rp "  Тег версии (с v, например v1.8.24): " input
-        input="$(echo "${input:-}" | tr -d '[:space:]')"
-        if [[ "$input" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-          [[ "$input" == v* ]] || input="v$input"
-          target_ver="$input"
-          break
-        fi
-        warn "Некорректный тег версии."
-        ;;
-      0) ok "Отменено."; return 0 ;;
-      *) warn "Некорректный выбор." ;;
-    esac
-  done
-
-  [[ -n "$target_ver" ]] || { warn "Версия не выбрана."; return 1; }
 
   ok "Выбрана версия ядра: $target_ver"
 
-  local url tmpdir
-  url="https://github.com/${XRAY_CORE_REPO}/releases/download/${target_ver}/${XRAY_CORE_ASSET}"
-  tmpdir="$(mktemp -d)"
-
-  if ! run_cmd "Скачиваю Xray $target_ver" \
-    curl -fL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG -o "$tmpdir/xray.zip" "$url"; then
-    rm -rf "$tmpdir"
-    warn "Не удалось скачать ядро Xray $target_ver. Проверь, что такой релиз существует."
-    return 1
-  fi
-
-  if ! run_cmd "Распаковываю Xray" unzip -o "$tmpdir/xray.zip" -d "$tmpdir"; then
-    rm -rf "$tmpdir"
-    return 1
-  fi
-
-  if [[ ! -f "$tmpdir/xray" ]]; then
-    rm -rf "$tmpdir"
-    warn "В архиве не найден бинарник xray."
-    return 1
-  fi
-
-  # Кладём новый бинарник рядом с нодой и делаем исполняемым.
-  install -m 0755 "$tmpdir/xray" "$REMNANODE_DIR/xray"
-  rm -rf "$tmpdir"
-  ok "Бинарник ядра сохранён: $REMNANODE_DIR/xray"
+  download_xray_core "$target_ver" "$REMNANODE_DIR" || return 1
 
   ensure_xray_volume_mounted || true
 
@@ -2960,10 +3048,15 @@ stage_after_reboot() {
     echo "  Конфиг инбаундов для панели:"
     echo "    $REMNANODE_DIR/panel-inbounds.json"
     echo
-  elif [[ "$HYSTERIA2_ENABLED" -eq 1 && "$CERT_OK" -eq 1 ]]; then
-    echo "  Конфиг инбаунда Hysteria2 для панели:"
-    echo "    $REMNANODE_DIR/panel-inbound-hysteria2.json"
+  elif [[ "$NODE_INSTALL_TYPE" == "reality" ]]; then
+    echo "  Конфиг инбаундов для панели:"
+    echo "    $REMNANODE_DIR/panel-inbounds.json"
     echo
+    if [[ "$HYSTERIA2_ENABLED" -eq 1 && "$CERT_OK" -eq 1 ]]; then
+      echo "  Конфиг инбаунда Hysteria2 для панели:"
+      echo "    $REMNANODE_DIR/panel-inbound-hysteria2.json"
+      echo
+    fi
   fi
 }
 
