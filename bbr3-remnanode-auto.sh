@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.1.2"
+SCRIPT_VERSION="3.0.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -894,6 +894,78 @@ clean_bad_docker_apt_sources() {
   fi
 }
 
+# Запускает apt-get update и, если какой-то СТОРОННИЙ репозиторий сломан
+# (404/нет Release — типично для временно недоступного deb.xanmod.org или
+# чужого репо, оставшегося от прошлых запусков), отключает именно его .list
+# и повторяет — чтобы не валить всю установку. Официальные репозитории
+# дистрибутива (ubuntu/debian) не трогает (их сбой — это временная сеть).
+apt_update_resilient() {
+  local msg="Обновляю APT index"
+  local backup_dir="/etc/apt/sources.list.d.disabled-by-eclipse"
+  local attempt out rc err_urls url host files f disabled
+
+  mkdir -p "$backup_dir" "$(dirname "$LOG_FILE")"
+
+  for attempt in 1 2 3; do
+    log_line "START: $msg (попытка $attempt)"
+    set +e
+    out="$(env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update 2>&1)"
+    rc=$?
+    set -e
+    printf '%s\n' "$out" >> "$LOG_FILE"
+
+    if [[ $rc -eq 0 ]]; then
+      ok "$msg"
+      return 0
+    fi
+
+    # URL-ы репозиториев, давших ошибку (строки Err:/E: The repository ...).
+    err_urls="$(printf '%s\n' "$out" \
+      | grep -iE '^(Err:|E: The repository)' \
+      | grep -oE 'https?://[^ '"'"']+' | sort -u)"
+
+    disabled=0
+    while IFS= read -r url; do
+      [[ -n "$url" ]] || continue
+      host="$(echo "$url" | sed -E 's~https?://([^/]+).*~\1~')"
+
+      # Официальные репозитории дистрибутива не отключаем — их ошибка это сеть.
+      case "$host" in
+        *.ubuntu.com|*.debian.org|ubuntu.com|debian.org)
+          warn "Ошибка обновления официального репозитория ($host) — вероятно, временная сеть."
+          continue
+          ;;
+      esac
+
+      files="$(grep -rlE -- "$host" /etc/apt/sources.list.d 2>/dev/null || true)"
+      while IFS= read -r f; do
+        [[ -n "$f" && -e "$f" ]] || continue
+        warn "Сломанный сторонний репозиторий ($host) мешает apt update — отключаю: $f"
+        mv -f "$f" "$backup_dir/$(basename "$f").$(date +%s)" 2>/dev/null || rm -f "$f"
+        disabled=1
+      done <<< "$files"
+    done <<< "$err_urls"
+
+    # Нечего отключать — повторять смысла нет.
+    [[ "$disabled" -eq 1 ]] || break
+  done
+
+  # Финальная попытка после отключения сломанных репозиториев.
+  set +e
+  env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update >> "$LOG_FILE" 2>&1
+  rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    ok "$msg (после отключения сломанных сторонних репозиториев)"
+    return 0
+  fi
+
+  fail "$msg"
+  show_last_log
+  return "$rc"
+}
+
 ask_node_install_type() {
   section "Тип установки ноды"
 
@@ -934,7 +1006,7 @@ install_base_packages() {
   detect_os_info
   clean_bad_docker_apt_sources
 
-  run_cmd "Обновляю APT index" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update
+  apt_update_resilient
 
   local packages=(
     curl wget gpg ca-certificates nano vim htop btop git unzip jq
@@ -1021,8 +1093,16 @@ setup_xanmod_repo() {
 
   echo "deb [signed-by=$XANMOD_KEYRING] http://deb.xanmod.org releases main" > "$XANMOD_REPO_LIST"
 
-  run_cmd "Обновляю APT index (XanMod repo)" \
-    env DEBIAN_FRONTEND=noninteractive apt-get update || return 1
+  # Если репозиторий XanMod недоступен (404/нет Release — бывает при проблемах
+  # CDN), сразу убираем его .list, чтобы он не сломал apt на следующих шагах
+  # (Docker, пакеты и т.д.).
+  if ! run_cmd "Обновляю APT index (XanMod repo)" \
+    env DEBIAN_FRONTEND=noninteractive apt-get update; then
+    warn "Репозиторий XanMod сейчас недоступен — убираю его, чтобы не мешал остальной установке."
+    rm -f "$XANMOD_REPO_LIST"
+    env DEBIAN_FRONTEND=noninteractive apt-get update >> "$LOG_FILE" 2>&1 || true
+    return 1
+  fi
 
   return 0
 }
@@ -3524,6 +3604,55 @@ run_ookla_speedtest() {
   fi
 }
 
+# Если на сервере уже есть прошлая установка (нода Remnawave, контейнеры
+# Caddy/selfsteal), предлагает остановить/удалить их перед новой установкой,
+# чтобы не конфликтовали порты и старые процессы. По умолчанию — не трогать.
+offer_cleanup_previous() {
+  command -v docker >/dev/null 2>&1 || return 0
+
+  local d node_dirs=() caddy_ctrs
+  for d in /opt/remnanode /root/remnanode /home/*/remnanode /opt/*-Node; do
+    [[ -f "$d/docker-compose.yml" ]] || continue
+    grep -q 'remnawave/node' "$d/docker-compose.yml" 2>/dev/null && node_dirs+=("$d")
+  done
+
+  caddy_ctrs="$(docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null \
+    | grep -iE 'caddy|selfsteal|steal' | awk '{print $1}' | sort -u || true)"
+
+  # Есть ли вообще что чистить?
+  [[ ${#node_dirs[@]} -gt 0 || -n "$caddy_ctrs" ]] || return 0
+
+  section "Обнаружена предыдущая установка"
+  [[ ${#node_dirs[@]} -gt 0 ]] && info "Ноды Remnawave: ${node_dirs[*]}"
+  [[ -n "$caddy_ctrs" ]] && info "Контейнеры Caddy/selfsteal: $(echo "$caddy_ctrs" | tr '\n' ' ')"
+  echo
+  info "Можно остановить/удалить прошлое, чтобы освободить порты и не мешать новой установке."
+  read -rp "  Очистить предыдущую установку? [y/N]: " ans
+
+  case "${ans,,}" in
+    y|yes|д|да) ;;
+    *) ok "Оставляю прошлую установку как есть."; return 0 ;;
+  esac
+
+  local nd c
+  for nd in "${node_dirs[@]}"; do
+    run_shell "Останавливаю ноду в $nd" \
+      "cd '$nd' && { docker compose down 2>/dev/null || docker-compose down 2>/dev/null; } || true"
+  done
+
+  if [[ -n "$caddy_ctrs" ]]; then
+    while IFS= read -r c; do
+      [[ -n "$c" ]] || continue
+      run_shell "Удаляю контейнер $c" "docker rm -f '$c' >/dev/null 2>&1 || true"
+    done <<< "$caddy_ctrs"
+  fi
+
+  # На всякий случай останавливаем caddy, если он поднят как systemd-сервис.
+  systemctl stop caddy >/dev/null 2>&1 || true
+
+  ok "Предыдущая установка остановлена."
+}
+
 stage_before_reboot() {
   need_root
   print_banner
@@ -3543,6 +3672,7 @@ stage_before_reboot() {
     *) die "Отменено пользователем." ;;
   esac
 
+  offer_cleanup_previous
   ask_node_install_type
 
   install_base_packages
