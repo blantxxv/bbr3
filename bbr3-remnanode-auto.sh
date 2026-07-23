@@ -3427,13 +3427,14 @@ ufw_allow_if_active() {
   ufw allow "$spec" >/dev/null 2>&1 || true
 }
 
-# По умолчанию всегда открыты 22 (SSH), 80 и 443 — SSH первым, чтобы не
-# потерять доступ при включении фаервола.
+# По умолчанию всегда открыты 22/tcp (SSH), 80/tcp, 443/tcp и 443/udp
+# (QUIC/HTTP3/Hysteria2 идут по UDP). SSH первым — чтобы не потерять доступ
+# при включении фаервола.
 apply_firewall_defaults() {
-  ufw allow 22/tcp >/dev/null 2>&1 || true
-  ufw allow OpenSSH >/dev/null 2>&1 || true
+  ufw allow 22/tcp  >/dev/null 2>&1 || true
   ufw allow 80/tcp  >/dev/null 2>&1 || true
   ufw allow 443/tcp >/dev/null 2>&1 || true
+  ufw allow 443/udp >/dev/null 2>&1 || true
 }
 
 firewall_show() {
@@ -3461,7 +3462,7 @@ manage_firewall() {
     return 1
   fi
 
-  info "По умолчанию всегда открыты порты 22 (SSH), 80 и 443."
+  info "По умолчанию всегда открыты 22/tcp (SSH), 80/tcp, 443/tcp и 443/udp."
   apply_firewall_defaults
 
   local choice port
@@ -3509,7 +3510,7 @@ manage_firewall() {
       3)
         apply_firewall_defaults
         if ufw --force enable >/dev/null 2>&1; then
-          ok "UFW включён (22/80/443 и добавленные порты открыты)."
+          ok "UFW включён (22/tcp, 80/tcp, 443/tcp, 443/udp и добавленные порты открыты)."
         else
           warn "Не удалось включить UFW."
         fi
