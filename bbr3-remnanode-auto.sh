@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.2.7"
+SCRIPT_VERSION="3.2.8"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -97,9 +97,9 @@ DOCKER_HUB_MIRRORS=(
 )
 
 DEFAULT_TLS_VLESS_PORT="443"
-DEFAULT_HY2_PORT="7443"
-TLS_VLESS_PORT=""
-HY2_PORT=""
+DEFAULT_HY2_PORT="443"
+TLS_VLESS_PORT="443"
+HY2_PORT="443"
 
 RU_GEOSITE_URL="https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat"
 RU_GEOIP_URL="https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat"
@@ -1176,6 +1176,53 @@ setup_xanmod_repo() {
   return 1
 }
 
+# Делает установленное ядро XanMod ($1 = uname-версия, напр. 7.1.4-x64v3-xanmod1)
+# ЗАГРУЗОЧНЫМ ПО УМОЛЧАНИЮ в GRUB. Без этого после reboot сервер у ряда
+# провайдеров снова грузится в дистрибутивное ядро (напр. 6.8.0-generic), а не
+# в XanMod — тогда BBR3 не активен, хотя ядро установлено. Прописываем точный
+# menuentry_id_option нашего ядра (учитывая вложенность в подменю "Advanced
+# options") в GRUB_DEFAULT и пересобираем grub.cfg. Возвращает 0 при успехе.
+set_grub_default_to_kernel() {
+  local kver="$1"
+  local grubdef="/etc/default/grub"
+  local grubcfg="" cand eid subid target
+
+  [[ -n "$kver" ]] || return 1
+
+  for cand in /boot/grub/grub.cfg /boot/grub2/grub.cfg; do
+    [[ -f "$cand" ]] && { grubcfg="$cand"; break; }
+  done
+  [[ -n "$grubcfg" && -f "$grubdef" ]] || return 1
+
+  # menuentry_id_option нужного ядра (первое совпадение — обычный пункт, не
+  # recovery). Каждый menuentry в grub.cfg — одна строка, поэтому grep -oP \K
+  # с одной строки корректно достаёт id.
+  eid="$(grep -oP "menuentry '[^']*${kver}[^']*'.*?menuentry_id_option '\K[^']+" "$grubcfg" 2>/dev/null | head -n1)"
+  # id подменю "Advanced options for ..." (там лежат все версии ядер).
+  subid="$(grep -oP "submenu '.*?'.*?menuentry_id_option '\K[^']+" "$grubcfg" 2>/dev/null | head -n1)"
+
+  [[ -n "$eid" ]] || return 1
+
+  if [[ -n "$subid" ]]; then
+    target="${subid}>${eid}"
+  else
+    target="$eid"
+  fi
+
+  if grep -q '^GRUB_DEFAULT=' "$grubdef"; then
+    sed -i 's~^GRUB_DEFAULT=.*~GRUB_DEFAULT="'"$target"'"~' "$grubdef"
+  else
+    printf 'GRUB_DEFAULT="%s"\n' "$target" >> "$grubdef"
+  fi
+  log_line "GRUB default set to: $target (kernel $kver)"
+
+  if run_cmd "Делаю ядро XanMod загрузочным по умолчанию (GRUB)" update-grub; then
+    ok "Ядро XanMod ($kver) выставлено загрузочным по умолчанию."
+    return 0
+  fi
+  return 1
+}
+
 # Fallback-установка ядра XanMod напрямую с зеркала SourceForge (официальный
 # бинарный релиз-хостинг XanMod), когда APT-репозиторий deb.xanmod.org
 # недоступен (сейчас он стабильно отдаёт 404 на файл Release — это не
@@ -1263,6 +1310,8 @@ install_xanmod_from_sourceforge() {
   fi
 
   run_cmd "Обновляю GRUB" update-grub || warn "update-grub вернул ошибку — проверь загрузчик вручную."
+  set_grub_default_to_kernel "$KERNEL_VER" \
+    || warn "Не удалось выставить ядро XanMod дефолтным в GRUB — если после reboot загрузится старое ядро, выбери XanMod в меню GRUB (Advanced options)."
   KERNEL_INSTALL_SKIPPED=0
   return 0
 }
@@ -1321,6 +1370,10 @@ install_xanmod_kernel() {
   fi
 
   run_cmd "Обновляю GRUB" update-grub || warn "update-grub вернул ошибку — проверь загрузчик вручную."
+  if [[ -n "$KERNEL_VER" ]]; then
+    set_grub_default_to_kernel "$KERNEL_VER" \
+      || warn "Не удалось выставить ядро XanMod дефолтным в GRUB — если после reboot загрузится старое ядро, выбери XanMod в меню GRUB (Advanced options)."
+  fi
 }
 
 install_profile_continue_hook() {
@@ -3909,7 +3962,33 @@ stage_after_reboot() {
     else
       warn "Сейчас загружено ядро: $(uname -r)"
       warn "Ожидалось: $KERNEL_VER"
-      warn "Продолжаю настройку, но BBR v3 может быть недоступен."
+
+      # Ядро XanMod установлено, но GRUB загрузил другое (частое у провайдеров).
+      # Перевыставляем XanMod дефолтным, чтобы следующий reboot был правильным.
+      if dpkg-query -W -f='${Package}\n' 'linux-image-*xanmod*' 2>/dev/null | grep -q "$KERNEL_VER"; then
+        warn "Ядро XanMod установлено, но GRUB загрузил не его. Перевыставляю его загрузочным по умолчанию."
+        if set_grub_default_to_kernel "$KERNEL_VER"; then
+          warn "Готово. Чтобы получить BBR v3, перезагрузи сервер ещё раз (reboot) и снова зайди по SSH — установка продолжится."
+          echo
+          read -rp "  Перезагрузить сейчас, чтобы загрузиться в XanMod? [y/N]: " reboot_ans
+          case "${reboot_ans,,}" in
+            y|yes|д|да)
+              set_state "need_post_reboot"
+              install_profile_continue_hook
+              info "Перезагружаюсь. После входа по SSH установка продолжится автоматически."
+              sleep 3
+              reboot || warn "reboot вернул ошибку — перезагрузи сервер вручную."
+              ;;
+            *)
+              warn "Продолжаю на текущем ядре. BBR v3 станет активен после reboot в XanMod."
+              ;;
+          esac
+        else
+          warn "Не удалось выставить XanMod дефолтным. Выбери его в меню GRUB (Advanced options) при следующем reboot."
+        fi
+      else
+        warn "Продолжаю настройку, но BBR v3 может быть недоступен."
+      fi
     fi
   elif uname -r | grep -q 'xanmod'; then
     ok "Загружено ядро XanMod: $(uname -r)"
