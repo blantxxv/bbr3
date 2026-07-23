@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.2.6"
+SCRIPT_VERSION="3.2.7"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -1176,6 +1176,97 @@ setup_xanmod_repo() {
   return 1
 }
 
+# Fallback-установка ядра XanMod напрямую с зеркала SourceForge (официальный
+# бинарный релиз-хостинг XanMod), когда APT-репозиторий deb.xanmod.org
+# недоступен (сейчас он стабильно отдаёт 404 на файл Release — это не
+# блокировка по IP сервера, а сломанный репозиторий на их стороне).
+#
+# Берём RSS со списком файлов ветки main, отбираем linux-image нужной
+# микроархитектуры (x64v2/x64v3, amd64), сортируем по версии ядра (sort -V) и
+# ставим самую свежую через apt (apt сам подтянет зависимости из репозиториев
+# дистрибутива). $1 — CPU level (v2/v3/v4). Возвращает 0 при успехе.
+XANMOD_SF_RSS_URL="https://sourceforge.net/projects/xanmod/rss?path=/releases/main"
+
+install_xanmod_from_sourceforge() {
+  local cpu_level="$1"
+  local variant rss url kver tmpdeb
+
+  case "$cpu_level" in
+    v4|v3) variant="x64v3" ;;
+    v2)    variant="x64v2" ;;
+    *) return 1 ;;
+  esac
+
+  info "APT-репозиторий XanMod недоступен — беру ядро с зеркала SourceForge ($variant)."
+
+  rss="$(curl -fsSL --connect-timeout 10 --max-time 90 $CURL_RETRY_ALL_ERRORS_FLAG "$XANMOD_SF_RSS_URL" 2>/dev/null || true)"
+  if [[ -z "$rss" ]]; then
+    warn "Не удалось получить список файлов XanMod с SourceForge (нет сети/зеркало недоступно)."
+    return 1
+  fi
+
+  # Отбираем ссылки на linux-image нужной микроархитектуры и выбираем самую
+  # свежую по версии ядра. RSS отдаёт файлы в произвольном порядке, поэтому
+  # НЕ полагаемся на head/tail, а сортируем по версии (sort -V).
+  url="$(printf '%s\n' "$rss" \
+    | grep -oE 'https://sourceforge\.net/projects/xanmod/files/releases/main/[^<]+/download' \
+    | grep -F -- '-image-' \
+    | grep -F -- "-${variant}-xanmod1_" \
+    | grep -F -- '_amd64.deb/download' \
+    | while IFS= read -r u; do
+        v="${u##*/linux-image-}"
+        v="${v%%-${variant}-xanmod1_*}"
+        printf '%s\t%s\n' "$v" "$u"
+      done \
+    | sort -V | tail -n1 | cut -f2-)"
+
+  if [[ -z "$url" ]]; then
+    warn "На SourceForge не нашёл .deb linux-image XanMod для $variant."
+    return 1
+  fi
+
+  # uname-версия ядра: часть между 'linux-image-' и первым '_'.
+  kver="$(printf '%s' "$url" | sed -E 's~.*/linux-image-([^_]+)_.*~\1~')"
+  ok "Самое свежее ядро XanMod на SourceForge: ${kver:-неизвестно}"
+
+  tmpdeb="$(mktemp --suffix=.deb 2>/dev/null || mktemp)"
+  if ! run_cmd "Скачиваю ядро XanMod с SourceForge ($kver)" \
+    curl -fL --connect-timeout 15 --max-time 900 --retry 3 --retry-delay 3 $CURL_RETRY_ALL_ERRORS_FLAG \
+    -o "$tmpdeb" "$url"; then
+    rm -f "$tmpdeb"
+    warn "Не удалось скачать .deb ядра с SourceForge."
+    return 1
+  fi
+
+  # Убеждаемся, что это действительно .deb, а не HTML-страница ошибки зеркала.
+  if command -v file >/dev/null 2>&1 && ! file "$tmpdeb" 2>/dev/null | grep -qi 'Debian binary package'; then
+    warn "Скачанный с SourceForge файл не похож на .deb (зеркало отдало заглушку). Пропускаю."
+    rm -f "$tmpdeb"
+    return 1
+  fi
+
+  if ! run_cmd "Устанавливаю ядро XanMod из .deb" \
+    env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y \
+    -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" "$tmpdeb"; then
+    rm -f "$tmpdeb"
+    warn "Не удалось установить ядро XanMod из .deb (apt)."
+    return 1
+  fi
+  rm -f "$tmpdeb"
+
+  KERNEL_VER="$(highest_installed_xanmod)"
+  [[ -n "$KERNEL_VER" ]] || KERNEL_VER="$kver"
+  if [[ -n "$KERNEL_VER" ]]; then
+    mkdir -p "$STATE_DIR"
+    echo "$KERNEL_VER" > "$KERNEL_VER_FILE"
+    ok "Установлена версия ядра XanMod (SourceForge): $KERNEL_VER"
+  fi
+
+  run_cmd "Обновляю GRUB" update-grub || warn "update-grub вернул ошибку — проверь загрузчик вручную."
+  KERNEL_INSTALL_SKIPPED=0
+  return 0
+}
+
 install_xanmod_kernel() {
   section "3/12 · XanMod kernel (последняя версия)"
 
@@ -1201,8 +1292,12 @@ install_xanmod_kernel() {
   KERNEL_INSTALL_SKIPPED=0
 
   if ! setup_xanmod_repo; then
+    warn "Официальный APT-репозиторий XanMod (deb.xanmod.org) недоступен."
+    if install_xanmod_from_sourceforge "$CPU_LEVEL"; then
+      return 0
+    fi
     KERNEL_INSTALL_SKIPPED=1
-    warn "Не удалось подключить репозиторий XanMod — пропускаю установку ядра, продолжаю без него."
+    warn "Не удалось получить ядро XanMod ни из APT-репозитория, ни с зеркала SourceForge — продолжаю без нового ядра."
     return 0
   fi
 
