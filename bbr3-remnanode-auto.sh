@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.7.0.1"
+SCRIPT_VERSION="2.8.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -37,6 +37,26 @@ NODE_PORT=""
 NODE_DISPLAY_NAME=""
 COMPOSE_PROJECT_NAME=""
 CONTAINER_NAME=""
+
+# Куда ставить ноду и все её файлы. Пользователь выбирает из готовых
+# вариантов (/opt/remnanode, /home/<user>/remnanode, /root/remnanode) или
+# вводит свой путь. Сохраняем реальный путь в state, чтобы пункты меню
+# (обновление ядра xray и т.п.) знали, где лежит нода после перезапуска.
+NODE_DIR_FILE="$STATE_DIR/node_dir"
+
+# Параметры REALITY-инбаунда (TCP+REALITY). SNI — домен selfsteal/Caddy,
+# target — локальный порт, куда REALITY проксирует «легитимный» трафик
+# (по умолчанию 127.0.0.1:9443, как поднимает selfsteal). shortId и ключи
+# x25519 генерируются на самом сервере.
+DEFAULT_REALITY_PORT="443"
+DEFAULT_REALITY_TARGET_PORT="9443"
+REALITY_PORT=""
+REALITY_SNI=""
+REALITY_TARGET_PORT=""
+
+# Репозиторий ядра Xray-core (для пункта меню «Обновление ядра xray»).
+XRAY_CORE_REPO="XTLS/Xray-core"
+XRAY_CORE_ASSET="Xray-linux-64.zip"
 
 # Тип установки: "reality" (TCP+REALITY, как раньше) или "tls" (TCP+TLS со своим доменом)
 NODE_INSTALL_TYPE=""
@@ -336,6 +356,37 @@ load_install_type() {
 save_domain() {
   mkdir -p "$STATE_DIR"
   echo "$DOMAIN" > "$DOMAIN_FILE"
+}
+
+save_node_dir() {
+  mkdir -p "$STATE_DIR"
+  echo "$REMNANODE_DIR" > "$NODE_DIR_FILE"
+}
+
+# Определяет каталог установленной ноды. Сначала пробует сохранённый в state
+# путь, затем ищет docker-compose.yml с образом remnawave/node в типичных
+# местах. Нужно для пунктов меню, которые работают с уже установленной нодой
+# (например, обновление ядра xray) — там REMNANODE_DIR ещё не заполнен.
+find_node_dir() {
+  local saved d
+
+  if [[ -f "$NODE_DIR_FILE" ]]; then
+    saved="$(cat "$NODE_DIR_FILE" 2>/dev/null || true)"
+    if [[ -n "$saved" && -f "$saved/docker-compose.yml" ]]; then
+      echo "$saved"
+      return 0
+    fi
+  fi
+
+  for d in /opt/remnanode /root/remnanode /home/*/remnanode /opt/*-Node; do
+    [[ -f "$d/docker-compose.yml" ]] || continue
+    if grep -q 'remnawave/node' "$d/docker-compose.yml" 2>/dev/null; then
+      echo "$d"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 # Проверяет, есть ли уже действующий (не истекающий в ближайшие сутки)
@@ -1747,38 +1798,6 @@ sanitize_compose_name() {
   echo "$raw"
 }
 
-detect_country_name() {
-  local country=""
-
-  country="$(curl -fsSL --connect-timeout 4 --max-time 8 https://ipapi.co/country_name/ 2>/dev/null | head -n 1 | tr -d '\r' || true)"
-
-  if [[ -z "$country" || "$country" == "Undefined" || "$country" == "Reserved" ]]; then
-    country="$(curl -fsSL --connect-timeout 4 --max-time 8 https://ifconfig.co/country 2>/dev/null | head -n 1 | tr -d '\r' || true)"
-  fi
-
-  if [[ -z "$country" ]]; then
-    country="Unknown"
-  fi
-
-  echo "$country"
-}
-
-detect_country_code() {
-  local code=""
-
-  code="$(curl -fsSL --connect-timeout 4 --max-time 8 https://ipapi.co/country/ 2>/dev/null | head -n 1 | tr -d '\r' | tr '[:lower:]' '[:upper:]' || true)"
-
-  if [[ ! "$code" =~ ^[A-Z]{2}$ ]]; then
-    code="$(curl -fsSL --connect-timeout 4 --max-time 8 https://ifconfig.co/country-iso 2>/dev/null | head -n 1 | tr -d '\r' | tr '[:lower:]' '[:upper:]' || true)"
-  fi
-
-  if [[ ! "$code" =~ ^[A-Z]{2}$ ]]; then
-    code="XX"
-  fi
-
-  echo "$code"
-}
-
 ask_node_port() {
   local input=""
   local port_dec=""
@@ -1800,31 +1819,89 @@ ask_node_port() {
   done
 }
 
+# Спрашивает, куда установить ноду и все её файлы. Варианты — готовые пути
+# (/opt/remnanode, /home/<user>/remnanode, /root/remnanode) или свой путь.
+# Заполняет REMNANODE_DIR.
+ask_node_location() {
+  section "Расположение ноды"
+
+  echo
+  echo "  Куда установить ноду и все её файлы?"
+  echo
+  echo "  ${C_GREEN}1${C_RESET}) /opt/remnanode          ${C_DIM}(рекомендуется)${C_RESET}"
+  echo "  ${C_GREEN}2${C_RESET}) /home/<пользователь>/remnanode"
+  echo "  ${C_GREEN}3${C_RESET}) /root/remnanode"
+  echo "  ${C_GREEN}4${C_RESET}) Свой путь"
+  echo
+
+  local choice user_input path_input
+  while true; do
+    read -rp "  Выбор [1/2/3/4]: " choice
+
+    case "${choice:-1}" in
+      1)
+        REMNANODE_DIR="/opt/remnanode"
+        break
+        ;;
+      2)
+        while true; do
+          read -rp "  Имя пользователя (папка в /home): " user_input
+          user_input="$(echo "${user_input:-}" | tr -d '[:space:]')"
+          if [[ -n "$user_input" && "$user_input" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            REMNANODE_DIR="/home/$user_input/remnanode"
+            [[ -d "/home/$user_input" ]] || warn "Каталог /home/$user_input не существует — будет создан."
+            break
+          fi
+          warn "Некорректное имя пользователя."
+        done
+        break
+        ;;
+      3)
+        REMNANODE_DIR="/root/remnanode"
+        break
+        ;;
+      4)
+        while true; do
+          read -rp "  Абсолютный путь установки: " path_input
+          path_input="$(echo "${path_input:-}" | tr -d '[:space:]')"
+          if [[ "$path_input" == /* ]]; then
+            REMNANODE_DIR="$path_input"
+            break
+          fi
+          warn "Путь должен быть абсолютным (начинаться с /)."
+        done
+        break
+        ;;
+      *)
+        warn "Некорректный выбор. Введи 1, 2, 3 или 4."
+        ;;
+    esac
+  done
+
+  ok "Папка ноды: $REMNANODE_DIR"
+}
+
 prepare_node_paths() {
-  local detected_country country_slug suffix base_dir compose_slug
+  local name_input compose_slug
 
-  detected_country="$(detect_country_name)"
-  country_slug="$(sanitize_node_name "$detected_country")"
+  ask_node_location
 
-  base_dir="/opt/${country_slug}-Node"
-
-  if [[ -e "$base_dir" ]]; then
-    suffix="$(tr -dc 'a-z0-9' </dev/urandom | head -c 4 || true)"
-    suffix="${suffix:-$RANDOM}"
-    REMNANODE_DIR="${base_dir}-${suffix}"
-  else
-    REMNANODE_DIR="$base_dir"
+  if [[ -e "$REMNANODE_DIR" && -f "$REMNANODE_DIR/docker-compose.yml" ]]; then
+    warn "В $REMNANODE_DIR уже есть установка ноды (docker-compose.yml). Файлы будут перезаписаны."
   fi
 
-  NODE_DISPLAY_NAME="$(basename "$REMNANODE_DIR")"
+  echo
+  echo "  Имя ноды/контейнера (латиница, для docker). Пустое = remnanode."
+  read -rp "  Имя ноды [remnanode]: " name_input
+  name_input="${name_input:-remnanode}"
+
+  NODE_DISPLAY_NAME="$(sanitize_node_name "$name_input")"
   compose_slug="$(sanitize_compose_name "$NODE_DISPLAY_NAME")"
 
   COMPOSE_PROJECT_NAME="$compose_slug"
   CONTAINER_NAME="$compose_slug"
   REMNANODE_LOG_DIR="$REMNANODE_DIR/logs"
 
-  ok "Страна сервера: $detected_country"
-  ok "Папка ноды: $REMNANODE_DIR"
   ok "Папка логов: $REMNANODE_LOG_DIR"
   ok "Контейнер: $CONTAINER_NAME"
 }
@@ -1880,10 +1957,9 @@ ask_tls_ports() {
 generate_tls_panel_config() {
   section "Конфиг для панели"
 
-  local country_code vless_tag hy2_tag hy2_password config_path
+  local vless_tag hy2_tag hy2_password config_path
 
-  country_code="$(detect_country_code)"
-  vless_tag="VLESS_TCP_TLS_${country_code}_${TLS_VLESS_PORT}"
+  vless_tag="VLESS_TCP_TLS_${TLS_VLESS_PORT}"
   hy2_tag="HYSTERIA2_SALAMANDER_${HY2_PORT}"
   hy2_password="$(openssl rand -base64 32)"
   config_path="$REMNANODE_DIR/panel-inbounds.json"
@@ -2123,6 +2199,208 @@ EOF_HY2
   info "Порт $HY2_PORT/UDP (Hysteria2) может совпадать по номеру с портом REALITY по TCP — это независимые протоколы."
 }
 
+# Спрашивает параметры REALITY-инбаунда: порт (обычно 443), SNI (домен
+# selfsteal/Caddy, он же попадёт в serverNames) и локальный target-порт,
+# куда REALITY проксирует замаскированный трафик (selfsteal по умолчанию
+# слушает 127.0.0.1:9443).
+ask_reality_params() {
+  local input=""
+
+  section "Параметры REALITY"
+
+  while true; do
+    read -rp "  Порт VLESS+REALITY (TCP) [${DEFAULT_REALITY_PORT}]: " input
+    input="${input:-$DEFAULT_REALITY_PORT}"
+    if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
+      REALITY_PORT="$((10#$input))"
+      break
+    fi
+    warn "Некорректный порт. Нужно число от 1 до 65535."
+  done
+
+  while true; do
+    read -rp "  Домен selfsteal (serverName), например safeeclipse.ru: " input
+    input="$(echo "${input:-}" | tr -d '[:space:]')"
+    if [[ "$input" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
+      REALITY_SNI="$input"
+      break
+    fi
+    warn "Некорректный домен. Пример: safeeclipse.ru"
+  done
+
+  while true; do
+    read -rp "  Локальный target-порт selfsteal (Caddy) [${DEFAULT_REALITY_TARGET_PORT}]: " input
+    input="${input:-$DEFAULT_REALITY_TARGET_PORT}"
+    if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
+      REALITY_TARGET_PORT="$((10#$input))"
+      break
+    fi
+    warn "Некорректный порт. Нужно число от 1 до 65535."
+  done
+
+  ok "REALITY: порт $REALITY_PORT, SNI $REALITY_SNI, target 127.0.0.1:$REALITY_TARGET_PORT"
+}
+
+# Генерирует пару ключей x25519 для REALITY прямо на сервере, используя
+# бинарник xray внутри образа remnawave/node (на хосте xray обычно нет).
+# Печатает две строки: "private" и "public". Возвращает 1, если не удалось.
+generate_reality_keys() {
+  local out priv pub
+
+  out="$(docker run --rm --entrypoint xray remnawave/node:latest x25519 2>/dev/null || true)"
+
+  if [[ -z "$out" ]]; then
+    out="$(docker run --rm remnawave/node:latest xray x25519 2>/dev/null || true)"
+  fi
+
+  [[ -n "$out" ]] || return 1
+
+  # Разные версии xray печатают по-разному:
+  #   "Private key: ..." / "Public key: ..."
+  #   "PrivateKey: ..."   / "Password: ..." (публичный ключ)
+  priv="$(echo "$out" | grep -iE 'private' | head -n1 | sed -E 's/.*[:=][[:space:]]*//' | tr -d '[:space:]')"
+  pub="$(echo "$out" | grep -iE 'public|password' | head -n1 | sed -E 's/.*[:=][[:space:]]*//' | tr -d '[:space:]')"
+
+  [[ -n "$priv" && -n "$pub" ]] || return 1
+
+  echo "$priv"
+  echo "$pub"
+}
+
+# Генерирует готовый конфиг инбаундов для REALITY-установки: VLESS+TCP+REALITY
+# с автосгенерированными shortId и ключами x25519. serverNames/target берутся
+# из ответов пользователя (selfsteal-домен и локальный порт Caddy).
+generate_reality_panel_config() {
+  section "Конфиг REALITY для панели"
+
+  local short_id keys priv_key pub_key config_path
+
+  short_id="$(openssl rand -hex 8)"
+
+  keys="$(generate_reality_keys || true)"
+  if [[ -n "$keys" ]]; then
+    priv_key="$(echo "$keys" | sed -n '1p')"
+    pub_key="$(echo "$keys" | sed -n '2p')"
+    ok "Ключи x25519 сгенерированы на сервере (через образ remnawave/node)."
+  else
+    priv_key="PASTE_PRIVATE_KEY_HERE"
+    pub_key="PASTE_PUBLIC_KEY_HERE"
+    warn "Не удалось сгенерировать ключи x25519 через xray. Подставлены плейсхолдеры — сгенерируй ключи вручную (xray x25519) и впиши их."
+  fi
+
+  config_path="$REMNANODE_DIR/panel-inbounds.json"
+
+  cat > "$config_path" <<EOF_REALITY
+{
+  "log": {
+    "loglevel": "none"
+  },
+  "inbounds": [
+    {
+      "tag": "VLESS_REALITY_${REALITY_PORT}",
+      "port": $REALITY_PORT,
+      "listen": "0.0.0.0",
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "target": "127.0.0.1:$REALITY_TARGET_PORT",
+          "shortIds": [
+            "$short_id"
+          ],
+          "privateKey": "$priv_key",
+          "serverNames": [
+            "$REALITY_SNI"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "DIRECT",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "BLOCK",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "ip": [
+          "geoip:private"
+        ],
+        "outboundTag": "BLOCK"
+      },
+      {
+        "domain": [
+          "geosite:private"
+        ],
+        "outboundTag": "BLOCK"
+      },
+      {
+        "protocol": [
+          "bittorrent"
+        ],
+        "outboundTag": "BLOCK"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:category-public-tracker"
+        ],
+        "ruleTag": "TORRENT_BY_DOMAIN",
+        "outboundTag": "BLOCK"
+      },
+      {
+        "port": "6881-6889,51413,21413,17417,37305",
+        "type": "field",
+        "ruleTag": "TORRENT_BY_PORT",
+        "outboundTag": "BLOCK"
+      }
+    ]
+  }
+}
+EOF_REALITY
+
+  chmod 600 "$config_path"
+
+  if command -v jq >/dev/null 2>&1; then
+    if jq empty "$config_path" >/dev/null 2>&1; then
+      ok "JSON конфиг валиден"
+    else
+      warn "JSON конфиг не прошёл проверку jq. Проверь файл вручную: $config_path"
+    fi
+  fi
+
+  ok "Готовый REALITY-конфиг инбаундов сохранён: $config_path"
+  echo
+  echo "${C_DIM}────────────────────────────────────────────────────────────${C_RESET}"
+  cat "$config_path"
+  echo "${C_DIM}────────────────────────────────────────────────────────────${C_RESET}"
+  echo
+  echo "  ${C_BOLD}Публичный ключ (publicKey) для клиента/панели:${C_RESET} $pub_key"
+  echo "  ${C_BOLD}shortId:${C_RESET} $short_id"
+  echo
+  info "Скопируй JSON выше (или файл $config_path) в конфиг инбаундов ноды в панели Remnawave."
+  info "publicKey и shortId укажи в настройках подключения клиента."
+}
+
 # Скачивает docker-образ с несколькими попытками, а при явном отказе Docker
 # Hub (например, "403 Forbidden" от registry-1.docker.io — блокировка/лимит
 # по IP) пробует публичные зеркала из DOCKER_HUB_MIRRORS и перетегирует
@@ -2156,6 +2434,29 @@ pull_docker_image_with_fallback() {
   return 1
 }
 
+# Проверяет, слушается ли порт, с несколькими попытками. После
+# `docker compose up -d` контейнер и xray внутри стартуют не мгновенно —
+# порт может появиться через несколько секунд, поэтому раньше проверка
+# ложно сообщала «порт не слушается». Матчим порт по границе (двоеточие +
+# номер + пробел/конец), чтобы :2222 не срабатывал на :22220. Учитываем и
+# TCP, и UDP (для Hysteria2). Возвращает 0, если порт занят.
+wait_for_port() {
+  local port="$1"
+  local attempts="${2:-15}"
+  local i
+
+  command -v ss >/dev/null 2>&1 || return 0
+
+  for (( i = 1; i <= attempts; i++ )); do
+    if ss -tulnH 2>/dev/null | grep -qE "[:.]${port}([[:space:]]|$)"; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
+}
+
 setup_remnanode() {
   section "12/12 · Remnawave Node"
 
@@ -2164,8 +2465,11 @@ setup_remnanode() {
 
   if [[ "$NODE_INSTALL_TYPE" == "tls" ]]; then
     ask_tls_ports
-  elif [[ "$HYSTERIA2_ENABLED" -eq 1 ]]; then
-    ask_hysteria2_port
+  else
+    ask_reality_params
+    if [[ "$HYSTERIA2_ENABLED" -eq 1 ]]; then
+      ask_hysteria2_port
+    fi
   fi
 
   echo
@@ -2177,6 +2481,7 @@ setup_remnanode() {
   [[ -n "${SECRET_KEY:-}" ]] || die "SECRET_KEY пустой."
 
   mkdir -p "$REMNANODE_DIR" "$REMNANODE_LOG_DIR"
+  save_node_dir
   cd "$REMNANODE_DIR"
 
   run_cmd "Скачиваю geosite.dat" \
@@ -2280,10 +2585,10 @@ EOF_COMPOSE
   docker_compose ps >> "$LOG_FILE" 2>&1 || true
   docker_compose logs --tail=100 >> "$LOG_FILE" 2>&1 || true
 
-  if command -v ss >/dev/null 2>&1 && ss -tulpen 2>/dev/null | awk -v port=":$NODE_PORT" '$0 ~ port {found=1} END{exit found ? 0 : 1}'; then
+  if wait_for_port "$NODE_PORT" 15; then
     ok "Порт $NODE_PORT слушается"
   else
-    warn "Порт $NODE_PORT не слушается. Проверь: cd $REMNANODE_DIR && docker compose logs -f --tail=100"
+    warn "Порт $NODE_PORT пока не слушается (контейнер мог ещё стартовать). Проверь: cd $REMNANODE_DIR && docker compose logs -f --tail=100"
   fi
 
   if [[ "$NODE_INSTALL_TYPE" == "tls" ]]; then
@@ -2293,12 +2598,16 @@ EOF_COMPOSE
       warn "Сертификат не был выпущен — пропускаю генерацию готового конфига для панели."
       warn "Выпусти сертификат вручную и добавь TLS-инбаунды в панели самостоятельно."
     fi
-  elif [[ "$HYSTERIA2_ENABLED" -eq 1 ]]; then
-    if [[ "$CERT_OK" -eq 1 ]]; then
-      generate_hysteria2_panel_config
-    else
-      warn "Сертификат для Hysteria2 не был выпущен — пропускаю генерацию инбаунда."
-      warn "Выпусти сертификат вручную и добавь Hysteria2-инбаунд в панели самостоятельно."
+  elif [[ "$NODE_INSTALL_TYPE" == "reality" ]]; then
+    generate_reality_panel_config
+
+    if [[ "$HYSTERIA2_ENABLED" -eq 1 ]]; then
+      if [[ "$CERT_OK" -eq 1 ]]; then
+        generate_hysteria2_panel_config
+      else
+        warn "Сертификат для Hysteria2 не был выпущен — пропускаю генерацию инбаунда."
+        warn "Выпусти сертификат вручную и добавь Hysteria2-инбаунд в панели самостоятельно."
+      fi
     fi
   fi
 }
@@ -2306,6 +2615,180 @@ EOF_COMPOSE
 cleanup_continue_hook() {
   rm -f "$PROFILE_HOOK"
   set_state "done"
+}
+
+# Возвращает JSON списка релизов Xray-core с GitHub API.
+fetch_xray_releases_json() {
+  curl -fsSL --connect-timeout 5 --max-time 20 \
+    -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/${XRAY_CORE_REPO}/releases?per_page=20" 2>/dev/null || true
+}
+
+# Возвращает текущую версию xray в контейнере ноды (строку версии), либо пусто.
+detect_current_xray_version() {
+  local svc="remnanode"
+
+  docker_compose exec -T "$svc" xray version 2>/dev/null \
+    | grep -ioE 'Xray[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | awk '{print $2}'
+}
+
+# Добавляет в docker-compose.yml монтирование локального бинарника xray в
+# контейнер, если его там ещё нет. Кастомный xray кладём рядом с нодой и
+# монтируем поверх штатного /usr/local/bin/xray внутри образа.
+ensure_xray_volume_mounted() {
+  local compose="$REMNANODE_DIR/docker-compose.yml"
+
+  [[ -f "$compose" ]] || return 1
+
+  if grep -q './xray:/usr/local/bin/xray' "$compose"; then
+    return 0
+  fi
+
+  # Вставляем строку монтирования сразу после строки с логами (она есть
+  # в любой нашей генерации compose).
+  if grep -q '\./logs:/var/log/remnanode' "$compose"; then
+    sed -i '/\.\/logs:\/var\/log\/remnanode/a\      - ./xray:/usr/local/bin/xray:ro' "$compose"
+    return 0
+  fi
+
+  warn "Не нашёл якорную строку в docker-compose.yml для вставки монтирования xray. Добавь вручную: - ./xray:/usr/local/bin/xray:ro"
+  return 1
+}
+
+update_xray_core() {
+  section "Обновление ядра Xray"
+
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Docker не установлен — обновлять ядро негде."
+    return 1
+  fi
+
+  local node_dir
+  node_dir="$(find_node_dir || true)"
+
+  if [[ -z "$node_dir" ]]; then
+    warn "Не удалось найти установленную ноду (docker-compose.yml с remnawave/node)."
+    info "Сначала установи ноду (пункт 1), затем обновляй ядро."
+    return 1
+  fi
+
+  REMNANODE_DIR="$node_dir"
+  cd "$REMNANODE_DIR"
+  ok "Нода найдена: $REMNANODE_DIR"
+
+  local current_ver
+  current_ver="$(detect_current_xray_version || true)"
+  if [[ -n "$current_ver" ]]; then
+    ok "Текущая версия Xray в контейнере: $current_ver"
+  else
+    info "Текущую версию Xray определить не удалось (контейнер не запущен или xray недоступен) — продолжаю."
+  fi
+
+  local releases_json stable_ver actual_ver
+  releases_json="$(fetch_xray_releases_json)"
+
+  if [[ -z "$releases_json" ]]; then
+    warn "Не удалось получить список релизов Xray с GitHub. Проверь сеть."
+    return 1
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    actual_ver="$(echo "$releases_json" | jq -r '.[0].tag_name' 2>/dev/null || true)"
+    stable_ver="$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false)][0].tag_name' 2>/dev/null || true)"
+  else
+    actual_ver="$(echo "$releases_json" | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')"
+    stable_ver="$actual_ver"
+  fi
+
+  [[ "$actual_ver" == "null" ]] && actual_ver=""
+  [[ "$stable_ver" == "null" ]] && stable_ver=""
+
+  if [[ -z "$actual_ver" && -z "$stable_ver" ]]; then
+    warn "Не удалось определить версии релизов Xray."
+    return 1
+  fi
+
+  echo
+  echo "  Доступные версии ядра Xray:"
+  echo
+  echo "  ${C_GREEN}1${C_RESET}) Стабильная: ${stable_ver:-неизвестно}"
+  echo "  ${C_GREEN}2${C_RESET}) Актуальная (последний релиз, возможно pre-release): ${actual_ver:-неизвестно}"
+  echo "  ${C_GREEN}3${C_RESET}) Ввести версию вручную (например, v1.8.24)"
+  echo "  ${C_YELLOW}0${C_RESET}) Отмена"
+  echo
+
+  local choice target_ver input
+  while true; do
+    read -rp "  Выбор [1/2/3/0]: " choice
+    case "${choice:-}" in
+      1) target_ver="$stable_ver"; break ;;
+      2) target_ver="$actual_ver"; break ;;
+      3)
+        read -rp "  Тег версии (с v, например v1.8.24): " input
+        input="$(echo "${input:-}" | tr -d '[:space:]')"
+        if [[ "$input" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+          [[ "$input" == v* ]] || input="v$input"
+          target_ver="$input"
+          break
+        fi
+        warn "Некорректный тег версии."
+        ;;
+      0) ok "Отменено."; return 0 ;;
+      *) warn "Некорректный выбор." ;;
+    esac
+  done
+
+  [[ -n "$target_ver" ]] || { warn "Версия не выбрана."; return 1; }
+
+  ok "Выбрана версия ядра: $target_ver"
+
+  local url tmpdir
+  url="https://github.com/${XRAY_CORE_REPO}/releases/download/${target_ver}/${XRAY_CORE_ASSET}"
+  tmpdir="$(mktemp -d)"
+
+  if ! run_cmd "Скачиваю Xray $target_ver" \
+    curl -fL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG -o "$tmpdir/xray.zip" "$url"; then
+    rm -rf "$tmpdir"
+    warn "Не удалось скачать ядро Xray $target_ver. Проверь, что такой релиз существует."
+    return 1
+  fi
+
+  if ! run_cmd "Распаковываю Xray" unzip -o "$tmpdir/xray.zip" -d "$tmpdir"; then
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  if [[ ! -f "$tmpdir/xray" ]]; then
+    rm -rf "$tmpdir"
+    warn "В архиве не найден бинарник xray."
+    return 1
+  fi
+
+  # Кладём новый бинарник рядом с нодой и делаем исполняемым.
+  install -m 0755 "$tmpdir/xray" "$REMNANODE_DIR/xray"
+  rm -rf "$tmpdir"
+  ok "Бинарник ядра сохранён: $REMNANODE_DIR/xray"
+
+  ensure_xray_volume_mounted || true
+
+  # Останавливаем ноду и запускаем заново, чтобы контейнер подхватил
+  # смонтированный бинарник ядра.
+  run_cmd "Останавливаю ноду" docker_compose down || warn "docker compose down вернул ошибку — продолжаю."
+  if ! run_cmd "Запускаю ноду с новым ядром" docker_compose up -d; then
+    warn "Не удалось запустить ноду после обновления ядра. Проверь: cd $REMNANODE_DIR && docker compose logs -f --tail=100"
+    return 1
+  fi
+
+  sleep 3
+  local new_ver
+  new_ver="$(detect_current_xray_version || true)"
+  if [[ -n "$new_ver" ]]; then
+    ok "Xray в контейнере после обновления: $new_ver"
+  else
+    info "Не удалось прочитать версию Xray после старта — дай контейнеру подняться и проверь: docker compose exec remnanode xray version"
+  fi
+
+  ok "Обновление ядра Xray завершено."
 }
 
 stage_before_reboot() {
@@ -2408,8 +2891,8 @@ README:
   4. Reboot
   5. BBR / сетевой тюнинг
   6. Docker
-  7. Remnawave Node в папке по стране сервера
-  8. Выбор порта и динамическое имя контейнера
+  7. Remnawave Node в выбранной папке (/opt/remnanode, /home/<user>/remnanode, /root/remnanode)
+  8. Выбор порта и имя контейнера
   9. Финальная проверка
 
 Быстро открыть README на сервере можно так:
@@ -2440,10 +2923,11 @@ main_menu() {
     echo "  ${C_CYAN}5${C_RESET}) Проверить/установить обновления скрипта"
     echo "  ${C_CYAN}6${C_RESET}) Проверить систему"
     echo "  ${C_CYAN}7${C_RESET}) Torrent Blocker (установить/переустановить)"
+    echo "  ${C_CYAN}8${C_RESET}) Обновление ядра Xray"
     echo "  ${C_YELLOW}0${C_RESET}) Выход"
     echo
 
-    read -rp "  Выбор [1/2/3/4/5/6/7/0]: " choice || choice="0"
+    read -rp "  Выбор [1/2/3/4/5/6/7/8/0]: " choice || choice="0"
 
     case "${choice:-}" in
       1)
@@ -2472,6 +2956,10 @@ main_menu() {
         ;;
       7)
         install_torrent_blocker
+        pause_menu
+        ;;
+      8)
+        update_xray_core
         pause_menu
         ;;
       0|q|Q|exit|quit)
@@ -2512,6 +3000,10 @@ case "${1:-}" in
     need_root
     install_torrent_blocker
     ;;
+  --xray-core|--update-xray|xray-core)
+    need_root
+    update_xray_core
+    ;;
   --menu|menu|"")
     main_menu
     ;;
@@ -2529,6 +3021,7 @@ case "${1:-}" in
   $0 --check-update     проверить обновления
   $0 --test             проверить систему
   $0 --torrent-blocker  установить/переустановить Torrent Blocker
+  $0 --xray-core        обновить ядро Xray в контейнере ноды
 EOF_HELP
     ;;
   *)
