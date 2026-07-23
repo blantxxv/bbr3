@@ -1744,6 +1744,124 @@ ask_domain() {
   done
 }
 
+# Считает количество A-записей домена (через публичные резолверы). >=2 —
+# это round-robin / DNS-балансировка, при которой HTTP-01 challenge не проходит.
+count_domain_a_records() {
+  local domain="$1" n=0
+
+  command -v dig >/dev/null 2>&1 || { echo 0; return 0; }
+
+  n="$(dig +short A "$domain" @8.8.8.8 2>/dev/null | grep -Ec '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+
+  if [[ "$n" -eq 0 ]]; then
+    n="$(dig +short A "$domain" @1.1.1.1 2>/dev/null | grep -Ec '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  fi
+
+  echo "$n"
+}
+
+# Выпускает сертификат через DNS-01 с ручной TXT-записью (для доменов с
+# несколькими IP / DNS-балансировкой, где HTTP-01 невозможен). certbot через
+# auth-hook показывает нужную TXT-запись; hook сам ждёт, пока именно это
+# значение начнёт отдаваться публичными DNS, и только тогда даёт LE проверять.
+# Заполняет CERT_DIR / CERT_OK.
+issue_cert_dns01_manual() {
+  local domain="$1"
+  local hook="$STATE_DIR/certbot-dns-auth-hook.sh"
+  local rc
+
+  mkdir -p "$STATE_DIR"
+
+  cat > "$hook" <<'EOF_AUTHHOOK'
+#!/usr/bin/env bash
+# certbot manual auth-hook (DNS-01): печатает TXT-запись, которую нужно
+# добавить, и ждёт, пока ИМЕННО это значение начнёт отдаваться публичными
+# DNS-резолверами, после чего возвращает управление certbot.
+set -u
+
+DOMAIN="${CERTBOT_DOMAIN:?}"
+VALIDATION="${CERTBOT_VALIDATION:?}"
+RECORD="_acme-challenge.${DOMAIN}"
+
+out() { printf '%s\n' "$*" > /dev/tty 2>/dev/null || printf '%s\n' "$*"; }
+
+out ""
+out "════════════════════════════════════════════════════════════"
+out "  DNS-01: добавь TXT-запись у регистратора (reg.ru):"
+out ""
+out "    Тип:      TXT"
+out "    Имя/Host: ${RECORD%.*.*}      (в зоне это часть до основного домена)"
+out "    Значение: ${VALIDATION}"
+out ""
+out "  Полное имя записи: ${RECORD}"
+out "════════════════════════════════════════════════════════════"
+out "  Как добавишь — скрипт сам увидит запись и продолжит."
+out ""
+
+check_resolver() {
+  local server="$1" got
+  got="$(dig +short TXT "$RECORD" "@$server" 2>/dev/null | tr -d '"')"
+  grep -qxF "$VALIDATION" <<< "$got"
+}
+
+RESOLVERS=(8.8.8.8 1.1.1.1 9.9.9.9)
+MAX=120   # 120 * 15s = 30 минут
+i=0
+while (( i < MAX )); do
+  ok_count=0
+  for r in "${RESOLVERS[@]}"; do
+    check_resolver "$r" && ok_count=$((ok_count + 1))
+  done
+
+  if (( ok_count >= 2 )); then
+    printf '\r%*s\r' 60 '' > /dev/tty 2>/dev/null || true
+    out "  [OK] TXT-запись видна в публичных DNS (${ok_count}/${#RESOLVERS[@]}). Продолжаю выпуск."
+    sleep 5
+    exit 0
+  fi
+
+  i=$((i + 1))
+  printf '\r  Ожидаю распространения TXT... попытка %d/%d   ' "$i" "$MAX" > /dev/tty 2>/dev/null || true
+  sleep 15
+done
+
+out ""
+out "  [WARN] За 30 минут TXT так и не появилась во всех резолверах."
+printf '  Продолжить валидацию всё равно? [y/N]: ' > /dev/tty 2>/dev/null || true
+read -r ans < /dev/tty 2>/dev/null || ans="n"
+case "${ans,,}" in y|yes|д|да) exit 0 ;; *) exit 1 ;; esac
+EOF_AUTHHOOK
+
+  chmod +x "$hook"
+
+  section "DNS-01 (TXT) для $domain"
+  info "У домена несколько IP (DNS-балансировка) — выпускаю сертификат через DNS-01."
+  info "certbot покажет TXT-запись, добавь её в reg.ru; скрипт дождётся распространения и продолжит."
+  echo
+
+  CERT_OK=0
+  set +e
+  certbot certonly --manual --preferred-challenges dns \
+    --manual-auth-hook "$hook" \
+    --non-interactive --agree-tos \
+    --register-unsafely-without-email \
+    -d "$domain" 2>&1 | tee -a "$LOG_FILE"
+  rc=${PIPESTATUS[0]}
+  set -e
+
+  if [[ "$rc" -eq 0 && -f "/etc/letsencrypt/live/$domain/fullchain.pem" && -f "/etc/letsencrypt/live/$domain/privkey.pem" ]]; then
+    CERT_DIR="/etc/letsencrypt/live/$domain"
+    CERT_OK=1
+    ok "Сертификат (DNS-01) успешно выпущен: $CERT_DIR"
+    warn "Внимание: DNS-01 с ручной TXT не продлевается автоматически — при DNS-балансировке LE даёт новое значение TXT."
+    warn "Перед истечением (~каждые 60-90 дней) перевыпусти сертификат: eclipse (пункт установки TLS) или certbot renew с добавлением новой TXT."
+  else
+    fail "Не удалось выпустить сертификат через DNS-01 для $domain (rc=$rc)."
+  fi
+}
+
 issue_tls_certificate() {
   section "11/12 · TLS сертификат"
 
@@ -1811,8 +1929,9 @@ issue_tls_certificate() {
   fi
 
   echo
-  info "Перед выпуском сертификата убедись, что A-запись домена указывает на IP этого сервера."
-  info "Certbot (standalone) временно займёт порт 80 — он должен быть свободен."
+  info "Перед выпуском убедись, что A-запись домена указывает на IP этого сервера."
+  info "Один IP → HTTP-01 (certbot временно займёт порт 80, он должен быть свободен)."
+  info "Несколько IP (DNS-балансировка) → скрипт сам переключится на DNS-01 (TXT-запись)."
   echo
 
   local attempt=1
@@ -1829,19 +1948,30 @@ issue_tls_certificate() {
       return 0
     fi
 
-    run_shell "Освобождаю порт 80 (если занят nginx/apache)" \
-      "systemctl stop nginx >/dev/null 2>&1 || true; systemctl stop apache2 >/dev/null 2>&1 || true; true"
-
     CERT_OK=0
 
-    if run_cmd "Выпускаю сертификат Let's Encrypt для $DOMAIN" \
-      certbot certonly --standalone --non-interactive --agree-tos \
-      --register-unsafely-without-email --preferred-challenges http \
-      -d "$DOMAIN"; then
+    local a_count
+    a_count="$(count_domain_a_records "$DOMAIN")"
 
-      if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" && -f "/etc/letsencrypt/live/$DOMAIN/privkey.pem" ]]; then
-        CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
-        CERT_OK=1
+    if (( a_count >= 2 )); then
+      # DNS-балансировка: несколько A-записей → HTTP-01 не пройдёт (LE
+      # проверяет со всех перспектив, попадёт и на «чужой» IP). Идём DNS-01.
+      warn "У домена $DOMAIN несколько A-записей ($a_count) — это DNS-балансировка."
+      info "HTTP-01 (порт 80) при этом не проходит — переключаюсь на DNS-01 (TXT-запись)."
+      issue_cert_dns01_manual "$DOMAIN"
+    else
+      run_shell "Освобождаю порт 80 (если занят nginx/apache)" \
+        "systemctl stop nginx >/dev/null 2>&1 || true; systemctl stop apache2 >/dev/null 2>&1 || true; true"
+
+      if run_cmd "Выпускаю сертификат Let's Encrypt (HTTP-01) для $DOMAIN" \
+        certbot certonly --standalone --non-interactive --agree-tos \
+        --register-unsafely-without-email --preferred-challenges http \
+        -d "$DOMAIN"; then
+
+        if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" && -f "/etc/letsencrypt/live/$DOMAIN/privkey.pem" ]]; then
+          CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
+          CERT_OK=1
+        fi
       fi
     fi
 
