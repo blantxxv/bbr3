@@ -1,167 +1,227 @@
-# Eclipse Node Manager
+<div align="center">
 
-## BBR3 + XanMod + Remnawave Node для VPS
+# 🌒 Eclipse Node Manager
 
-Автоматическая и ручная настройка VPS под Remnawave Node:
+### BBR3 · XanMod · Remnawave Node — установка и управление одной командой
 
-- установка XanMod kernel;
-- включение BBR / BBR3;
-- сетевой тюнинг VPS;
-- Docker;
-- Remnawave Node;
-- speedtest;
-- базовая проверка системы.
+Автоматическая настройка VPS под **Remnawave Node**: свежее ядро XanMod, BBR3, сетевой тюнинг, Docker, нода с готовым конфигом инбаундов, фаервол и обновление ядра Xray — из одного меню.
 
-Канал проекта: [t.me/light_eclipse](https://t.me/light_eclipse)
+<br>
 
----
+[![Telegram](https://img.shields.io/badge/Telegram-Light__Eclipse-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/Light_Eclipse)
 
-## Важно перед установкой
+![Version](https://img.shields.io/badge/version-3.0.0-6f42c1?style=flat-square)
+![Platform](https://img.shields.io/badge/OS-Ubuntu%20%7C%20Debian-orange?style=flat-square&logo=linux&logoColor=white)
+![Arch](https://img.shields.io/badge/arch-amd64%20%7C%20arm64-informational?style=flat-square)
+![Shell](https://img.shields.io/badge/shell-bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-required-2496ED?style=flat-square&logo=docker&logoColor=white)
 
-> ⚠️ Перед установкой ядра убедись, что у VPS есть доступ к VNC/Rescue-консоли на случай, если сервер не загрузится после `reboot`.
-
-Рекомендуется выполнять команды от `root`.
-
-Проверить пользователя:
-
-```bash
-whoami
-```
-
-Если не `root`, перейди в root:
-
-```bash
-sudo -i
-```
+</div>
 
 ---
 
-# Быстрая установка
+## ✨ Возможности
 
-Есть два варианта:
-
-1. **Автоматический** — скрипт сам скачивает, устанавливает, делает `reboot` и продолжает настройку после повторного SSH-входа.
-2. **Ручной** — выполняешь команды из README по шагам.
-
----
-
-## Вариант 1. Автоматическая установка
-
-Скачать и запустить:
-
-```bash
-curl -fL -o bbr3-remnanode-auto.sh https://raw.githubusercontent.com/blantxxv/bbr3/main/bbr3-remnanode-auto.sh
-chmod +x bbr3-remnanode-auto.sh
-sudo ./bbr3-remnanode-auto.sh
-```
-
-В меню выбери:
-
-```text
-1) Автоматическая установка
-```
-
-Можно запустить автоматический режим сразу, без меню:
-
-```bash
-sudo ./bbr3-remnanode-auto.sh --auto
-```
-
-После установки XanMod kernel сервер уйдёт в `reboot`.
-
-После перезагрузки снова зайди на сервер по SSH под `root`. Скрипт автоматически продолжит установку и попросит `SECRET_KEY` от Remnawave Panel.
-
-Подробный лог установки:
-
-```bash
-/var/log/bbr3-remnanode-install.log
-```
-
-Смотреть лог в реальном времени:
-
-```bash
-tail -f /var/log/bbr3-remnanode-install.log
-```
-
-Запуск с подробным выводом всех команд:
-
-```bash
-DEBUG=1 sudo ./bbr3-remnanode-auto.sh --auto
-```
+| | |
+|---|---|
+| 🧬 **XanMod (последняя версия)** | Ставится из официального APT-репозитория — всегда свежее ядро |
+| 🚀 **BBR3 + сетевой тюнинг** | Оптимальные sysctl, fq qdisc, RPS, отключение THP |
+| 🐳 **Умная установка Docker** | Каскад: get.docker.com → офиц. репозиторий → docker.io |
+| 🛰️ **Remnawave Node** | Готовый `docker-compose.yml` + автозапуск контейнера |
+| 🔐 **Reality или TLS** | Генерация конфига инбаундов: shortId и ключи x25519 — на сервере |
+| 🌀 **Hysteria2 (опц.)** | UDP-инбаунд поверх Reality/TLS с сертификатом Let's Encrypt |
+| 🧩 **Обновление ядра Xray** | Стабильная/актуальная версия, arm64, проверка контрольной суммы |
+| 🔥 **Фаервол UFW** | Порты 22/80/443 по умолчанию, меню управления портами |
+| 📜 **Автопродление сертификата** | `certbot` deploy-hook сам перезапускает ноду после обновления |
+| 📊 **Speedtest** | iperf3 (РФ) и **Ookla** (ближайший мировой сервер) |
+| ⚡ **Команда `eclipse`** | После установки менеджер открывается одной командой |
 
 ---
 
-## Вариант 2. Ручная установка
+## ⚡ Быстрый старт
 
-Можно открыть ручной режим через скрипт:
+> [!WARNING]
+> Перед установкой ядра убедись, что у VPS есть доступ к **VNC/Rescue-консоли** — на случай, если сервер не загрузится после `reboot`. Запускать нужно от `root`.
+
+**Скачать и запустить:**
 
 ```bash
-sudo ./bbr3-remnanode-auto.sh --manual
+curl -fL -o eclipse.sh https://raw.githubusercontent.com/blantxxv/bbr3/main/bbr3-remnanode-auto.sh
+chmod +x eclipse.sh
+sudo ./eclipse.sh
 ```
 
-Или выполнять команды ниже по разделам.
+Или одной строкой:
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/blantxxv/bbr3/main/bbr3-remnanode-auto.sh)"
+```
+
+После первой установки менеджер снова открывается командой:
+
+```bash
+eclipse
+```
+
+> [!TIP]
+> Автоматический режим без меню: `sudo ./eclipse.sh --auto`
+> Подробный лог всех команд: `DEBUG=1 sudo ./eclipse.sh --auto`
 
 ---
 
-# Ручная настройка VPS: XanMod, BBR, сетевой тюнинг, Docker и Remnawave Node
+## 🧭 Главное меню
 
-## 1. Базовые пакеты
+| # | Пункт | Что делает |
+|:-:|-------|------------|
+| **1** | Автоматическая установка | Весь пайплайн: ядро → тюнинг → Docker → нода |
+| **2** | Продолжить после reboot | Второй этап после установки ядра |
+| **3** | Ручная установка | Показывает README/команды |
+| **4** | Настройка WARP | Запуск Eclipse WARP Manager |
+| **5** | Обновления скрипта | Проверка и установка новой версии |
+| **6** | Проверить систему | Ядро, BBR, qdisc, THP, Docker |
+| **7** | Torrent Blocker | Установка/переустановка |
+| **8** | Обновление ядра Xray | Стабильная/актуальная версия ядра |
+| **9** | Настройка портов (UFW) | Открытые порты, добавить/закрыть |
+| **0** | Выход | |
+
+---
+
+## 🛠️ Что делает автоматическая установка
+
+```mermaid
+flowchart LR
+    A[Базовые пакеты] --> B[CPU level]
+    B --> C[XanMod kernel]
+    C --> D[reboot]
+    D --> E[Сетевой тюнинг + BBR3]
+    E --> F[THP / RPS]
+    F --> G[Docker]
+    G --> H[LLMNR / 5355]
+    H --> I[Speedtest]
+    I --> J[Reality / TLS + selfsteal]
+    J --> K[Remnawave Node + конфиг]
+```
+
+После установки ядра сервер уходит в **reboot**. Зайди снова по SSH под `root` — скрипт сам продолжит настройку и попросит `SECRET_KEY` от Remnawave Panel.
+
+---
+
+## 🔐 Типы транспорта
+
+При установке выбирается один из двух вариантов:
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🟣 TCP + REALITY
+Маскировка через `selfsteal.sh` (Caddy).
+Скрипт сам:
+- сгенерирует **shortId**;
+- сгенерирует пару ключей **x25519** на сервере;
+- соберёт готовый `panel-inbounds.json`;
+- покажет **publicKey** для клиента.
+
+</td>
+<td width="50%" valign="top">
+
+### 🔵 TCP + TLS
+Свой домен + сертификат **Let's Encrypt** (certbot).
+Скрипт сам:
+- выпустит/переиспользует сертификат;
+- смонтирует `/etc/letsencrypt` в контейнер;
+- соберёт `panel-inbounds.json` (VLESS+TLS);
+- настроит **автопродление** с рестартом ноды.
+
+</td>
+</tr>
+</table>
+
+> [!NOTE]
+> К любому варианту опционально добавляется **Hysteria2 (UDP)** — отдельный инбаунд с настоящим TLS-сертификатом. Теги инбаундов генерируются уникальными (`протокол_порт_суффикс`), чтобы не путать ноды между собой.
+
+---
+
+## 🧩 Обновление ядра Xray
+
+Пункт меню **8** (или `eclipse --xray-core`):
+
+- показывает **текущую** версию в контейнере;
+- предлагает **стабильную** и **актуальную** (последний релиз) версии;
+- определяет архитектуру: `amd64` / `arm64` / `armhf`;
+- **проверяет контрольную сумму** (SHA256 из `.dgst`);
+- монтирует ядро в контейнер и перезапускает ноду.
+
+Ту же версию ядра можно выбрать **прямо при установке** ноды.
+
+---
+
+## 🔥 Настройка портов (UFW)
+
+Пункт меню **9** (или `eclipse --firewall`):
+
+- по умолчанию открыты **22 (SSH), 80, 443**;
+- показывает список открытых портов;
+- добавление/закрытие порта, вкл/выкл фаервола;
+- при установке ноды её порты открываются автоматически, если UFW активен.
+
+---
+
+## 📟 CLI-команды
+
+```bash
+eclipse                    # главное меню
+eclipse --auto             # автоматическая установка
+eclipse --continue         # продолжить после reboot
+eclipse --xray-core        # обновить ядро Xray
+eclipse --firewall         # настройка портов (UFW)
+eclipse --warp             # настройка WARP
+eclipse --torrent-blocker  # Torrent Blocker
+eclipse --test             # проверка системы
+eclipse --check-update     # проверить обновления
+eclipse --help             # все команды
+```
+
+Лог установки: `/var/log/bbr3-remnanode-install.log`
+Смотреть в реальном времени: `tail -f /var/log/bbr3-remnanode-install.log`
+
+---
+
+<details>
+<summary><b>🧱 Ручная установка (без скрипта) — развернуть</b></summary>
+
+<br>
+
+Рекомендуется выполнять от `root` (`sudo -i`).
+
+### 1. Базовые пакеты
 
 ```bash
 apt update
-apt install -y curl wget gpg ca-certificates nano vim htop btop git unzip jq dnsutils iperf3 mtr-tiny iproute2 net-tools iptables ipset conntrack openssl python3 file
+apt install -y curl wget gpg ca-certificates nano vim htop btop git unzip jq \
+  dnsutils iperf3 mtr-tiny iproute2 net-tools iptables ipset conntrack openssl python3 file
 ```
 
----
-
-## 2. Проверка CPU level для XanMod
+### 2. Проверка CPU level для XanMod
 
 ```bash
-LEVEL=$(awk 'BEGIN{while(!/flags/) if (getline<"/proc/cpuinfo"!=1) exit; level=1
+awk 'BEGIN{while(!/flags/) if (getline<"/proc/cpuinfo"!=1) exit; level=1
   if(/lm/&&/cmov/&&/cx16/&&/sse4_1/&&/sse4_2/&&/ssse3/&&/popcnt/) level=2
   if(level==2&&/avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/) level=3
-  if(level==3&&/avx512f/&&/avx512bw/) level=4; print "v"level}')
-echo "$LEVEL"
+  if(level==3&&/avx512f/&&/avx512bw/) level=4; print "v"level}'
 ```
 
-Даже если покажет `v4`, ставим `x64v3`. Для VPS это обычно стабильнее.
+`v3`/`v4` → `x64v3`, `v2` → `x64v2`, ниже — XanMod пропускается.
 
----
-
-## 3. Установка XanMod x64v3
+### 3. Установка XanMod (последняя версия из репозитория)
 
 ```bash
-mkdir -p /root/xanmod
-cd /root/xanmod
-rm -f *.deb
-```
-
-Скачать kernel image:
-
-```bash
-curl -fL -o image.deb "https://sourceforge.net/projects/xanmod/files/releases/main/6.19.14-xanmod1/6.19.14-x64v3-xanmod1/linux-image-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb/download"
-```
-
-Скачать headers:
-
-```bash
-curl -fL -o headers.deb "https://sourceforge.net/projects/xanmod/files/releases/main/6.19.14-xanmod1/6.19.14-x64v3-xanmod1/linux-headers-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb/download"
-```
-
-Проверить пакеты:
-
-```bash
-file image.deb headers.deb
-dpkg-deb -I image.deb | head
-dpkg-deb -I headers.deb | head
-```
-
-Установить:
-
-```bash
-apt install -y ./image.deb ./headers.deb
+curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg
+echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' \
+  > /etc/apt/sources.list.d/xanmod-release.list
+apt update
+apt install -y linux-xanmod-x64v3   # или linux-xanmod-x64v2
 update-grub
-grep -R "xanmod" /boot/grub/grub.cfg
 reboot
 ```
 
@@ -170,27 +230,13 @@ reboot
 ```bash
 uname -r
 modprobe tcp_bbr
-cat /sys/module/tcp_bbr/version 2>/dev/null || modinfo tcp_bbr | grep -i version
+cat /sys/module/tcp_bbr/version
 ```
 
-Ожидаемо:
-
-```text
-6.19.14-x64v3-xanmod1
-3
-```
-
----
-
-## 4. Сетевой тюнинг
+### 4. Сетевой тюнинг
 
 ```bash
 modprobe tcp_bbr
-```
-
-Создать sysctl-конфиг:
-
-```bash
 cat >/etc/sysctl.d/99-net-tuning.conf <<'EOF_SYSCTL'
 net.ipv4.tcp_congestion_control = bbr
 net.core.default_qdisc = fq
@@ -223,7 +269,6 @@ net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_ecn = 1
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 10
-
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 4
@@ -245,26 +290,12 @@ vm.overcommit_memory = 1
 vm.max_map_count = 262144
 vm.min_free_kbytes = 131072
 EOF_SYSCTL
-```
 
-Применить:
-
-```bash
 sysctl --system
+sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
 ```
 
-Проверить:
-
-```bash
-sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_min_snd_mss
-cat /sys/module/tcp_bbr/version
-```
-
----
-
-## 5. Отключение THP
-
-Создать systemd-сервис:
+### 5. Отключение THP
 
 ```bash
 cat >/etc/systemd/system/disable-thp.service <<'EOF_SERVICE'
@@ -279,282 +310,52 @@ ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled; 
 [Install]
 WantedBy=multi-user.target
 EOF_SERVICE
-```
 
-Включить:
-
-```bash
 systemctl daemon-reload
 systemctl enable --now disable-thp.service
-```
-
-Проверить:
-
-```bash
 cat /sys/kernel/mm/transparent_hugepage/enabled
 ```
 
-Ожидаемо:
-
-```text
-always madvise [never]
-```
-
----
-
-## 6. RPS
-
-Определить основной интерфейс:
-
-```bash
-ip route get 1.1.1.1
-```
-
-Создать скрипт:
-
-```bash
-cat >/usr/local/sbin/enable-rps.sh <<'EOF_RPS'
-#!/usr/bin/env bash
-set -e
-
-IFACE="${1:-eth0}"
-
-MASK="$(python3 - <<'PY'
-import os
-
-n = os.cpu_count() or 1
-mask = (1 << n) - 1
-
-parts = []
-while mask:
-    parts.append(f"{mask & 0xffffffff:x}")
-    mask >>= 32
-
-print(",".join(parts) if parts else "1")
-PY
-)"
-
-echo "RPS iface: $IFACE"
-echo "RPS mask: $MASK"
-
-if [[ ! -d "/sys/class/net/$IFACE" ]]; then
-  echo "Interface $IFACE not found"
-  exit 0
-fi
-
-for q in /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus; do
-  [[ -e "$q" ]] || continue
-  echo "$MASK" > "$q" || true
-done
-
-for q in /sys/class/net/"$IFACE"/queues/rx-*/rps_flow_cnt; do
-  [[ -e "$q" ]] || continue
-  echo 32768 > "$q" || true
-done
-
-echo 32768 > /proc/sys/net/core/rps_sock_flow_entries || true
-
-cat /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus 2>/dev/null || true
-EOF_RPS
-```
-
-Сделать исполняемым:
-
-```bash
-chmod +x /usr/local/sbin/enable-rps.sh
-```
-
-Создать systemd-сервис. В примере используется `eth0`; при необходимости замени на свой интерфейс.
-
-```bash
-cat >/etc/systemd/system/na-rps-lite.service <<'EOF_SERVICE'
-[Unit]
-Description=Enable RPS dynamically
-After=network-online.target docker.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/enable-rps.sh eth0
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF_SERVICE
-```
-
-Включить:
-
-```bash
-systemctl daemon-reload
-systemctl enable --now na-rps-lite.service
-```
-
-Проверить:
-
-```bash
-cat /sys/class/net/eth0/queues/rx-*/rps_cpus
-```
-
----
-
-## 7. Docker
-
-Установить Docker:
+### 6. Docker
 
 ```bash
 curl -fsSL https://get.docker.com | sh
-```
-
-Создать конфиг Docker daemon:
-
-```bash
 mkdir -p /etc/docker
-
 cat >/etc/docker/daemon.json <<'EOF_DOCKER'
 {
   "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "100m",
-    "max-file": "5"
-  },
+  "log-opts": { "max-size": "100m", "max-file": "5" },
+  "registry-mirrors": ["https://mirror.gcr.io"],
   "default-ulimits": {
-    "nofile": {
-      "Name": "nofile",
-      "Hard": 1048576,
-      "Soft": 1048576
-    },
-    "nproc": {
-      "Name": "nproc",
-      "Hard": 1048576,
-      "Soft": 1048576
-    }
+    "nofile": { "Name": "nofile", "Hard": 1048576, "Soft": 1048576 },
+    "nproc":  { "Name": "nproc",  "Hard": 1048576, "Soft": 1048576 }
   },
   "live-restore": true
 }
 EOF_DOCKER
-```
 
-Перезапустить Docker:
-
-```bash
 systemctl enable docker
 systemctl restart docker
-docker version
-docker compose version
+docker version && docker compose version
 ```
 
----
-
-## 8. Закрытие 5355 / LLMNR
-
-Если используется `systemd-resolved`, отключить LLMNR и MulticastDNS:
+### 7. Remnawave Node
 
 ```bash
-mkdir -p /etc/systemd/resolved.conf.d
-
-cat >/etc/systemd/resolved.conf.d/99-no-llmnr.conf <<'EOF_RESOLVED'
-[Resolve]
-LLMNR=no
-MulticastDNS=no
-EOF_RESOLVED
-```
-
-Перезапустить `systemd-resolved`:
-
-```bash
-systemctl restart systemd-resolved 2>/dev/null || true
-```
-
-Проверить:
-
-```bash
-ss -tulpen | grep 5355 || echo "5355 закрыт"
-```
-
----
-
-## 9. Финальный тест
-
-```bash
-uname -r
-sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_min_snd_mss
-cat /sys/module/tcp_bbr/version
-cat /sys/kernel/mm/transparent_hugepage/enabled
-docker version
-docker compose version
-ss -tulpen
-```
-
----
-
-## 10. Тест скорости
-
-Счётчики до теста:
-
-```bash
-nstat -az TcpRetransSegs TcpOutSegs
-```
-
-Запуск speedtest:
-
-```bash
-bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)
-```
-
-Счётчики после теста:
-
-```bash
-nstat -az TcpRetransSegs TcpOutSegs
-```
-
----
-
-## 11. Selfsteal
-
-```bash
-bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh)
-```
-
----
-
-## 12. Добавление Remnawave Node
-
-Создать директории:
-
-```bash
-mkdir -p /opt/remnanode /var/log/remnanode
+mkdir -p /opt/remnanode/logs
 cd /opt/remnanode
-```
 
-Скачать базы правил:
-
-```bash
 curl -fL -o geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
-curl -fL -o geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
-```
+curl -fL -o geoip.dat   https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+touch logs/access.log logs/error.log
 
-Создать файлы логов:
-
-```bash
-touch /var/log/remnanode/access.log /var/log/remnanode/error.log
-```
-
-Создать `.env`:
-
-```bash
-cat >/opt/remnanode/.env <<'EOF_ENV'
+cat >.env <<'EOF_ENV'
 NODE_PORT=2222
 SECRET_KEY=СЕКРЕТ_С_ПАНЕЛИ
 EOF_ENV
+chmod 600 .env
 
-chmod 600 /opt/remnanode/.env
-```
-
-Создать `docker-compose.yml`:
-
-```bash
-cat >/opt/remnanode/docker-compose.yml <<'EOF_COMPOSE'
+cat >docker-compose.yml <<'EOF_COMPOSE'
 name: remnanode
 
 services:
@@ -569,7 +370,7 @@ services:
     volumes:
       - ./geosite.dat:/usr/local/share/xray/geosite.dat:ro
       - ./geoip.dat:/usr/local/share/xray/geoip.dat:ro
-      - /var/log/remnanode:/var/log/remnanode
+      - ./logs:/var/log/remnanode
     ulimits:
       nofile:
         soft: 1048576
@@ -577,87 +378,42 @@ services:
     env_file:
       - .env
 EOF_COMPOSE
-```
 
-Запустить ноду:
-
-```bash
-cd /opt/remnanode
 docker compose up -d
-```
-
----
-
-## 13. Быстрая проверка Remnawave Node
-
-```bash
-cd /opt/remnanode
 docker compose ps
-docker compose logs --tail=100
-ss -tulpen | grep 2222
 ```
 
-Логи в реальном времени:
+> Используй `image: remnawave/node:latest`. Вариант `ghcr.io/remnawave/nodelatest` отдаёт ошибку registry `denied`.
+
+</details>
+
+---
+
+## 🧰 Обслуживание
 
 ```bash
 cd /opt/remnanode
-docker compose logs -f --tail=100
+
+docker compose ps                       # статус
+docker compose logs -f --tail=100       # логи в реальном времени
+docker compose restart                  # перезапуск
+docker compose pull && docker compose up -d   # обновить образ ноды
+
+sysctl net.ipv4.tcp_congestion_control  # проверить BBR
+cat /sys/module/tcp_bbr/version         # версия BBR
+ss -tulpen                              # активные порты
 ```
 
 ---
 
-## Примечание по образу ноды
+<div align="center">
 
-Используется образ:
+### 💬 Сообщество и поддержка
 
-```yaml
-image: remnawave/node:latest
-```
+Новости, обновления и помощь по проекту — в Telegram:
 
-Не использовать:
+[![Telegram](https://img.shields.io/badge/@Light__Eclipse-подписаться-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/Light_Eclipse)
 
-```yaml
-image: ghcr.io/remnawave/nodelatest
-```
+<sub>🌒 Eclipse Node Manager — сделано для тех, кто ценит скорость и порядок.</sub>
 
-Этот вариант ранее отдавал ошибку registry `denied`.
-
----
-
-# Обслуживание
-
-## Проверить статус ноды
-
-```bash
-cd /opt/remnanode
-docker compose ps
-docker compose logs --tail=100
-```
-
-## Перезапустить ноду
-
-```bash
-cd /opt/remnanode
-docker compose restart
-```
-
-## Обновить образ ноды
-
-```bash
-cd /opt/remnanode
-docker compose pull
-docker compose up -d
-```
-
-## Посмотреть активные порты
-
-```bash
-ss -tulpen
-```
-
-## Проверить BBR
-
-```bash
-sysctl net.ipv4.tcp_congestion_control
-cat /sys/module/tcp_bbr/version 2>/dev/null || true
-```
+</div>
