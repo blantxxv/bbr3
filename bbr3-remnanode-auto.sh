@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.2.3"
+SCRIPT_VERSION="3.2.4"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -1086,8 +1086,11 @@ setup_xanmod_repo() {
   run_cmd "Ставлю зависимости репозитория XanMod" \
     env DEBIAN_FRONTEND=noninteractive apt-get install -y gnupg curl ca-certificates || return 1
 
+  # --batch --yes: молча перезаписать ключ, если файл уже существует (при
+  # повторном запуске), иначе gpg зависает на интерактивном "Overwrite? (y/N)"
+  # прямо поверх спиннера.
   if ! run_shell "Добавляю GPG-ключ XanMod" \
-    "set -o pipefail; curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor -o '$XANMOD_KEYRING'"; then
+    "set -o pipefail; curl -fsSL https://dl.xanmod.org/archive.key | gpg --batch --yes --dearmor -o '$XANMOD_KEYRING'"; then
     return 1
   fi
 
