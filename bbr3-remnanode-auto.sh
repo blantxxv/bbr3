@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.9.0"
+SCRIPT_VERSION="3.0.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -20,10 +20,14 @@ TORRENT_BLOCKER_BIN="/usr/local/bin/torrent-blocker"
 CPU_LEVEL=""
 KERNEL_INSTALL_SKIPPED=0
 
-KERNEL_VER="6.19.14-x64v3-xanmod1"
-XANMOD_BASE_URL="https://deb.xanmod.org/pool/main/l/linux-upstream"
-IMAGE_DEB_URL="$XANMOD_BASE_URL/linux-image-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb"
-HEADERS_DEB_URL="$XANMOD_BASE_URL/linux-headers-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb"
+# XanMod ставим последней версией из официального APT-репозитория: метапакет
+# linux-xanmod-x64vN сам тянет самый свежий образ ядра, поэтому фиксированные
+# ссылки на .deb больше не нужны. KERNEL_VER заполняется реально установленной
+# версией и сохраняется в state, чтобы после reboot знать, какое ядро ожидать.
+KERNEL_VER=""
+KERNEL_VER_FILE="$STATE_DIR/kernel_ver"
+XANMOD_REPO_LIST="/etc/apt/sources.list.d/xanmod-release.list"
+XANMOD_KEYRING="/usr/share/keyrings/xanmod-archive-keyring.gpg"
 
 OS_ID=""
 OS_VERSION_ID=""
@@ -55,8 +59,11 @@ REALITY_SNI=""
 REALITY_TARGET_PORT=""
 
 # Репозиторий ядра Xray-core (для пункта меню «Обновление ядра xray»).
+# Имя ассета (zip) выбирается по архитектуре в xray_asset_for_arch.
 XRAY_CORE_REPO="XTLS/Xray-core"
-XRAY_CORE_ASSET="Xray-linux-64.zip"
+
+# Куда ставить wrapper-команду для быстрого запуска (eclipse).
+ECLIPSE_CMD="/usr/local/bin/eclipse"
 
 # Случайный суффикс для тегов инбаундов (схема: протокол+порт+рандом), чтобы
 # имена были уникальными между нодами и их не приходилось править руками.
@@ -979,8 +986,49 @@ check_cpu_level() {
   log_line "Detected CPU level: ${CPU_LEVEL}"
 }
 
+# Возвращает самую свежую установленную версию ядра XanMod (строку uname -r),
+# например 6.19.14-x64v3-xanmod1. Пусто, если XanMod-ядро не установлено.
+highest_installed_xanmod() {
+  dpkg-query -W -f='${Package}\n' 'linux-image-*xanmod*' 2>/dev/null \
+    | sed 's/^linux-image-//' \
+    | grep -E 'xanmod' \
+    | sort -V \
+    | tail -n1
+}
+
+# Загружает ожидаемую версию XanMod-ядра из state (нужно после reboot).
+load_kernel_ver() {
+  if [[ -z "$KERNEL_VER" && -f "$KERNEL_VER_FILE" ]]; then
+    KERNEL_VER="$(cat "$KERNEL_VER_FILE" 2>/dev/null || true)"
+  fi
+}
+
+# Подключает официальный APT-репозиторий XanMod (deb.xanmod.org). Возвращает 0
+# при успехе. Метапакеты linux-xanmod-x64vN из него всегда тянут самую свежую
+# версию ядра.
+setup_xanmod_repo() {
+  if [[ -z "${OS_ID:-}" || "$OS_ID" == "unknown" ]]; then
+    detect_os_info
+  fi
+
+  run_cmd "Ставлю зависимости репозитория XanMod" \
+    env DEBIAN_FRONTEND=noninteractive apt-get install -y gnupg curl ca-certificates || return 1
+
+  if ! run_shell "Добавляю GPG-ключ XanMod" \
+    "set -o pipefail; curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor -o '$XANMOD_KEYRING'"; then
+    return 1
+  fi
+
+  echo "deb [signed-by=$XANMOD_KEYRING] http://deb.xanmod.org releases main" > "$XANMOD_REPO_LIST"
+
+  run_cmd "Обновляю APT index (XanMod repo)" \
+    env DEBIAN_FRONTEND=noninteractive apt-get update || return 1
+
+  return 0
+}
+
 install_xanmod_kernel() {
-  section "3/12 · XanMod kernel $KERNEL_VER"
+  section "3/12 · XanMod kernel (последняя версия)"
 
   if is_container_env; then
     KERNEL_INSTALL_SKIPPED=1
@@ -989,35 +1037,46 @@ install_xanmod_kernel() {
     return 0
   fi
 
-  if [[ "$CPU_LEVEL" == "v1" || "$CPU_LEVEL" == "v2" ]]; then
-    KERNEL_INSTALL_SKIPPED=1
-    warn "Пропускаю установку XanMod x64v3 ядра: CPU level ${CPU_LEVEL:-unknown} ниже требуемого v3."
-    info "Сервер останется на текущем ядре, BBR v3 тюнинг сети при этом всё равно применится там, где это поддерживается текущим ядром."
-    return 0
-  fi
+  local meta
+  case "$CPU_LEVEL" in
+    v4|v3) meta="linux-xanmod-x64v3" ;;
+    v2)    meta="linux-xanmod-x64v2" ;;
+    *)
+      KERNEL_INSTALL_SKIPPED=1
+      warn "Пропускаю установку XanMod: CPU level ${CPU_LEVEL:-unknown} ниже v2 (XanMod требует минимум x64v2)."
+      info "Сервер останется на текущем ядре, сетевой тюнинг всё равно применится там, где это поддерживается."
+      return 0
+      ;;
+  esac
 
   KERNEL_INSTALL_SKIPPED=0
 
-  if uname -r | grep -q "$KERNEL_VER"; then
-    ok "Уже загружено нужное ядро: $(uname -r)"
+  if ! setup_xanmod_repo; then
+    KERNEL_INSTALL_SKIPPED=1
+    warn "Не удалось подключить репозиторий XanMod — пропускаю установку ядра, продолжаю без него."
     return 0
   fi
 
-  mkdir -p /root/xanmod
-  cd /root/xanmod
+  info "Ставлю метапакет $meta (тянет самую свежую версию ядра XanMod)."
 
-  rm -f ./*.deb
+  if ! run_cmd "Устанавливаю XanMod kernel ($meta)" \
+    env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y \
+    -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" "$meta"; then
+    KERNEL_INSTALL_SKIPPED=1
+    warn "Не удалось установить $meta — продолжаю без нового ядра."
+    return 0
+  fi
 
-  run_cmd "Скачиваю linux-image XanMod" \
-    curl -fL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG -o image.deb "$IMAGE_DEB_URL"
+  KERNEL_VER="$(highest_installed_xanmod)"
+  if [[ -n "$KERNEL_VER" ]]; then
+    mkdir -p "$STATE_DIR"
+    echo "$KERNEL_VER" > "$KERNEL_VER_FILE"
+    ok "Установлена версия ядра XanMod: $KERNEL_VER"
+  else
+    warn "Не удалось определить установленную версию XanMod (dpkg-query пусто)."
+  fi
 
-  run_cmd "Скачиваю linux-headers XanMod" \
-    curl -fL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG -o headers.deb "$HEADERS_DEB_URL"
-
-  run_shell "Проверяю deb-пакеты" "file /root/xanmod/image.deb /root/xanmod/headers.deb && dpkg-deb -I /root/xanmod/image.deb >/dev/null && dpkg-deb -I /root/xanmod/headers.deb >/dev/null"
-
-  run_cmd "Устанавливаю XanMod kernel" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" ./image.deb ./headers.deb
-  run_cmd "Обновляю GRUB" update-grub
+  run_cmd "Обновляю GRUB" update-grub || warn "update-grub вернул ошибку — проверь загрузчик вручную."
 }
 
 install_profile_continue_hook() {
@@ -1090,8 +1149,15 @@ maybe_reboot() {
     return 0
   fi
 
-  if uname -r | grep -q "$KERNEL_VER"; then
-    ok "Ребут не нужен, уже загружено ядро $KERNEL_VER"
+  load_kernel_ver
+
+  if [[ -n "$KERNEL_VER" ]]; then
+    if [[ "$(uname -r)" == "$KERNEL_VER" ]]; then
+      ok "Ребут не нужен, уже загружено ядро $KERNEL_VER"
+      return 0
+    fi
+  elif uname -r | grep -q 'xanmod'; then
+    ok "Ребут не нужен, уже загружено ядро XanMod: $(uname -r)"
     return 0
   fi
 
@@ -1604,32 +1670,40 @@ run_final_test() {
   fi
 }
 
+run_iperf3_ru_speedtest() {
+  echo
+  echo "${C_DIM}  TCP counters before:${C_RESET}"
+  nstat -az TcpRetransSegs TcpOutSegs 2>/dev/null | tee -a "$LOG_FILE" | sed 's/^/  /' || true
+
+  if ! run_shell_live "Запускаю iperf3 speedtest (RU)" \
+    "bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)"; then
+    warn "iperf3 speedtest завершился с ошибкой, но это не критично — продолжаю."
+  fi
+
+  echo
+  echo "${C_DIM}  TCP counters after:${C_RESET}"
+  nstat -az TcpRetransSegs TcpOutSegs 2>/dev/null | tee -a "$LOG_FILE" | sed 's/^/  /' || true
+}
+
 optional_speedtest() {
   section "10/12 · Speedtest"
 
   echo
-  read -rp "  Запустить iperf3 speedtest сейчас? [y/N]: " ans
+  echo "  Что запустить?"
+  echo "  ${C_GREEN}1${C_RESET}) iperf3 (серверы в России)"
+  echo "  ${C_GREEN}2${C_RESET}) Ookla Speedtest (ближайший мировой сервер)"
+  echo "  ${C_GREEN}3${C_RESET}) Оба"
+  echo "  ${C_YELLOW}0${C_RESET}) Пропустить"
+  echo
 
-  case "${ans,,}" in
-    y|yes|д|да)
-      echo
-      echo "${C_DIM}  TCP counters before:${C_RESET}"
-      nstat -az TcpRetransSegs TcpOutSegs 2>/dev/null | tee -a "$LOG_FILE" | sed 's/^/  /' || true
+  local ans
+  read -rp "  Выбор [1/2/3/0]: " ans
 
-      if run_shell_live "Запускаю iperf3 speedtest" \
-        "bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)"; then
-        :
-      else
-        warn "Speedtest завершился с ошибкой, но это не критично — продолжаю установку."
-      fi
-
-      echo
-      echo "${C_DIM}  TCP counters after:${C_RESET}"
-      nstat -az TcpRetransSegs TcpOutSegs 2>/dev/null | tee -a "$LOG_FILE" | sed 's/^/  /' || true
-      ;;
-    *)
-      ok "Speedtest пропущен"
-      ;;
+  case "${ans:-0}" in
+    1) run_iperf3_ru_speedtest ;;
+    2) run_ookla_speedtest || true ;;
+    3) run_iperf3_ru_speedtest; run_ookla_speedtest || true ;;
+    *) ok "Speedtest пропущен" ;;
   esac
 }
 
@@ -2732,6 +2806,24 @@ EOF_COMPOSE
       fi
     fi
   fi
+
+  # Если UFW уже активен — открываем порты этой ноды, чтобы не потерять связь.
+  if command -v ufw >/dev/null 2>&1 && ufw_is_active; then
+    ufw_allow_if_active "${NODE_PORT}/tcp"
+    if [[ "$NODE_INSTALL_TYPE" == "tls" ]]; then
+      ufw_allow_if_active "${TLS_VLESS_PORT}/tcp"
+      ufw_allow_if_active "${HY2_PORT}/udp"
+    else
+      ufw_allow_if_active "${REALITY_PORT}/tcp"
+      [[ "$HYSTERIA2_ENABLED" -eq 1 ]] && ufw_allow_if_active "${HY2_PORT}/udp"
+    fi
+    ok "Порты ноды открыты в UFW."
+  fi
+
+  # Автопродление сертификата с рестартом ноды — только если сертификат есть.
+  if [[ "$CERT_OK" -eq 1 ]]; then
+    install_cert_renew_hook
+  fi
 }
 
 cleanup_continue_hook() {
@@ -2847,21 +2939,72 @@ select_xray_version() {
   echo "$target_ver"
 }
 
-# Скачивает бинарник ядра Xray указанного тега и кладёт в <dest_dir>/xray
-# (исполняемым). Возвращает 0 при успехе.
+# Возвращает имя zip-ассета Xray-core под архитектуру этого сервера.
+xray_asset_for_arch() {
+  local arch
+  arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+
+  case "$arch" in
+    amd64|x86_64)   echo "Xray-linux-64.zip" ;;
+    arm64|aarch64)  echo "Xray-linux-arm64-v8a.zip" ;;
+    armhf|armv7l)   echo "Xray-linux-arm32-v7a.zip" ;;
+    *)              echo "Xray-linux-64.zip" ;;
+  esac
+}
+
+# Сверяет SHA256 скачанного zip с контрольной суммой из .dgst-файла релиза.
+# 0 — совпало; 1 — не совпало; 2 — проверить не удалось (нет .dgst/суммы),
+# что не считаем фатальным (старые релизы могут не иметь .dgst).
+verify_xray_checksum() {
+  local zip="$1" dgst_url="$2" tmp_dgst expected actual
+
+  tmp_dgst="${zip}.dgst"
+  if ! curl -fsSL --retry 3 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG -o "$tmp_dgst" "$dgst_url" 2>/dev/null; then
+    return 2
+  fi
+
+  expected="$(grep -ioE 'sha(2-)?256[^0-9a-f]*[0-9a-f]{64}' "$tmp_dgst" 2>/dev/null | grep -oiE '[0-9a-f]{64}' | head -n1 | tr 'A-F' 'a-f')"
+  [[ -n "$expected" ]] || return 2
+
+  actual="$(sha256sum "$zip" 2>/dev/null | awk '{print $1}' | tr 'A-F' 'a-f')"
+  [[ -n "$actual" ]] || return 2
+
+  [[ "$expected" == "$actual" ]]
+}
+
+# Скачивает бинарник ядра Xray указанного тега (под архитектуру сервера),
+# проверяет контрольную сумму и кладёт в <dest_dir>/xray (исполняемым).
+# Возвращает 0 при успехе.
 download_xray_core() {
   local tag="$1" dest_dir="$2"
-  local url tmpdir
+  local asset url tmpdir rc
 
-  url="https://github.com/${XRAY_CORE_REPO}/releases/download/${tag}/${XRAY_CORE_ASSET}"
+  asset="$(xray_asset_for_arch)"
+  url="https://github.com/${XRAY_CORE_REPO}/releases/download/${tag}/${asset}"
   tmpdir="$(mktemp -d)"
+
+  info "Архитектура сервера · ассет ядра: $asset"
 
   if ! run_cmd "Скачиваю Xray $tag" \
     curl -fL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG -o "$tmpdir/xray.zip" "$url"; then
     rm -rf "$tmpdir"
-    warn "Не удалось скачать ядро Xray $tag. Проверь, что такой релиз существует."
+    warn "Не удалось скачать ядро Xray $tag ($asset). Проверь, что такой релиз/ассет существует."
     return 1
   fi
+
+  set +e
+  verify_xray_checksum "$tmpdir/xray.zip" "${url}.dgst"
+  rc=$?
+  set -e
+  case "$rc" in
+    0) ok "Контрольная сумма Xray проверена (SHA256)." ;;
+    1)
+      rm -rf "$tmpdir"
+      warn "Контрольная сумма ядра Xray НЕ совпала — загрузка повреждена или подменена. Отменяю."
+      return 1
+      ;;
+    *) warn "Не удалось проверить контрольную сумму (.dgst недоступен) — продолжаю без проверки." ;;
+  esac
 
   if ! run_cmd "Распаковываю Xray" unzip -o "$tmpdir/xray.zip" -d "$tmpdir"; then
     rm -rf "$tmpdir"
@@ -2973,10 +3116,226 @@ update_xray_core() {
   ok "Обновление ядра Xray завершено."
 }
 
+# Создаёт короткую команду `eclipse` для запуска менеджера. Если системной
+# копии скрипта ещё нет — сохраняет туда текущий файл, затем делает симлинк.
+ensure_eclipse_command() {
+  if [[ ! -s "$SCRIPT_PATH" ]]; then
+    local src
+    src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+    if [[ -n "$src" && -f "$src" && -r "$src" ]]; then
+      mkdir -p "$(dirname "$SCRIPT_PATH")"
+      if cp -- "$src" "$SCRIPT_PATH" 2>/dev/null; then
+        chmod 700 "$SCRIPT_PATH"
+      fi
+    fi
+  fi
+
+  [[ -s "$SCRIPT_PATH" ]] || return 0
+  ln -sf "$SCRIPT_PATH" "$ECLIPSE_CMD" 2>/dev/null || true
+}
+
+# ── UFW / порты ──────────────────────────────────────────────────────────────
+
+ensure_ufw() {
+  command -v ufw >/dev/null 2>&1 && return 0
+  run_cmd "Устанавливаю ufw" env DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+}
+
+ufw_is_active() {
+  ufw status 2>/dev/null | grep -q "Status: active"
+}
+
+# Разрешает порт(ы) в ufw, только если он активен (иначе молча пропускаем,
+# чтобы не «включать» фаервол неожиданно во время установки ноды).
+ufw_allow_if_active() {
+  local spec="$1"
+  command -v ufw >/dev/null 2>&1 || return 0
+  ufw_is_active || return 0
+  ufw allow "$spec" >/dev/null 2>&1 || true
+}
+
+# По умолчанию всегда открыты 22 (SSH), 80 и 443 — SSH первым, чтобы не
+# потерять доступ при включении фаервола.
+apply_firewall_defaults() {
+  ufw allow 22/tcp >/dev/null 2>&1 || true
+  ufw allow OpenSSH >/dev/null 2>&1 || true
+  ufw allow 80/tcp  >/dev/null 2>&1 || true
+  ufw allow 443/tcp >/dev/null 2>&1 || true
+}
+
+firewall_show() {
+  echo
+  if ufw_is_active; then
+    ok "UFW активен. Открытые правила:"
+    ufw status numbered 2>/dev/null | sed 's/^/  /'
+  else
+    warn "UFW сейчас неактивен (правила не применяются, пока не включишь)."
+    ufw status 2>/dev/null | sed 's/^/  /' || true
+  fi
+}
+
+valid_port_spec() {
+  [[ "$1" =~ ^[0-9]{1,5}(/(tcp|udp))?$ ]] || return 1
+  local num="${1%%/*}"
+  (( 10#$num >= 1 && 10#$num <= 65535 ))
+}
+
+manage_firewall() {
+  section "Настройка портов (UFW)"
+
+  if ! ensure_ufw; then
+    warn "Не удалось установить ufw."
+    return 1
+  fi
+
+  info "По умолчанию всегда открыты порты 22 (SSH), 80 и 443."
+  apply_firewall_defaults
+
+  local choice port
+  while true; do
+    firewall_show
+    echo
+    echo "  ${C_GREEN}1${C_RESET}) Разрешить порт"
+    echo "  ${C_GREEN}2${C_RESET}) Закрыть порт"
+    echo "  ${C_GREEN}3${C_RESET}) Включить UFW"
+    echo "  ${C_GREEN}4${C_RESET}) Выключить UFW"
+    echo "  ${C_GREEN}5${C_RESET}) Обновить список открытых портов"
+    echo "  ${C_YELLOW}0${C_RESET}) Назад"
+    echo
+    read -rp "  Выбор: " choice
+
+    case "${choice:-}" in
+      1)
+        read -rp "  Порт (например 2222 или 2222/udp): " port
+        port="$(echo "${port:-}" | tr -d '[:space:]')"
+        if valid_port_spec "$port"; then
+          if ufw allow "$port" >/dev/null 2>&1; then
+            ok "Разрешён порт $port"
+          else
+            warn "Не удалось добавить правило для $port"
+          fi
+        else
+          warn "Некорректный порт. Пример: 2222 или 2222/udp"
+        fi
+        ;;
+      2)
+        read -rp "  Порт для закрытия (например 2222 или 2222/udp): " port
+        port="$(echo "${port:-}" | tr -d '[:space:]')"
+        if [[ "$port" =~ ^(22|80|443)(/tcp)?$ ]]; then
+          warn "Порт $port относится к базовым (22/80/443) — закрывать не рекомендую (можно потерять доступ)."
+          read -rp "  Всё равно закрыть? [y/N]: " ans
+          case "${ans,,}" in y|yes|д|да) ;; *) continue ;; esac
+        fi
+        if valid_port_spec "$port"; then
+          ufw delete allow "$port" >/dev/null 2>&1 && ok "Правило allow $port удалено" \
+            || warn "Правило для $port не найдено (или уже удалено)."
+        else
+          warn "Некорректный порт."
+        fi
+        ;;
+      3)
+        apply_firewall_defaults
+        if ufw --force enable >/dev/null 2>&1; then
+          ok "UFW включён (22/80/443 и добавленные порты открыты)."
+        else
+          warn "Не удалось включить UFW."
+        fi
+        ;;
+      4)
+        if ufw disable >/dev/null 2>&1; then
+          ok "UFW выключен."
+        else
+          warn "Не удалось выключить UFW."
+        fi
+        ;;
+      5) ;;
+      0|"") break ;;
+      *) warn "Некорректный выбор." ;;
+    esac
+  done
+}
+
+# Ставит deploy-hook certbot: после обновления сертификата Let's Encrypt
+# перезапускает все ноды Remnawave, чтобы xray перечитал новый fullchain/privkey
+# (иначе TLS/Hysteria2-нода тихо отвалится через ~90 дней). Также включает
+# таймер автообновления certbot.
+install_cert_renew_hook() {
+  local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+  local hook="$hook_dir/restart-remnanode.sh"
+
+  mkdir -p "$hook_dir"
+
+  cat > "$hook" <<'EOF_HOOK'
+#!/usr/bin/env bash
+# Перезапуск нод Remnawave после обновления сертификата Let's Encrypt.
+set -e
+
+restart_dir() {
+  local d="$1"
+  ( cd "$d" && { docker compose restart 2>/dev/null || docker-compose restart 2>/dev/null; } ) || true
+}
+
+for d in /opt/remnanode /root/remnanode /home/*/remnanode /opt/*-Node; do
+  [ -f "$d/docker-compose.yml" ] || continue
+  grep -q 'remnawave/node' "$d/docker-compose.yml" 2>/dev/null || continue
+  restart_dir "$d"
+done
+EOF_HOOK
+
+  chmod +x "$hook"
+  systemctl enable --now certbot.timer >/dev/null 2>&1 || true
+
+  ok "Deploy-hook автопродления сертификата установлен: $hook"
+  info "После каждого обновления сертификата нода перезапустится автоматически."
+}
+
+# ── Ookla Speedtest ──────────────────────────────────────────────────────────
+
+# Ставит официальный Ookla Speedtest CLI (пакет speedtest) через их
+# packagecloud-репозиторий; при неудаче пробует speedtest-cli из дистрибутива.
+ensure_ookla_speedtest() {
+  command -v speedtest >/dev/null 2>&1 && return 0
+
+  if [[ -z "${OS_ID:-}" || "$OS_ID" == "unknown" ]]; then
+    detect_os_info
+  fi
+
+  if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
+    run_shell "Подключаю репозиторий Ookla Speedtest" \
+      "set -o pipefail; curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash" || true
+    run_cmd "Устанавливаю Ookla speedtest" \
+      env DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest >/dev/null 2>&1 || true
+  fi
+
+  command -v speedtest >/dev/null 2>&1 && return 0
+
+  # Фолбэк — python-клиент speedtest-cli.
+  run_cmd "Устанавливаю speedtest-cli (фолбэк)" \
+    env DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest-cli >/dev/null 2>&1 || true
+
+  command -v speedtest >/dev/null 2>&1 || command -v speedtest-cli >/dev/null 2>&1
+}
+
+run_ookla_speedtest() {
+  if ! ensure_ookla_speedtest; then
+    warn "Не удалось установить Ookla Speedtest CLI."
+    return 1
+  fi
+
+  if command -v speedtest >/dev/null 2>&1; then
+    # Официальный Ookla CLI — нужно принять лицензию/GDPR при первом запуске.
+    run_shell_live "Ookla Speedtest (ближайший сервер)" \
+      "speedtest --accept-license --accept-gdpr 2>/dev/null || speedtest"
+  else
+    run_shell_live "Speedtest (speedtest-cli)" "speedtest-cli"
+  fi
+}
+
 stage_before_reboot() {
   need_root
   print_banner
   save_self
+  ensure_eclipse_command
 
   mkdir -p "$STATE_DIR"
   touch "$LOG_FILE"
@@ -3004,20 +3363,30 @@ stage_before_reboot() {
 stage_after_reboot() {
   need_root
   print_banner
+  ensure_eclipse_command
 
   mkdir -p "$STATE_DIR"
   touch "$LOG_FILE"
 
   load_install_type
+  load_kernel_ver
 
   section "Продолжение установки после reboot"
 
-  if ! uname -r | grep -q "$KERNEL_VER"; then
-    warn "Сейчас загружено ядро: $(uname -r)"
-    warn "Ожидалось: $KERNEL_VER"
-    warn "Продолжаю настройку, но BBR v3 может быть недоступен."
+  if is_container_env; then
+    ok "Контейнерное окружение (LXC/OpenVZ) — используется ядро хоста: $(uname -r). Своё XanMod-ядро здесь не ставится, это нормально."
+  elif [[ -n "$KERNEL_VER" ]]; then
+    if [[ "$(uname -r)" == "$KERNEL_VER" ]]; then
+      ok "Загружено ядро: $(uname -r)"
+    else
+      warn "Сейчас загружено ядро: $(uname -r)"
+      warn "Ожидалось: $KERNEL_VER"
+      warn "Продолжаю настройку, но BBR v3 может быть недоступен."
+    fi
+  elif uname -r | grep -q 'xanmod'; then
+    ok "Загружено ядро XanMod: $(uname -r)"
   else
-    ok "Загружено ядро: $(uname -r)"
+    warn "Загружено не XanMod-ядро: $(uname -r). Продолжаю, но BBR v3 может быть недоступен."
   fi
 
   apply_network_tuning
@@ -3042,6 +3411,8 @@ stage_after_reboot() {
   echo "    cd $REMNANODE_DIR"
   echo "    docker compose ps"
   echo "    docker compose logs -f --tail=100"
+  echo
+  echo "  Менеджер снова открыть командой: ${C_BOLD}eclipse${C_RESET}"
   echo
 
   if [[ "$NODE_INSTALL_TYPE" == "tls" && "$CERT_OK" -eq 1 ]]; then
@@ -3096,6 +3467,7 @@ pause_menu() {
 
 main_menu() {
   need_root
+  ensure_eclipse_command
 
   while true; do
     print_banner
@@ -3111,10 +3483,11 @@ main_menu() {
     echo "  ${C_CYAN}6${C_RESET}) Проверить систему"
     echo "  ${C_CYAN}7${C_RESET}) Torrent Blocker (установить/переустановить)"
     echo "  ${C_CYAN}8${C_RESET}) Обновление ядра Xray"
+    echo "  ${C_CYAN}9${C_RESET}) Настройка портов (UFW)"
     echo "  ${C_YELLOW}0${C_RESET}) Выход"
     echo
 
-    read -rp "  Выбор [1/2/3/4/5/6/7/8/0]: " choice || choice="0"
+    read -rp "  Выбор [1/2/3/4/5/6/7/8/9/0]: " choice || choice="0"
 
     case "${choice:-}" in
       1)
@@ -3147,6 +3520,10 @@ main_menu() {
         ;;
       8)
         update_xray_core
+        pause_menu
+        ;;
+      9)
+        manage_firewall
         pause_menu
         ;;
       0|q|Q|exit|quit)
@@ -3191,6 +3568,10 @@ case "${1:-}" in
     need_root
     update_xray_core
     ;;
+  --firewall|--ufw|firewall|ufw)
+    need_root
+    manage_firewall
+    ;;
   --menu|menu|"")
     main_menu
     ;;
@@ -3209,6 +3590,9 @@ case "${1:-}" in
   $0 --test             проверить систему
   $0 --torrent-blocker  установить/переустановить Torrent Blocker
   $0 --xray-core        обновить ядро Xray в контейнере ноды
+  $0 --firewall         настройка портов (UFW)
+
+После первой установки менеджер доступен короткой командой: eclipse
 EOF_HELP
     ;;
   *)
