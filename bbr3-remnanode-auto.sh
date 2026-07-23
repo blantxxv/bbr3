@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.2.5"
+SCRIPT_VERSION="3.2.6"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -2082,18 +2082,32 @@ issue_tls_certificate() {
   fi
 
   # Если скрипт запускают повторно (например, после сбоя запуска ноды) и для
-  # ранее сохранённого домена уже есть действующий сертификат — не спрашиваем
-  # заново и не выпускаем его повторно.
+  # ранее сохранённого домена уже есть действующий сертификат — предлагаем его
+  # переиспользовать, но НЕ навязываем: пользователь может захотеть другой
+  # домен/сертификат, поэтому спрашиваем, а не возвращаемся молча.
+  local declined_saved=0
   if [[ -f "$DOMAIN_FILE" ]]; then
-    local saved_domain
+    local saved_domain saved_ans
     saved_domain="$(cat "$DOMAIN_FILE" 2>/dev/null || true)"
 
     if [[ -n "$saved_domain" ]] && check_existing_certificate "$saved_domain"; then
-      DOMAIN="$saved_domain"
-      CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
-      CERT_OK=1
-      ok "Найден действующий сертификат для домена $DOMAIN. Повторный выпуск не требуется."
-      return 0
+      echo
+      info "Найден действующий сертификат для сохранённого ранее домена: $saved_domain"
+      read -rp "  Использовать его? (n — указать другой домен/сертификат) [Y/n]: " saved_ans
+
+      case "${saved_ans,,}" in
+        n|no|н|нет)
+          info "Хорошо, выберем другой домен/сертификат."
+          declined_saved=1
+          ;;
+        *)
+          DOMAIN="$saved_domain"
+          CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
+          CERT_OK=1
+          ok "Использую сертификат для домена $DOMAIN."
+          return 0
+          ;;
+      esac
     fi
   fi
 
@@ -2106,7 +2120,7 @@ issue_tls_certificate() {
   found_count=0
   [[ -n "$found_certs" ]] && found_count="$(echo "$found_certs" | wc -l)"
 
-  if [[ "$found_count" -gt 0 ]]; then
+  if [[ "$declined_saved" -ne 1 && "$found_count" -gt 0 ]]; then
     echo
     info "На сервере уже есть действующие сертификаты Let's Encrypt:"
     echo "$found_certs" | sed 's/^/    - /'
