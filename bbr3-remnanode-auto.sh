@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.2.8"
+SCRIPT_VERSION="3.2.9"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -308,9 +308,27 @@ run_shell() {
   return "$rc"
 }
 
+# Многие «живые» команды (speedtest, apt с прогресс-барами, инсталляторы)
+# переводят tty в свой режим и не всегда его восстанавливают — тогда вывод
+# начинает «лесенкой» (потерян ONLCR: \n без \r) или пропадает эхо ввода.
+# Снимаем состояние терминала до команды и возвращаем после.
+save_tty_state() {
+  [[ -t 1 ]] || return 0
+  stty -g 2>/dev/null || true
+}
+
+restore_tty_state() {
+  [[ -t 1 ]] || return 0
+  if [[ -n "${1:-}" ]]; then
+    stty "$1" 2>/dev/null && return 0
+  fi
+  stty sane 2>/dev/null || true
+}
+
 run_shell_live() {
   local msg="$1"
   local cmd="$2"
+  local tty_state
 
   mkdir -p "$(dirname "$LOG_FILE")"
   log_line "START LIVE: $msg"
@@ -319,10 +337,14 @@ run_shell_live() {
   echo "${C_CYAN}  [..]${C_RESET} $msg"
   echo "${C_DIM}  ────────────────────────────────────────────────────────────${C_RESET}"
 
+  tty_state="$(save_tty_state)"
+
   set +e
   bash -lc "$cmd" 2>&1 | tee -a "$LOG_FILE"
   local rc="${PIPESTATUS[0]}"
   set -e
+
+  restore_tty_state "$tty_state"
 
   echo "${C_DIM}  ────────────────────────────────────────────────────────────${C_RESET}"
 
@@ -343,13 +365,16 @@ run_shell_live() {
 # поэтому сигнал получает только дерево процессов теста — оно завершается, а
 # скрипт продолжает работу и возвращается в меню. Нужно для тестов скорости и
 # прочих долгих шагов, которые могут «зависнуть» или идти слишком долго.
-# Третий аргумент — через сколько секунд напомнить, что тест можно отменить.
+# Третий аргумент раньше задавал задержку фонового напоминания об отмене —
+# оно убрано: асинхронная запись в тот же stdout влезала в середину строки
+# живого вывода (speedtest/apt) и разносила весь экран. Подсказка про Ctrl+C
+# теперь печатается один раз до старта команды. Аргумент оставлен для
+# совместимости с существующими вызовами и игнорируется.
 run_live_cancellable() {
   local msg="$1"
   local cmd="$2"
-  local warn_after="${3:-45}"
   local rc=0
-  local reminder_pid=""
+  local tty_state
 
   mkdir -p "$(dirname "$LOG_FILE")"
   log_line "START LIVE-CANCEL: $msg"
@@ -359,10 +384,7 @@ run_live_cancellable() {
   echo "${C_DIM}  Идёт слишком долго или зависло? Нажми Ctrl+C — отменится только этот тест, скрипт продолжит работу.${C_RESET}"
   echo "${C_DIM}  ────────────────────────────────────────────────────────────${C_RESET}"
 
-  # Фоновое напоминание об отмене, если тест длится дольше warn_after секунд.
-  ( sleep "$warn_after" 2>/dev/null && \
-    printf '\n%s\n' "${C_YELLOW}  Тест идёт уже больше ${warn_after}с. Если завис — нажми Ctrl+C для отмены.${C_RESET}" ) &
-  reminder_pid="$!"
+  tty_state="$(save_tty_state)"
 
   set +e
   # Пока идёт тест, скрипт игнорирует Ctrl+C сам, но дочерние процессы теста
@@ -373,10 +395,7 @@ run_live_cancellable() {
   trap - INT
   set -e
 
-  if [[ -n "$reminder_pid" ]]; then
-    kill "$reminder_pid" >/dev/null 2>&1 || true
-    wait "$reminder_pid" 2>/dev/null || true
-  fi
+  restore_tty_state "$tty_state"
 
   echo "${C_DIM}  ────────────────────────────────────────────────────────────${C_RESET}"
 
@@ -3829,13 +3848,15 @@ ensure_ookla_speedtest() {
   fi
 
   if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
-    # timeout не даёт зависнуть навсегда (packagecloud-скрипт делает apt-get
-    # update и на битом стороннем репо может стоять минутами); Ctrl+C всё
-    # равно отменит шаг вручную, не роняя скрипт.
-    run_live_cancellable "Подключаю репозиторий Ookla Speedtest" \
-      "set -o pipefail; timeout 150 bash -c 'curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash'" 25 || true
-    run_live_cancellable "Устанавливаю Ookla speedtest" \
-      "timeout 150 env DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest" 25 || true
+    # Установка идёт тихо (вывод в лог): прогресс-бары apt и packagecloud-скрипта
+    # перехватывают терминал и портят дальнейший вывод. timeout не даёт зависнуть
+    # навсегда, но берём с запасом — триггеры man-db после установки пакета
+    # спокойно идут пару минут, а прежние 150с их обрывали и шаг падал с [FAIL],
+    # хотя пакет по факту уже ставился.
+    run_shell "Подключаю репозиторий Ookla Speedtest" \
+      "set -o pipefail; timeout 300 bash -c 'curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash'" || true
+    run_shell "Устанавливаю Ookla speedtest" \
+      "timeout 600 env DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest" || true
   fi
 
   command -v speedtest >/dev/null 2>&1 && return 0
