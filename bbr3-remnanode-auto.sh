@@ -1777,8 +1777,10 @@ issue_cert_dns01_manual() {
   cat > "$hook" <<'EOF_AUTHHOOK'
 #!/usr/bin/env bash
 # certbot manual auth-hook (DNS-01): печатает TXT-запись, которую нужно
-# добавить, и ждёт, пока ИМЕННО это значение начнёт отдаваться публичными
-# DNS-резолверами, после чего возвращает управление certbot.
+# добавить, и ждёт, пока ИМЕННО это значение начнёт отдаваться. Проверяет в
+# первую очередь АВТОРИТЕТНЫЙ NS зоны (именно его опрашивает Let's Encrypt —
+# и он не подвержен перехвату публичных резолверов у хостера), плюс несколько
+# публичных резолверов как запасной вариант. Достаточно одного совпадения.
 set -u
 
 DOMAIN="${CERTBOT_DOMAIN:?}"
@@ -1786,6 +1788,37 @@ VALIDATION="${CERTBOT_VALIDATION:?}"
 RECORD="_acme-challenge.${DOMAIN}"
 
 out() { printf '%s\n' "$*" > /dev/tty 2>/dev/null || printf '%s\n' "$*"; }
+
+# Быстрый dig: короткий таймаут, чтобы «молчащие»/перехваченные резолверы
+# не подвешивали проверку.
+DIG="dig +short +time=3 +tries=1"
+
+# Ищет авторитетный NS зоны, поднимаясь от полного имени к корню
+# (de34.safeeclipse.online → safeeclipse.online → ...).
+find_auth_ns() {
+  local name="$1" ns
+  while [[ "$name" == *.*.* || "$name" == *.* ]]; do
+    ns="$($DIG NS "$name" 2>/dev/null | head -n1)"
+    [[ -n "$ns" ]] && { echo "${ns%.}"; return 0; }
+    [[ "$name" == *.* ]] || break
+    name="${name#*.}"
+  done
+  return 1
+}
+
+# Проверяет TXT на конкретном сервере (пусто = системный резолвер).
+check_at() {
+  local server="${1:-}" got
+  if [[ -n "$server" ]]; then
+    got="$($DIG TXT "$RECORD" "@$server" 2>/dev/null | tr -d '"')"
+  else
+    got="$($DIG TXT "$RECORD" 2>/dev/null | tr -d '"')"
+  fi
+  grep -qxF "$VALIDATION" <<< "$got"
+}
+
+AUTH_NS="$(find_auth_ns "$DOMAIN" || true)"
+RESOLVERS=(1.1.1.1 8.8.8.8 9.9.9.9 77.88.8.8)
 
 out ""
 out "════════════════════════════════════════════════════════════"
@@ -1797,38 +1830,38 @@ out "    Значение: ${VALIDATION}"
 out ""
 out "  Полное имя записи: ${RECORD}"
 out "════════════════════════════════════════════════════════════"
+[[ -n "$AUTH_NS" ]] && out "  Авторитетный NS зоны: $AUTH_NS (его же проверяет Let's Encrypt)"
 out "  Как добавишь — скрипт сам увидит запись и продолжит."
 out ""
 
-check_resolver() {
-  local server="$1" got
-  got="$(dig +short TXT "$RECORD" "@$server" 2>/dev/null | tr -d '"')"
-  grep -qxF "$VALIDATION" <<< "$got"
-}
-
-RESOLVERS=(8.8.8.8 1.1.1.1 9.9.9.9)
-MAX=120   # 120 * 15s = 30 минут
+MAX=120   # 120 * 10s = 20 минут
 i=0
 while (( i < MAX )); do
-  ok_count=0
-  for r in "${RESOLVERS[@]}"; do
-    check_resolver "$r" && ok_count=$((ok_count + 1))
-  done
-
-  if (( ok_count >= 2 )); then
-    printf '\r%*s\r' 60 '' > /dev/tty 2>/dev/null || true
-    out "  [OK] TXT-запись видна в публичных DNS (${ok_count}/${#RESOLVERS[@]}). Продолжаю выпуск."
-    sleep 5
+  # 1) Авторитетный NS — это ровно то, что проверит LE.
+  if [[ -n "$AUTH_NS" ]] && check_at "$AUTH_NS"; then
+    printf '\r%*s\r' 70 '' > /dev/tty 2>/dev/null || true
+    out "  [OK] TXT видна на авторитетном NS ($AUTH_NS). Продолжаю выпуск."
+    sleep 3
     exit 0
   fi
 
+  # 2) Любой публичный резолвер (хватает одного — например, 1.1.1.1).
+  for r in "${RESOLVERS[@]}"; do
+    if check_at "$r"; then
+      printf '\r%*s\r' 70 '' > /dev/tty 2>/dev/null || true
+      out "  [OK] TXT видна в публичном DNS ($r). Продолжаю выпуск."
+      sleep 3
+      exit 0
+    fi
+  done
+
   i=$((i + 1))
   printf '\r  Ожидаю распространения TXT... попытка %d/%d   ' "$i" "$MAX" > /dev/tty 2>/dev/null || true
-  sleep 15
+  sleep 10
 done
 
 out ""
-out "  [WARN] За 30 минут TXT так и не появилась во всех резолверах."
+out "  [WARN] За 20 минут TXT так и не удалось увидеть ни на NS, ни в резолверах."
 printf '  Продолжить валидацию всё равно? [y/N]: ' > /dev/tty 2>/dev/null || true
 read -r ans < /dev/tty 2>/dev/null || ans="n"
 case "${ans,,}" in y|yes|д|да) exit 0 ;; *) exit 1 ;; esac
