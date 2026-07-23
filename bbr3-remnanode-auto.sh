@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="2.8.0"
+SCRIPT_VERSION="2.8.1"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -1300,34 +1300,128 @@ EOF_SERVICE
   ok "RPS настроен для $iface"
 }
 
+# Подключает официальный APT-репозиторий Docker (download.docker.com) вручную:
+# GPG-ключ + docker.list с правильным дистрибутивом/codename/архитектурой.
+# Используется как запасной путь, когда convenience-скрипт get.docker.com
+# недоступен (например, отдаёт 403 по IP сервера). Возвращает 0 при успехе.
+setup_docker_official_repo() {
+  local distro codename arch
+
+  # После reboot detect_os_info в этой стадии ещё не вызывался — заполняем OS_*.
+  if [[ -z "${OS_ID:-}" || "$OS_ID" == "unknown" ]]; then
+    detect_os_info
+  fi
+
+  distro="$OS_ID"
+  codename="$OS_CODENAME"
+
+  if [[ "$distro" != "ubuntu" && "$distro" != "debian" ]]; then
+    warn "Официальный репозиторий Docker поддерживает только Ubuntu/Debian (тут: ${distro:-unknown}). Пропускаю этот способ."
+    return 1
+  fi
+
+  if [[ -z "$codename" || "$codename" == "unknown" ]]; then
+    warn "Не удалось определить codename дистрибутива для репозитория Docker."
+    return 1
+  fi
+
+  arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+
+  run_cmd "Ставлю зависимости репозитория Docker" \
+    env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg || return 1
+
+  install -m 0755 -d /etc/apt/keyrings || return 1
+
+  run_cmd "Скачиваю GPG-ключ Docker" \
+    curl -fsSL "https://download.docker.com/linux/$distro/gpg" -o /etc/apt/keyrings/docker.asc || return 1
+  chmod a+r /etc/apt/keyrings/docker.asc
+
+  echo "deb [arch=$arch signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$distro $codename stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+  run_cmd "Обновляю APT index (Docker repo)" \
+    env DEBIAN_FRONTEND=noninteractive apt-get update || return 1
+
+  return 0
+}
+
+# Ставит пакеты Docker CE из подключённого официального репозитория Docker.
+install_docker_ce_packages() {
+  local pkgs=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+  local avail=() p
+
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && avail+=("$p")
+  done < <(filter_available_packages "${pkgs[@]}")
+
+  [[ "${#avail[@]}" -gt 0 ]] || return 1
+
+  run_cmd "Устанавливаю Docker CE" \
+    env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    "${avail[@]}"
+}
+
+# Последний запасной путь: docker.io + compose из репозитория самого
+# дистрибутива (когда и download.docker.com недоступен). Даёт рабочий
+# `docker` и `docker compose`/`docker-compose`.
+install_docker_distro() {
+  local pkgs=(docker.io docker-compose-v2 docker-compose-plugin docker-compose)
+  local avail=() p have_docker_io=0
+
+  run_cmd "Обновляю APT index" \
+    env DEBIAN_FRONTEND=noninteractive apt-get update || true
+
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && avail+=("$p")
+    [[ "$p" == "docker.io" ]] && have_docker_io=1
+  done < <(filter_available_packages "${pkgs[@]}")
+
+  if [[ "$have_docker_io" -ne 1 ]]; then
+    warn "Пакет docker.io недоступен в репозиториях дистрибутива."
+    return 1
+  fi
+
+  run_cmd "Устанавливаю docker.io из репозитория дистрибутива" \
+    env DEBIAN_FRONTEND=noninteractive apt-get install -y "${avail[@]}"
+}
+
+# Каскад установки движка Docker с корректной обработкой ошибок пайпа.
+install_docker_engine() {
+  # 1) Официальный convenience-скрипт. pipefail обязателен: без него код
+  #    возврата берётся от `sh`, который при пустом stdin (curl отдал 403 и
+  #    ничего не вывел) завершается успешно — и ошибка curl проглатывается.
+  if run_shell "Устанавливаю Docker (get.docker.com)" \
+    "set -o pipefail; curl -fsSL https://get.docker.com | sh" \
+    && command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "get.docker.com недоступен или вернул ошибку (частый случай — 403 по IP/региону сервера). Пробую официальный APT-репозиторий Docker напрямую."
+
+  if setup_docker_official_repo && install_docker_ce_packages && command -v docker >/dev/null 2>&1; then
+    ok "Docker установлен из официального репозитория Docker."
+    return 0
+  fi
+
+  warn "Официальный репозиторий Docker не сработал. Пробую docker.io из репозитория дистрибутива."
+
+  if install_docker_distro && command -v docker >/dev/null 2>&1; then
+    ok "Docker установлен из репозитория дистрибутива (docker.io)."
+    return 0
+  fi
+
+  die "Docker установить не удалось ни одним способом (get.docker.com, официальный репозиторий, docker.io)."
+}
+
 install_docker() {
   section "7/12 · Docker"
 
-  if ! command -v docker >/dev/null 2>&1; then
-    if ! run_shell "Устанавливаю Docker" "curl -fsSL https://get.docker.com | sh"; then
-      warn "Официальный скрипт get.docker.com не смог доустановить Docker целиком — на старых/EOL дистрибутивах (например, Ubuntu 18.04) в его набор пакетов иногда попадает то, чего нет в репозитории для этой версии (например, docker-model-plugin)."
-      info "Docker APT-репозиторий и GPG-ключ он обычно успевает добавить до этого сбоя — пробую доустановить вручную только доступные пакеты."
-
-      local docker_packages=(docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-ce-rootless-extras docker-buildx-plugin)
-      local available_docker_packages=()
-
-      run_cmd "Обновляю APT index (Docker repo)" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update
-
-      while IFS= read -r pkg; do
-        [[ -n "$pkg" ]] && available_docker_packages+=("$pkg")
-      done < <(filter_available_packages "${docker_packages[@]}")
-
-      [[ "${#available_docker_packages[@]}" -gt 0 ]] || die "Не удалось установить Docker: пакеты docker-ce/docker-ce-cli/containerd.io недоступны в репозитории (репозиторий Docker не подключился)."
-
-      run_cmd "Устанавливаю Docker (доступные пакеты)" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" \
-        "${available_docker_packages[@]}"
-
-      command -v docker >/dev/null 2>&1 || die "Docker всё равно не установился после ручной доустановки пакетов."
-    fi
-  else
+  if command -v docker >/dev/null 2>&1; then
     ok "Docker уже установлен"
+  else
+    install_docker_engine
   fi
 
   mkdir -p /etc/docker
