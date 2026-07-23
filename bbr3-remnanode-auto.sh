@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.2.4"
+SCRIPT_VERSION="3.2.5"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -335,6 +335,66 @@ run_shell_live() {
   fail "$msg"
   log_line "FAIL LIVE: $msg rc=$rc"
   show_last_log
+  return "$rc"
+}
+
+# Как run_shell_live, но команду можно ОТМЕНИТЬ по Ctrl+C, не роняя весь
+# скрипт: во время выполнения INT перехватывается самим скриптом (trap ':'),
+# поэтому сигнал получает только дерево процессов теста — оно завершается, а
+# скрипт продолжает работу и возвращается в меню. Нужно для тестов скорости и
+# прочих долгих шагов, которые могут «зависнуть» или идти слишком долго.
+# Третий аргумент — через сколько секунд напомнить, что тест можно отменить.
+run_live_cancellable() {
+  local msg="$1"
+  local cmd="$2"
+  local warn_after="${3:-45}"
+  local rc=0
+  local reminder_pid=""
+
+  mkdir -p "$(dirname "$LOG_FILE")"
+  log_line "START LIVE-CANCEL: $msg"
+  log_line "SHELL LIVE: $cmd"
+
+  echo "${C_CYAN}  [..]${C_RESET} $msg"
+  echo "${C_DIM}  Идёт слишком долго или зависло? Нажми Ctrl+C — отменится только этот тест, скрипт продолжит работу.${C_RESET}"
+  echo "${C_DIM}  ────────────────────────────────────────────────────────────${C_RESET}"
+
+  # Фоновое напоминание об отмене, если тест длится дольше warn_after секунд.
+  ( sleep "$warn_after" 2>/dev/null && \
+    printf '\n%s\n' "${C_YELLOW}  Тест идёт уже больше ${warn_after}с. Если завис — нажми Ctrl+C для отмены.${C_RESET}" ) &
+  reminder_pid="$!"
+
+  set +e
+  # Пока идёт тест, скрипт игнорирует Ctrl+C сам, но дочерние процессы теста
+  # (в той же группе процессов) сигнал получают и завершаются.
+  trap ':' INT
+  bash -lc "$cmd" 2>&1 | tee -a "$LOG_FILE"
+  rc="${PIPESTATUS[0]}"
+  trap - INT
+  set -e
+
+  if [[ -n "$reminder_pid" ]]; then
+    kill "$reminder_pid" >/dev/null 2>&1 || true
+    wait "$reminder_pid" 2>/dev/null || true
+  fi
+
+  echo "${C_DIM}  ────────────────────────────────────────────────────────────${C_RESET}"
+
+  # rc>128 — тест прерван сигналом (Ctrl+C). Это штатная отмена, не ошибка.
+  if [[ "$rc" -gt 128 ]]; then
+    warn "$msg — отменено (Ctrl+C). Продолжаю."
+    log_line "CANCELLED: $msg rc=$rc"
+    return 0
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    ok "$msg"
+    log_line "OK LIVE-CANCEL: $msg"
+    return 0
+  fi
+
+  fail "$msg"
+  log_line "FAIL LIVE-CANCEL: $msg rc=$rc"
   return "$rc"
 }
 
@@ -1764,8 +1824,8 @@ run_iperf3_ru_speedtest() {
   echo "${C_DIM}  TCP counters before:${C_RESET}"
   nstat -az TcpRetransSegs TcpOutSegs 2>/dev/null | tee -a "$LOG_FILE" | sed 's/^/  /' || true
 
-  if ! run_shell_live "Запускаю iperf3 speedtest (RU)" \
-    "bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)"; then
+  if ! run_live_cancellable "Запускаю iperf3 speedtest (RU)" \
+    "bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)" 60; then
     warn "iperf3 speedtest завершился с ошибкой, но это не критично — продолжаю."
   fi
 
@@ -3607,10 +3667,13 @@ ensure_ookla_speedtest() {
   fi
 
   if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
-    run_shell "Подключаю репозиторий Ookla Speedtest" \
-      "set -o pipefail; curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash" || true
-    run_cmd "Устанавливаю Ookla speedtest" \
-      env DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest >/dev/null 2>&1 || true
+    # timeout не даёт зависнуть навсегда (packagecloud-скрипт делает apt-get
+    # update и на битом стороннем репо может стоять минутами); Ctrl+C всё
+    # равно отменит шаг вручную, не роняя скрипт.
+    run_live_cancellable "Подключаю репозиторий Ookla Speedtest" \
+      "set -o pipefail; timeout 150 bash -c 'curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash'" 25 || true
+    run_live_cancellable "Устанавливаю Ookla speedtest" \
+      "timeout 150 env DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest" 25 || true
   fi
 
   command -v speedtest >/dev/null 2>&1 && return 0
@@ -3630,10 +3693,10 @@ run_ookla_speedtest() {
 
   if command -v speedtest >/dev/null 2>&1; then
     # Официальный Ookla CLI — нужно принять лицензию/GDPR при первом запуске.
-    run_shell_live "Ookla Speedtest (ближайший сервер)" \
-      "speedtest --accept-license --accept-gdpr 2>/dev/null || speedtest"
+    run_live_cancellable "Ookla Speedtest (ближайший сервер)" \
+      "speedtest --accept-license --accept-gdpr 2>/dev/null || speedtest" 45
   else
-    run_shell_live "Speedtest (speedtest-cli)" "speedtest-cli"
+    run_live_cancellable "Speedtest (speedtest-cli)" "speedtest-cli" 45
   fi
 }
 
