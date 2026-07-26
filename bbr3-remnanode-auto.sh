@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.2.9"
+SCRIPT_VERSION="3.3.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -57,6 +57,27 @@ DEFAULT_REALITY_TARGET_PORT="9443"
 REALITY_PORT=""
 REALITY_SNI=""
 REALITY_TARGET_PORT=""
+
+# Полный target REALITY (host:port), куда проксируется «легитимный» трафик.
+# selfsteal → 127.0.0.1:<локальный порт Caddy>; без selfsteal → <чужой SNI>:443
+# (маскировка под реальный внешний сайт, «borrowed SNI»). Заполняется в
+# ask_reality_params по флагу SELFSTEAL_ENABLED.
+REALITY_TARGET=""
+
+# Флаг: запускался ли selfsteal.sh (Caddy-маскировка на этом же сервере).
+# Ставится в optional_selfsteal. От него зависит, какой SNI/target спрашивать:
+# при selfsteal — свой домен Caddy и локальный порт, без него — внешний домен.
+SELFSTEAL_ENABLED=0
+
+# VLESS Encryption (mlkem768x25519plus, пост-квант ML-KEM-768). Опциональный
+# слой шифрования поверх VLESS, независимый от REALITY/TLS. Спрашивается перед
+# генерацией конфига. REALITY_DECRYPTION идёт в inbound (settings.decryption),
+# REALITY_ENCRYPTION — строка для клиента/панели. Режим фиксируем random
+# (самый устойчивый к DPI). "none" = шифрование выключено.
+REALITY_ENCRYPTION_ENABLED=0
+REALITY_DECRYPTION="none"
+REALITY_ENCRYPTION=""
+VLESS_ENC_MODE="random"
 
 # Репозиторий ядра Xray-core (для пункта меню «Обновление ядра xray»).
 # Имя ассета (zip) выбирается по архитектуре в xray_asset_for_arch.
@@ -1513,9 +1534,11 @@ net.ipv4.tcp_wmem = 4096 1048576 33554432
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 
-net.core.netdev_max_backlog = 65536
+net.core.netdev_max_backlog = 250000
 net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 8000
 net.core.somaxconn = 65535
+net.core.rps_sock_flow_entries = 32768
 
 net.ipv4.tcp_max_syn_backlog = 65536
 net.ipv4.tcp_max_tw_buckets = 2000000
@@ -1586,6 +1609,70 @@ EOF_SYSCTL
   else
     warn "Default qdisc: не удалось определить"
   fi
+}
+
+# Поднимает системные лимиты файловых дескрипторов и процессов до 1048576 на
+# уровне ОС (limits.conf + systemd), чтобы xray/docker и всё дерево процессов
+# ноды не упирались в дефолтные 1024/недостаточный потолок под нагрузкой.
+# Идея и значения взяты из node-accelerator. В контейнере (LXC/OpenVZ) потолок
+# задаёт хост — тогда просто пишем конфиги (применятся, где разрешено), а не
+# валимся. Эффект для интерактивных сессий — после повторного входа/reboot; для
+# systemd-сервисов (docker) — после systemctl daemon-reexec + рестарта сервиса.
+apply_system_limits() {
+  section "Системные лимиты (nofile/nproc)"
+
+  local limit=1048576
+
+  # PAM limits для интерактивных сессий и сервисов, использующих pam_limits.
+  cat >/etc/security/limits.d/99-eclipse.conf <<EOF_LIMITS
+*     soft nofile $limit
+*     hard nofile $limit
+*     soft nproc  $limit
+*     hard nproc  $limit
+root  soft nofile $limit
+root  hard nofile $limit
+root  soft nproc  $limit
+root  hard nproc  $limit
+EOF_LIMITS
+  ok "Записан /etc/security/limits.d/99-eclipse.conf (nofile/nproc = $limit)"
+
+  # systemd задаёт лимиты для сервисов (в т.ч. docker.service) через
+  # DefaultLimit*. Пишем и в system.conf.d, и в user.conf.d.
+  mkdir -p /etc/systemd/system.conf.d /etc/systemd/user.conf.d
+
+  cat >/etc/systemd/system.conf.d/99-eclipse-limits.conf <<EOF_SYSTEMD
+[Manager]
+DefaultLimitNOFILE=$limit
+DefaultLimitNPROC=$limit
+EOF_SYSTEMD
+
+  cat >/etc/systemd/user.conf.d/99-eclipse-limits.conf <<EOF_SYSTEMD_USER
+[Manager]
+DefaultLimitNOFILE=$limit
+DefaultLimitNPROC=$limit
+EOF_SYSTEMD_USER
+  ok "Записаны systemd DefaultLimitNOFILE/NPROC = $limit"
+
+  # Убеждаемся, что pam_limits подключён (на Debian/Ubuntu обычно уже есть в
+  # common-session). Не критично, если файла нет — просто пропускаем.
+  local pam_f
+  for pam_f in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; do
+    [[ -f "$pam_f" ]] || continue
+    if ! grep -qE '^\s*session\s+required\s+pam_limits\.so' "$pam_f"; then
+      echo "session required pam_limits.so" >> "$pam_f"
+      info "Добавил pam_limits.so в $pam_f"
+    fi
+  done
+
+  # Перечитываем конфиг systemd-менеджера, чтобы DefaultLimit* вступили в силу
+  # для сервисов, стартующих дальше (docker поднимается позже в install_docker).
+  systemctl daemon-reexec >> "$LOG_FILE" 2>&1 \
+    || warn "systemctl daemon-reexec вернул ошибку (типично для ограниченного контейнера) — продолжаю."
+
+  local cur_soft cur_hard
+  cur_soft="$(ulimit -Sn 2>/dev/null || echo '?')"
+  cur_hard="$(ulimit -Hn 2>/dev/null || echo '?')"
+  info "Текущая сессия nofile: soft=$cur_soft hard=$cur_hard (новые значения применятся после повторного входа/reboot)."
 }
 
 disable_thp() {
@@ -1818,19 +1905,27 @@ install_docker() {
 
   mkdir -p /etc/docker
 
-  # В LXC-контейнере ulimit -Hn/-Hu ограничены потолком родительского
-  # контейнера — фиксированные 1048576 как default-ulimits дают "operation
-  # not permitted" при старте ЛЮБОГО контейнера без явных своих ulimits.
-  # Берём реально достижимый потолок этого окружения (на bare metal/VM он
-  # обычно и есть 1048576+, так что поведение там не меняется).
+  # Целевой лимит — 1048576 (как в node-accelerator). На bare metal/VM ставим
+  # его жёстко: apply_system_limits уже подняла системный потолок, поэтому даже
+  # если ТЕКУЩАЯ сессия скрипта ещё видит старый ulimit -Hn, демон docker после
+  # рестарта стартует с новым DefaultLimit* systemd и 1048576 применится.
+  # В LXC-контейнере runc не может поднять rlimit контейнера выше потолка
+  # родителя — фиксированные 1048576 дали бы "operation not permitted" при
+  # старте любого контейнера. Поэтому внутри контейнера берём реально
+  # достижимый потолок этого окружения.
   local docker_nofile_limit docker_nproc_limit
-  docker_nofile_limit="$(ulimit -Hn 2>/dev/null || true)"
-  [[ "$docker_nofile_limit" =~ ^[0-9]+$ ]] || docker_nofile_limit=1048576
-  (( docker_nofile_limit > 1048576 )) && docker_nofile_limit=1048576
+  if is_container_env; then
+    docker_nofile_limit="$(ulimit -Hn 2>/dev/null || true)"
+    [[ "$docker_nofile_limit" =~ ^[0-9]+$ ]] || docker_nofile_limit=1048576
+    (( docker_nofile_limit > 1048576 )) && docker_nofile_limit=1048576
 
-  docker_nproc_limit="$(ulimit -Hu 2>/dev/null || true)"
-  [[ "$docker_nproc_limit" =~ ^[0-9]+$ ]] || docker_nproc_limit=1048576
-  (( docker_nproc_limit > 1048576 )) && docker_nproc_limit=1048576
+    docker_nproc_limit="$(ulimit -Hu 2>/dev/null || true)"
+    [[ "$docker_nproc_limit" =~ ^[0-9]+$ ]] || docker_nproc_limit=1048576
+    (( docker_nproc_limit > 1048576 )) && docker_nproc_limit=1048576
+  else
+    docker_nofile_limit=1048576
+    docker_nproc_limit=1048576
+  fi
 
   cat >/etc/docker/daemon.json <<EOF_DOCKER
 {
@@ -2027,6 +2122,10 @@ optional_selfsteal() {
   section "11/12 · Selfsteal"
 
   echo
+  info "Selfsteal поднимает на этом же сервере Caddy-заглушку под твоим доменом —"
+  info "REALITY маскируется под неё (target = 127.0.0.1). Без selfsteal REALITY"
+  info "маскируется под чужой реальный сайт (borrowed SNI, напр. www.samsung.com)."
+  echo
   read -rp "  Запустить selfsteal.sh сейчас? [y/N]: " ans
 
   case "${ans,,}" in
@@ -2036,9 +2135,11 @@ optional_selfsteal() {
       else
         warn "Selfsteal.sh вернул ненулевой код (это может быть нормально для его собственной логики). Продолжаю установку ноды — её настройка дальше не зависит от selfsteal."
       fi
+      SELFSTEAL_ENABLED=1
       ;;
     *)
-      ok "Selfsteal пропущен"
+      SELFSTEAL_ENABLED=0
+      ok "Selfsteal пропущен — REALITY будет маскироваться под внешний домен (SNI спросим ниже)."
       ;;
   esac
 }
@@ -2910,46 +3011,144 @@ EOF_HY2
   info "Порт $HY2_PORT/UDP (Hysteria2) может совпадать по номеру с портом REALITY по TCP — это независимые протоколы."
 }
 
-# Спрашивает параметры REALITY-инбаунда: порт (обычно 443), SNI (домен
-# selfsteal/Caddy, он же попадёт в serverNames) и локальный target-порт,
-# куда REALITY проксирует замаскированный трафик (selfsteal по умолчанию
-# слушает 127.0.0.1:9443).
+# Спрашивает параметры REALITY-инбаунда. Логика зависит от того, поднимали ли
+# selfsteal (SELFSTEAL_ENABLED):
+#   • selfsteal ВКЛ  — маскировка под свой Caddy на этом же сервере. Спрашиваем
+#     порт (обычно 443), свой домен (serverName) и локальный target-порт Caddy
+#     (по умолчанию 9443). target = 127.0.0.1:<порт Caddy>.
+#   • selfsteal ВЫКЛ — маскировка под чужой реальный сайт (borrowed SNI).
+#     Спрашиваем ТОЛЬКО внешний домен (напр. www.samsung.com). Порт всегда 443,
+#     target = <этот домен>:443 (а не 127.0.0.1 — иначе REALITY некуда
+#     проксировать «легитимный» трафик и маскировка ломается).
 ask_reality_params() {
   local input=""
 
   section "Параметры REALITY"
 
-  while true; do
-    read -rp "  Порт VLESS+REALITY (TCP) [${DEFAULT_REALITY_PORT}]: " input
-    input="${input:-$DEFAULT_REALITY_PORT}"
-    if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
-      REALITY_PORT="$((10#$input))"
-      break
-    fi
-    warn "Некорректный порт. Нужно число от 1 до 65535."
-  done
+  if [[ "$SELFSTEAL_ENABLED" -eq 1 ]]; then
+    while true; do
+      read -rp "  Порт VLESS+REALITY (TCP) [${DEFAULT_REALITY_PORT}]: " input
+      input="${input:-$DEFAULT_REALITY_PORT}"
+      if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
+        REALITY_PORT="$((10#$input))"
+        break
+      fi
+      warn "Некорректный порт. Нужно число от 1 до 65535."
+    done
 
-  while true; do
-    read -rp "  Домен selfsteal (serverName), например safeeclipse.ru: " input
-    input="$(echo "${input:-}" | tr -d '[:space:]')"
-    if [[ "$input" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
-      REALITY_SNI="$input"
-      break
-    fi
-    warn "Некорректный домен. Пример: safeeclipse.ru"
-  done
+    while true; do
+      read -rp "  Домен selfsteal (serverName), например safeeclipse.ru: " input
+      input="$(echo "${input:-}" | tr -d '[:space:]')"
+      if [[ "$input" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
+        REALITY_SNI="$input"
+        break
+      fi
+      warn "Некорректный домен. Пример: safeeclipse.ru"
+    done
 
-  while true; do
-    read -rp "  Локальный target-порт selfsteal (Caddy) [${DEFAULT_REALITY_TARGET_PORT}]: " input
-    input="${input:-$DEFAULT_REALITY_TARGET_PORT}"
-    if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
-      REALITY_TARGET_PORT="$((10#$input))"
-      break
-    fi
-    warn "Некорректный порт. Нужно число от 1 до 65535."
-  done
+    while true; do
+      read -rp "  Локальный target-порт selfsteal (Caddy) [${DEFAULT_REALITY_TARGET_PORT}]: " input
+      input="${input:-$DEFAULT_REALITY_TARGET_PORT}"
+      if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
+        REALITY_TARGET_PORT="$((10#$input))"
+        break
+      fi
+      warn "Некорректный порт. Нужно число от 1 до 65535."
+    done
 
-  ok "REALITY: порт $REALITY_PORT, SNI $REALITY_SNI, target 127.0.0.1:$REALITY_TARGET_PORT"
+    REALITY_TARGET="127.0.0.1:${REALITY_TARGET_PORT}"
+    ok "REALITY (selfsteal): порт $REALITY_PORT, SNI $REALITY_SNI, target $REALITY_TARGET"
+  else
+    # Без selfsteal: порт фиксирован 443 (стандарт для маскировки под HTTPS).
+    REALITY_PORT="$DEFAULT_REALITY_PORT"
+    info "Selfsteal не используется — порт REALITY фиксирован: $REALITY_PORT (стандарт)."
+    echo
+    info "Укажи внешний домен для маскировки (SNI). Требования: настоящий сайт на"
+    info "TLS 1.3 + HTTP/2, не CDN-заглушка, желательно без соседства с твоим IP."
+    info "Примеры: www.samsung.com, www.microsoft.com, www.nvidia.com"
+
+    while true; do
+      read -rp "  Внешний домен (SNI/target), например www.samsung.com: " input
+      input="$(echo "${input:-}" | tr -d '[:space:]')"
+      # На всякий случай убираем протокол/путь, если пользователь вставил URL.
+      input="${input#http://}"
+      input="${input#https://}"
+      input="${input%%/*}"
+      if [[ "$input" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
+        REALITY_SNI="$input"
+        break
+      fi
+      warn "Некорректный домен. Пример: www.samsung.com"
+    done
+
+    REALITY_TARGET_PORT="443"
+    REALITY_TARGET="${REALITY_SNI}:443"
+    ok "REALITY (внешний SNI): порт $REALITY_PORT, SNI $REALITY_SNI, target $REALITY_TARGET"
+  fi
+
+  ask_vless_encryption
+}
+
+# Спрашивает, включать ли VLESS Encryption (mlkem768x25519plus, пост-квант).
+# Это дополнительный слой шифрования поверх VLESS, независимый от REALITY.
+# Реальная генерация ключей происходит позже (generate_vless_encryption),
+# когда образ remnawave/node уже скачан.
+ask_vless_encryption() {
+  local ans
+  echo
+  info "VLESS Encryption — пост-квантовый слой шифрования (ML-KEM-768) поверх"
+  info "VLESS, поверх REALITY. Скрывает содержимое даже при компрометации ключей"
+  info "REALITY. Требует свежий Xray на клиенте и сервере (25.9+). Режим: $VLESS_ENC_MODE."
+  echo
+  read -rp "  Использовать шифрование (VLESS Encryption)? [y/N]: " ans
+
+  case "${ans,,}" in
+    y|yes|д|да)
+      REALITY_ENCRYPTION_ENABLED=1
+      ok "Шифрование VLESS будет включено (mlkem768x25519plus.${VLESS_ENC_MODE})."
+      ;;
+    *)
+      REALITY_ENCRYPTION_ENABLED=0
+      REALITY_DECRYPTION="none"
+      ok "Шифрование VLESS выключено (decryption: none)."
+      ;;
+  esac
+}
+
+# Генерирует пару decryption/encryption для VLESS Encryption через `xray vlessenc`
+# внутри образа remnawave/node. Берёт X25519-пару (первую в выводе), заменяет
+# режим на VLESS_ENC_MODE (random) и заполняет REALITY_DECRYPTION (для inbound)
+# и REALITY_ENCRYPTION (строка для клиента). Возвращает 1, если не удалось —
+# тогда вызывающий откатывается на decryption: none.
+generate_vless_encryption() {
+  local out dec enc
+
+  # `xray vlessenc` печатает две пары (X25519 и ML-KEM-768), каждая строкой вида
+  #   "decryption": "mlkem768x25519plus.native.600s...."
+  #   "encryption": "mlkem768x25519plus.native.0rtt...."
+  # Берём первую (X25519) — короче и достаточно (обмен ключами всё равно
+  # пост-квантовый). Пробуем оба способа вызова xray в образе.
+  out="$(docker run --rm --entrypoint xray remnawave/node:latest vlessenc 2>/dev/null || true)"
+  if [[ -z "$out" ]]; then
+    out="$(docker run --rm remnawave/node:latest xray vlessenc 2>/dev/null || true)"
+  fi
+
+  [[ -n "$out" ]] || return 1
+
+  dec="$(printf '%s\n' "$out" | grep -oE '"decryption": *"[^"]+"' | head -n1 | sed -E 's/.*"decryption": *"([^"]+)".*/\1/')"
+  enc="$(printf '%s\n' "$out" | grep -oE '"encryption": *"[^"]+"' | head -n1 | sed -E 's/.*"encryption": *"([^"]+)".*/\1/')"
+
+  [[ -n "$dec" && -n "$enc" ]] || return 1
+
+  # Заменяем режим (второе поле после mlkem768x25519plus) на выбранный —
+  # native → random. Режим меняет только представление ключа на проводе,
+  # само ключевое вещество не трогается; обе стороны должны совпадать.
+  dec="$(printf '%s' "$dec" | sed -E "s/^(mlkem768x25519plus)\.[a-z0-9]+\./\1.${VLESS_ENC_MODE}./")"
+  enc="$(printf '%s' "$enc" | sed -E "s/^(mlkem768x25519plus)\.[a-z0-9]+\./\1.${VLESS_ENC_MODE}./")"
+
+  REALITY_DECRYPTION="$dec"
+  REALITY_ENCRYPTION="$enc"
+  return 0
 }
 
 # Генерирует пару ключей x25519 для REALITY прямо на сервере, используя
@@ -3000,6 +3199,18 @@ generate_reality_panel_config() {
     warn "Не удалось сгенерировать ключи x25519 через xray. Подставлены плейсхолдеры — сгенерируй ключи вручную (xray x25519) и впиши их."
   fi
 
+  # VLESS Encryption (если включено пользователем) — генерируем decryption/
+  # encryption сейчас, когда образ ноды уже скачан.
+  if [[ "$REALITY_ENCRYPTION_ENABLED" -eq 1 ]]; then
+    if generate_vless_encryption; then
+      ok "VLESS Encryption сгенерирован (mlkem768x25519plus.${VLESS_ENC_MODE})."
+    else
+      REALITY_DECRYPTION="none"
+      REALITY_ENCRYPTION=""
+      warn "Не удалось сгенерировать VLESS Encryption через 'xray vlessenc' (возможно, образ ноды со старым Xray < 25.9). Ставлю decryption: none, продолжаю без шифрования."
+    fi
+  fi
+
   config_path="$REMNANODE_DIR/panel-inbounds.json"
 
   cat > "$config_path" <<EOF_REALITY
@@ -3015,7 +3226,7 @@ generate_reality_panel_config() {
       "protocol": "vless",
       "settings": {
         "clients": [],
-        "decryption": "none"
+        "decryption": "$REALITY_DECRYPTION"
       },
       "sniffing": {
         "enabled": true,
@@ -3029,7 +3240,7 @@ generate_reality_panel_config() {
         "network": "raw",
         "security": "reality",
         "realitySettings": {
-          "target": "127.0.0.1:$REALITY_TARGET_PORT",
+          "target": "$REALITY_TARGET",
           "shortIds": [
             "$short_id"
           ],
@@ -3108,9 +3319,18 @@ EOF_REALITY
   echo
   echo "  ${C_BOLD}Публичный ключ (publicKey) для клиента/панели:${C_RESET} $pub_key"
   echo "  ${C_BOLD}shortId:${C_RESET} $short_id"
+  if [[ "$REALITY_ENCRYPTION_ENABLED" -eq 1 && -n "$REALITY_ENCRYPTION" ]]; then
+    echo
+    echo "  ${C_BOLD}VLESS Encryption включён (mlkem768x25519plus.${VLESS_ENC_MODE}):${C_RESET}"
+    echo "  ${C_BOLD}decryption (сервер, уже в конфиге):${C_RESET} $REALITY_DECRYPTION"
+    echo "  ${C_BOLD}encryption (клиент — впиши в настройки подключения/панель):${C_RESET} $REALITY_ENCRYPTION"
+  fi
   echo
   info "Скопируй JSON выше (или файл $config_path) в конфиг инбаундов ноды в панели Remnawave."
   info "publicKey и shortId укажи в настройках подключения клиента."
+  if [[ "$REALITY_ENCRYPTION_ENABLED" -eq 1 && -n "$REALITY_ENCRYPTION" ]]; then
+    info "Строку encryption укажи в клиенте/панели — decryption и encryption должны быть из одной пары."
+  fi
 }
 
 # Скачивает docker-образ с несколькими попытками, а при явном отказе Docker
@@ -3238,19 +3458,28 @@ EOF_ENV
 
   # runc не может поднять rlimit контейнера выше жёсткого потолка своего
   # родительского процесса ("operation not permitted", errno EPERM для
-  # setrlimit). В LXC-контейнере этот потолок (ulimit -Hn) обычно намного
-  # ниже 1048576, поэтому вместо фиксированного значения берём то, что
-  # реально достижимо в этом окружении — на bare metal/полноценной VM
-  # ulimit -Hn обычно и есть 1048576+, так что поведение не меняется.
-  local nofile_limit
-  nofile_limit="$(ulimit -Hn 2>/dev/null || true)"
-  if [[ -z "$nofile_limit" || "$nofile_limit" == "unlimited" ]] || ! [[ "$nofile_limit" =~ ^[0-9]+$ ]]; then
+  # setrlimit). На bare metal/полноценной VM ставим целевые 1048576 (как в
+  # node-accelerator) — apply_system_limits и DefaultLimit* systemd для docker
+  # это уже разрешают. В LXC-контейнере потолок (ulimit -Hn) обычно ниже, тогда
+  # берём то, что реально достижимо в этом окружении.
+  local nofile_limit nproc_limit
+  if is_container_env; then
+    nofile_limit="$(ulimit -Hn 2>/dev/null || true)"
+    if [[ -z "$nofile_limit" || "$nofile_limit" == "unlimited" ]] || ! [[ "$nofile_limit" =~ ^[0-9]+$ ]]; then
+      nofile_limit=1048576
+    fi
+    (( nofile_limit > 1048576 )) && nofile_limit=1048576
+
+    nproc_limit="$(ulimit -Hu 2>/dev/null || true)"
+    if [[ -z "$nproc_limit" || "$nproc_limit" == "unlimited" ]] || ! [[ "$nproc_limit" =~ ^[0-9]+$ ]]; then
+      nproc_limit=1048576
+    fi
+    (( nproc_limit > 1048576 )) && nproc_limit=1048576
+  else
     nofile_limit=1048576
+    nproc_limit=1048576
   fi
-  if (( nofile_limit > 1048576 )); then
-    nofile_limit=1048576
-  fi
-  info "Лимит nofile для контейнера ноды: $nofile_limit (потолок этого окружения: $(ulimit -Hn 2>/dev/null || echo unknown))"
+  info "Лимиты контейнера ноды: nofile=$nofile_limit, nproc=$nproc_limit (потолок окружения: $(ulimit -Hn 2>/dev/null || echo unknown))"
 
   cat > "$REMNANODE_DIR/docker-compose.yml" <<EOF_COMPOSE
 name: $COMPOSE_PROJECT_NAME
@@ -3276,6 +3505,9 @@ ${XRAY_VOLUME_LINE}
       nofile:
         soft: $nofile_limit
         hard: $nofile_limit
+      nproc:
+        soft: $nproc_limit
+        hard: $nproc_limit
     env_file:
       - .env
 EOF_COMPOSE
@@ -4018,6 +4250,7 @@ stage_after_reboot() {
   fi
 
   apply_network_tuning
+  apply_system_limits
   disable_thp
   enable_rps
   install_docker
@@ -4093,6 +4326,502 @@ pause_menu() {
   read -rp "  Нажми Enter для возврата в меню..." _ || true
 }
 
+# ============================================================================
+# Eclipse Firewall (nftables) — защита ноды.
+#
+# Живёт в СВОЕЙ таблице `inet na_filter` и НЕ делает flush ruleset, поэтому
+# сосуществует с UFW, Docker и CrowdSec (каждый — свои таблицы/цепочки).
+# Ключевая фича: порт ноды (NODE_PORT) открывается ТОЛЬКО для IP панели
+# (резолвится из домена панели, обновляется systemd-таймером). Плюс per-IP
+# анти-флуд (SYN/UDP/ICMP), connlimit, anti-spoof bogon, drop битых TCP-флагов
+# и бан SSH connect-flood. Policy = accept: наша таблица только ДОБАВЛЯет drop'ы
+# к тому, что уже есть, а «строгий» режим добавляет финальный drop всего лишнего.
+#
+# Защита от самоблокировки: IP текущей SSH-сессии авто-вайтлистится, а при
+# включении правила применяются с авто-откатом через 180с, если пользователь
+# не подтвердит, что связь жива.
+# ============================================================================
+
+ECLIPSE_FW_DIR="/etc/eclipse"
+ECLIPSE_FW_FILE="$ECLIPSE_FW_DIR/na_filter.nft"
+ECLIPSE_FW_MODE_FILE="$ECLIPSE_FW_DIR/fw_mode"
+ECLIPSE_PANEL_DOMAIN_FILE="$ECLIPSE_FW_DIR/panel_domain"
+ECLIPSE_PANEL_SYNC="/usr/local/sbin/eclipse-panel-sync.sh"
+
+# Лимиты (взяты из node-accelerator, per-IP — масштабируются по числу клиентов,
+# а не глобальный потолок).
+NA_SYN_RATE="200/second"
+NA_UDP_RATE="200/second"
+NA_ICMP_RATE="10/second"
+NA_CONN_LIMIT="2048"
+NA_SSH_FLOOD_RATE="6/minute"
+
+na_ensure_nftables() {
+  if command -v nft >/dev/null 2>&1; then
+    return 0
+  fi
+  run_cmd "Устанавливаю nftables" env DEBIAN_FRONTEND=noninteractive apt-get install -y nftables
+}
+
+# Основной (WAN) интерфейс — на нём полицируем трафик. Всё остальное (lo,
+# docker*, туннели) наша таблица пропускает, чтобы не ломать контейнеры.
+na_detect_wan() {
+  local i
+  i="$(detect_iface)"
+  echo "${i:-eth0}"
+}
+
+# SSH-порт(ы): из sshd_config + порт текущего соединения (SSH_CONNECTION).
+na_detect_ssh_ports() {
+  local ports=() p conn
+  while read -r p; do
+    [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
+  done < <(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    conn="$(awk '{print $4}' <<< "$SSH_CONNECTION")"
+    [[ "$conn" =~ ^[0-9]+$ ]] && ports+=("$conn")
+  fi
+
+  [[ ${#ports[@]} -eq 0 ]] && ports=(22)
+  printf '%s\n' "${ports[@]}" | sort -un | xargs
+}
+
+# IP клиента текущей SSH-сессии (для авто-вайтлиста, анти-самоблокировка).
+na_detect_ssh_client_ip() {
+  local ips=()
+  [[ -n "${SSH_CONNECTION:-}" ]] && ips+=("$(awk '{print $1}' <<< "$SSH_CONNECTION")")
+  [[ -n "${SSH_CLIENT:-}" ]] && ips+=("$(awk '{print $1}' <<< "$SSH_CLIENT")")
+  printf '%s\n' "${ips[@]}" | awk 'NF' | sort -u | xargs
+}
+
+# Порт(ы) установленных нод (NODE_PORT из .env). Фоллбэк — известные дефолты
+# node-agent'а (2222 старый, 3000 новый).
+na_detect_node_ports() {
+  local d port found=()
+  for d in /opt/remnanode /root/remnanode /home/*/remnanode /opt/*-Node; do
+    [[ -f "$d/.env" ]] || continue
+    port="$(grep -E '^NODE_PORT=' "$d/.env" 2>/dev/null | head -n1 | cut -d= -f2 | tr -d '[:space:]')"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) && found+=("$port")
+  done
+  if [[ ${#found[@]} -eq 0 ]]; then
+    echo "2222 3000"
+  else
+    printf '%s\n' "${found[@]}" | sort -un | xargs
+  fi
+}
+
+na_resolve_domain_v4() {
+  local domain="$1" out
+  if command -v dig >/dev/null 2>&1; then
+    out="$(dig +short A "$domain" @1.1.1.1 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+    [[ -z "$out" ]] && out="$(dig +short A "$domain" @8.8.8.8 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+    echo "$out"
+  else
+    getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u
+  fi
+}
+
+na_resolve_domain_v6() {
+  local domain="$1"
+  command -v dig >/dev/null 2>&1 || return 0
+  dig +short AAAA "$domain" @1.1.1.1 2>/dev/null | grep -E ':' || true
+}
+
+# Генерирует файл ruleset. Режим: strict (блокировать всё лишнее) или open
+# (пропускать всё лишнее, но с анти-флудом). Порт ноды ограничивается панелью,
+# только если задан домен панели (иначе оставляем открытым, чтобы включение
+# фаервола не оборвало связь панели с нодой).
+na_write_ruleset() {
+  local mode="$1"
+  local wan ssh_ports node_ports ssh_ips ssh_set node_set
+  local wl4=() wl6=() ip wl4_elems="" wl6_elems="" panel_only=0 final_rule=""
+
+  mkdir -p "$ECLIPSE_FW_DIR"
+
+  wan="$(na_detect_wan)"
+  ssh_ports="$(na_detect_ssh_ports)"
+  node_ports="$(na_detect_node_ports)"
+  ssh_ips="$(na_detect_ssh_client_ip)"
+
+  ssh_set="$(echo "$ssh_ports" | tr ' ' ',')"
+  node_set="$(echo "$node_ports" | tr ' ' ',')"
+
+  for ip in $ssh_ips; do
+    if [[ "$ip" == *:* ]]; then wl6+=("$ip"); else wl4+=("$ip"); fi
+  done
+  [[ ${#wl4[@]} -gt 0 ]] && wl4_elems=" elements = { $(IFS=,; echo "${wl4[*]}") }"
+  [[ ${#wl6[@]} -gt 0 ]] && wl6_elems=" elements = { $(IFS=,; echo "${wl6[*]}") }"
+
+  [[ -s "$ECLIPSE_PANEL_DOMAIN_FILE" ]] && panel_only=1
+  [[ "$mode" == "strict" ]] && final_rule="    drop"
+
+  # Правила для порта ноды: с панелью — только её IP, без панели — открыто.
+  local nodeport_block
+  if [[ "$panel_only" -eq 1 ]]; then
+    nodeport_block="    tcp dport { $node_set } ip saddr @nodeport_wl_v4 accept
+    tcp dport { $node_set } ip6 saddr @nodeport_wl_v6 accept
+    tcp dport { $node_set } drop"
+  else
+    nodeport_block="    tcp dport { $node_set } accept"
+  fi
+
+  cat > "$ECLIPSE_FW_FILE" <<NFT
+#!/usr/sbin/nft -f
+# Eclipse Firewall — таблица inet na_filter. Сгенерировано автоматически.
+# Режим: $mode · WAN: $wan · SSH: $ssh_ports · NODE: $node_ports · panel_only=$panel_only
+table inet na_filter
+delete table inet na_filter
+table inet na_filter {
+  set wl_v4 { type ipv4_addr; flags interval;$wl4_elems }
+  set wl_v6 { type ipv6_addr; flags interval;$wl6_elems }
+  set nodeport_wl_v4 { type ipv4_addr; flags interval; }
+  set nodeport_wl_v6 { type ipv6_addr; flags interval; }
+  set bogon_v4 { type ipv4_addr; flags interval; elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 } }
+  set ssh_ban_v4 { type ipv4_addr; flags dynamic, timeout; timeout 1h; }
+
+  chain input {
+    type filter hook input priority 0; policy accept;
+
+    ct state established,related accept
+    iif "lo" accept
+    ct state invalid drop
+
+    ip saddr @wl_v4 accept
+    ip6 saddr @wl_v6 accept
+
+    # Полицируем только WAN — весь трафик с других интерфейсов (docker, туннели)
+    # пропускаем к остальным таблицам (UFW/Docker решают сами).
+    iifname != "$wan" accept
+
+    # anti-spoof: bogon/RFC1918/CGNAT как источник на WAN.
+    ip saddr @bogon_v4 drop
+
+    # drop битых комбинаций TCP-флагов (сканы).
+    tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 drop
+    tcp flags & (fin|syn) == (fin|syn) drop
+    tcp flags & (syn|rst) == (syn|rst) drop
+    tcp flags & (fin|rst) == (fin|rst) drop
+    tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|psh|urg) drop
+
+    # ICMP: пинг жив, флуд режется. ICMPv6 не трогаем (нужен для ND).
+    ip protocol icmp icmp type echo-request limit rate $NA_ICMP_RATE accept
+    ip protocol icmp icmp type echo-request drop
+    meta l4proto ipv6-icmp accept
+
+    # SSH: бан connect-flood (наш IP уже в wl_v4 выше — нас не забанит).
+    ip saddr @ssh_ban_v4 drop
+    tcp dport { $ssh_set } ct state new update @ssh_ban_v4 { ip saddr limit rate over $NA_SSH_FLOOD_RATE } drop
+    tcp dport { $ssh_set } accept
+
+    # Порт ноды — только для панели (если задан домен панели).
+$nodeport_block
+
+    # per-IP анти-флуд для всех новых соединений на WAN.
+    tcp flags syn ct state new meter na_syn4 { ip saddr limit rate over $NA_SYN_RATE } drop
+    ct state new meter na_conn4 { ip saddr ct count over $NA_CONN_LIMIT } drop
+    meta l4proto udp meter na_udp4 { ip saddr limit rate over $NA_UDP_RATE } drop
+
+    # Публичные сервис-порты.
+    tcp dport { 80, 443 } accept
+    udp dport { 443 } accept
+
+$final_rule
+  }
+}
+NFT
+}
+
+# Скрипт периодической ре-резолвинга домена панели → обновление nodeport_wl_*.
+na_write_sync_script() {
+  cat > "$ECLIPSE_PANEL_SYNC" <<'SYNC'
+#!/usr/bin/env bash
+# Резолвит домен панели и держит в nodeport_wl_v4/v6 актуальные IP панели.
+set -u
+DOMAIN_FILE="/etc/eclipse/panel_domain"
+DOMAIN="$(cat "$DOMAIN_FILE" 2>/dev/null || true)"
+[ -n "$DOMAIN" ] || exit 0
+command -v nft >/dev/null 2>&1 || exit 0
+nft list table inet na_filter >/dev/null 2>&1 || exit 0
+
+resolve4() {
+  if command -v dig >/dev/null 2>&1; then
+    dig +short A "$1" @1.1.1.1 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    dig +short A "$1" @8.8.8.8 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+  else
+    getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}'
+  fi
+}
+resolve6() {
+  command -v dig >/dev/null 2>&1 || return 0
+  dig +short AAAA "$1" @1.1.1.1 2>/dev/null | grep -E ':'
+}
+
+v4="$(resolve4 "$DOMAIN" | sort -u)"
+v6="$(resolve6 "$DOMAIN" | sort -u)"
+
+# Пустой ответ DNS не сбрасываем — оставляем прежние IP (защита от временного
+# сбоя резолва, чтобы не оборвать панель).
+[ -n "$v4$v6" ] || exit 0
+
+nft flush set inet na_filter nodeport_wl_v4 2>/dev/null || true
+nft flush set inet na_filter nodeport_wl_v6 2>/dev/null || true
+for ip in $v4; do nft add element inet na_filter nodeport_wl_v4 "{ $ip }" 2>/dev/null || true; done
+for ip in $v6; do nft add element inet na_filter nodeport_wl_v6 "{ $ip }" 2>/dev/null || true; done
+logger -t eclipse-panel-sync "synced $DOMAIN -> v4=[$(echo $v4 | tr '\n' ' ')] v6=[$(echo $v6 | tr '\n' ' ')]" 2>/dev/null || true
+exit 0
+SYNC
+  chmod 755 "$ECLIPSE_PANEL_SYNC"
+}
+
+# systemd-юниты: сервис применения фаервола при загрузке + таймер ре-резолва.
+na_install_units() {
+  local nft_bin
+  nft_bin="$(command -v nft || echo /usr/sbin/nft)"
+
+  cat > /etc/systemd/system/eclipse-firewall.service <<EOF_FWSVC
+[Unit]
+Description=Eclipse nftables firewall (na_filter)
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$nft_bin -f $ECLIPSE_FW_FILE
+ExecStartPost=-$ECLIPSE_PANEL_SYNC
+ExecStop=-$nft_bin delete table inet na_filter
+
+[Install]
+WantedBy=multi-user.target
+EOF_FWSVC
+
+  cat > /etc/systemd/system/eclipse-panel-sync.service <<EOF_SYNCSVC
+[Unit]
+Description=Eclipse panel IP sync (nodeport whitelist)
+After=eclipse-firewall.service
+
+[Service]
+Type=oneshot
+ExecStart=$ECLIPSE_PANEL_SYNC
+EOF_SYNCSVC
+
+  cat > /etc/systemd/system/eclipse-panel-sync.timer <<'EOF_SYNCTIMER'
+[Unit]
+Description=Eclipse panel IP sync timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF_SYNCTIMER
+
+  systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
+}
+
+# Применяет ruleset с авто-откатом (анти-самоблокировка).
+na_apply_with_rollback() {
+  local nft_bin ans pid
+  nft_bin="$(command -v nft)"
+
+  if ! "$nft_bin" -f "$ECLIPSE_FW_FILE"; then
+    fail "Не удалось применить nftables ruleset. Проверь $ECLIPSE_FW_FILE и $LOG_FILE."
+    return 1
+  fi
+  ok "Правила применены (таблица inet na_filter)."
+
+  # Полностью отвязываем дескрипторы фонового «сторожа», чтобы он не держал
+  # терминал/канал открытым (иначе в некоторых окружениях скрипт «висит»).
+  ( sleep 180; "$nft_bin" delete table inet na_filter >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+  pid=$!
+  disown "$pid" 2>/dev/null || true
+
+  echo
+  warn "АНТИ-САМОБЛОКИРОВКА: если связь оборвётся — просто НЕ подтверждай."
+  warn "Через 180 секунд фаервол автоматически откатится (таблица удалится)."
+  echo
+  read -rp "  Связь работает нормально, оставить фаервол включённым? [y/N]: " ans
+
+  case "${ans,,}" in
+    y|yes|д|да)
+      kill "$pid" >/dev/null 2>&1 || true
+      systemctl enable eclipse-firewall.service >> "$LOG_FILE" 2>&1 || true
+      ok "Фаервол включён и будет применяться при загрузке (eclipse-firewall.service)."
+      ;;
+    *)
+      kill "$pid" >/dev/null 2>&1 || true
+      "$nft_bin" delete table inet na_filter >/dev/null 2>&1 || true
+      systemctl disable eclipse-firewall.service >> "$LOG_FILE" 2>&1 || true
+      warn "Откат: таблица inet na_filter удалена, автозапуск выключен."
+      return 1
+      ;;
+  esac
+}
+
+# Единая точка включения фаервола в режиме strict/open.
+na_firewall_apply() {
+  local mode="$1"
+
+  na_ensure_nftables || { warn "nftables не установлен."; return 1; }
+
+  na_write_ruleset "$mode"
+  echo "$mode" > "$ECLIPSE_FW_MODE_FILE"
+
+  if ! nft -c -f "$ECLIPSE_FW_FILE"; then
+    fail "Сгенерированный ruleset не прошёл проверку nft -c. Не применяю."
+    return 1
+  fi
+
+  na_write_sync_script
+  na_install_units
+  na_apply_with_rollback || return 1
+
+  # Если домен панели задан — сразу подтягиваем его IP и включаем таймер.
+  if [[ -s "$ECLIPSE_PANEL_DOMAIN_FILE" ]]; then
+    "$ECLIPSE_PANEL_SYNC" || true
+    systemctl enable --now eclipse-panel-sync.timer >> "$LOG_FILE" 2>&1 || true
+  fi
+}
+
+na_firewall_enable_strict() {
+  section "Eclipse Firewall — строгий режим (strict)"
+  info "Блокируется всё, кроме: SSH, 80/443, порта ноды (для панели) и established."
+  na_firewall_apply "strict"
+}
+
+na_firewall_enable_open() {
+  section "Eclipse Firewall — мягкий режим (open)"
+  info "Лишние порты не блокируются, но действуют per-IP анти-флуд, anti-spoof и"
+  info "ограничение порта ноды для панели."
+  na_firewall_apply "open"
+}
+
+# Настройка «порт ноды только для панели»: спрашиваем домен панели, резолвим,
+# сохраняем и включаем фаервол (если ещё не включён — в мягком режиме).
+na_set_panel_domain() {
+  section "Порт ноды — доступ только для панели"
+
+  local input v4 v6 mode ans
+
+  echo
+  info "Укажи домен панели Remnawave (например, panel.example.com или"
+  info "remnawave.icu). Скрипт резолвит его IP и откроет порт ноды ТОЛЬКО им."
+  echo
+
+  while true; do
+    read -rp "  Домен панели: " input
+    input="$(echo "${input:-}" | tr -d '[:space:]')"
+    input="${input#http://}"; input="${input#https://}"; input="${input%%/*}"
+    if [[ "$input" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
+      break
+    fi
+    warn "Некорректный домен. Пример: panel.example.com"
+  done
+
+  v4="$(na_resolve_domain_v4 "$input" | xargs || true)"
+  v6="$(na_resolve_domain_v6 "$input" | xargs || true)"
+
+  echo
+  info "Домен панели: $input"
+  info "IPv4 панели: ${v4:-<не найдено>}"
+  info "IPv6 панели: ${v6:-<нет>}"
+
+  if [[ -z "$v4$v6" ]]; then
+    warn "DNS не вернул IP для $input. Порт ноды будет закрыт для всех, пока резолв не заработает."
+    read -rp "  Всё равно продолжить? [y/N]: " ans
+    case "${ans,,}" in y|yes|д|да) ;; *) warn "Отменено."; return 1 ;; esac
+  fi
+
+  na_ensure_nftables || { warn "nftables не установлен."; return 1; }
+
+  mkdir -p "$ECLIPSE_FW_DIR"
+  echo "$input" > "$ECLIPSE_PANEL_DOMAIN_FILE"
+  ok "Домен панели сохранён: $input"
+
+  mode="$(cat "$ECLIPSE_FW_MODE_FILE" 2>/dev/null || true)"
+  [[ "$mode" == "strict" || "$mode" == "open" ]] || mode="open"
+
+  info "Применяю фаервол (режим: $mode) с ограничением порта ноды для панели."
+  na_firewall_apply "$mode"
+}
+
+na_firewall_status() {
+  section "Eclipse Firewall — статус"
+
+  echo
+  if nft list table inet na_filter >/dev/null 2>&1; then
+    ok "Таблица inet na_filter активна."
+    info "Режим: $(cat "$ECLIPSE_FW_MODE_FILE" 2>/dev/null || echo неизвестен)"
+    info "Домен панели: $(cat "$ECLIPSE_PANEL_DOMAIN_FILE" 2>/dev/null || echo '<не задан>')"
+    echo
+    echo "${C_DIM}  IP панели в whitelist (nodeport_wl_v4):${C_RESET}"
+    nft list set inet na_filter nodeport_wl_v4 2>/dev/null | grep -oE 'elements = \{[^}]*\}' | sed 's/^/    /' || true
+    echo
+    echo "${C_DIM}  Автозапуск:${C_RESET}"
+    systemctl is-enabled eclipse-firewall.service 2>/dev/null | sed 's/^/    firewall.service: /' || true
+    systemctl is-enabled eclipse-panel-sync.timer 2>/dev/null | sed 's/^/    panel-sync.timer: /' || true
+  else
+    warn "Таблица inet na_filter не активна (фаервол выключен)."
+  fi
+}
+
+na_firewall_disable() {
+  section "Eclipse Firewall — выключение"
+
+  local nft_bin ans
+  nft_bin="$(command -v nft || echo nft)"
+
+  read -rp "  Точно выключить Eclipse Firewall (удалить таблицу и автозапуск)? [y/N]: " ans
+  case "${ans,,}" in y|yes|д|да) ;; *) info "Отменено."; return 0 ;; esac
+
+  "$nft_bin" delete table inet na_filter >/dev/null 2>&1 || true
+  systemctl disable --now eclipse-firewall.service >> "$LOG_FILE" 2>&1 || true
+  systemctl disable --now eclipse-panel-sync.timer >> "$LOG_FILE" 2>&1 || true
+  ok "Eclipse Firewall выключен. UFW/Docker/CrowdSec не затронуты."
+}
+
+eclipse_firewall_menu() {
+  need_root
+
+  while true; do
+    section "Eclipse Firewall (nftables)"
+    echo
+    echo "  ${C_GREEN}1${C_RESET}) Порт ноды — только для панели ${C_DIM}(указать домен панели)${C_RESET}"
+    echo "  ${C_CYAN}2${C_RESET}) Включить строгий режим ${C_DIM}(strict: блокировать всё лишнее)${C_RESET}"
+    echo "  ${C_CYAN}3${C_RESET}) Включить мягкий режим ${C_DIM}(open: анти-флуд + порт ноды)${C_RESET}"
+    echo "  ${C_CYAN}4${C_RESET}) Обновить IP панели сейчас ${C_DIM}(ре-резолв домена)${C_RESET}"
+    echo "  ${C_CYAN}5${C_RESET}) Статус фаервола"
+    echo "  ${C_RED}6${C_RESET}) Выключить фаервол"
+    echo "  ${C_YELLOW}0${C_RESET}) Назад"
+    echo
+
+    local choice
+    read -rp "  Выбор [1/2/3/4/5/6/0]: " choice || choice="0"
+
+    case "${choice:-}" in
+      1) na_set_panel_domain; pause_menu ;;
+      2) na_firewall_enable_strict; pause_menu ;;
+      3) na_firewall_enable_open; pause_menu ;;
+      4)
+        if [[ -s "$ECLIPSE_PANEL_DOMAIN_FILE" ]]; then
+          na_write_sync_script
+          if "$ECLIPSE_PANEL_SYNC"; then ok "IP панели обновлены."; else warn "Не удалось обновить (фаервол выключен или DNS недоступен)."; fi
+        else
+          warn "Домен панели не задан. Сначала пункт 1."
+        fi
+        pause_menu
+        ;;
+      5) na_firewall_status; pause_menu ;;
+      6) na_firewall_disable; pause_menu ;;
+      0|q|Q) return 0 ;;
+      *) warn "Неверный выбор: ${choice:-empty}"; sleep 1 ;;
+    esac
+  done
+}
+
 main_menu() {
   need_root
   ensure_eclipse_command
@@ -4112,10 +4841,11 @@ main_menu() {
     echo "  ${C_CYAN}7${C_RESET}) Torrent Blocker (установить/переустановить)"
     echo "  ${C_CYAN}8${C_RESET}) Обновление ядра Xray"
     echo "  ${C_CYAN}9${C_RESET}) Настройка портов (UFW)"
+    echo "  ${C_CYAN}10${C_RESET}) Eclipse Firewall (nftables): порт ноды для панели + защита"
     echo "  ${C_YELLOW}0${C_RESET}) Выход"
     echo
 
-    read -rp "  Выбор [1/2/3/4/5/6/7/8/9/0]: " choice || choice="0"
+    read -rp "  Выбор [1..10/0]: " choice || choice="0"
 
     case "${choice:-}" in
       1)
@@ -4153,6 +4883,9 @@ main_menu() {
       9)
         manage_firewall
         pause_menu
+        ;;
+      10)
+        eclipse_firewall_menu
         ;;
       0|q|Q|exit|quit)
         echo "Выход."
@@ -4199,6 +4932,14 @@ case "${1:-}" in
   --firewall|--ufw|firewall|ufw)
     need_root
     manage_firewall
+    ;;
+  --nftables|--eclipse-firewall|nftables|eclipse-firewall)
+    need_root
+    eclipse_firewall_menu
+    ;;
+  --panel-port|panel-port)
+    need_root
+    na_set_panel_domain
     ;;
   --menu|menu|"")
     main_menu
