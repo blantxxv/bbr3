@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.4.0"
+SCRIPT_VERSION="3.6.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -242,15 +242,24 @@ show_last_log() {
 run_cmd() {
   local msg="$1"
   shift
+  local tty_state
 
   mkdir -p "$(dirname "$LOG_FILE")"
   log_line "START: $msg"
   log_line "CMD: $*"
 
+  # Шаги здесь неинтерактивные, поэтому stdin отвязываем от терминала:
+  # так команда не сможет ни съесть ввод, ни оставить tty в своём режиме,
+  # ни молча зависнуть на невидимом вопросе (вывод-то уходит в лог).
+  # Состояние tty всё равно снимаем и возвращаем — на случай, если команда
+  # лезет в терминал напрямую через /dev/tty.
+  tty_state="$(save_tty_state)"
+
   if [[ "$DEBUG" == "1" ]]; then
     echo "${C_CYAN}  [..]${C_RESET} $msg"
-    "$@" 2>&1 | tee -a "$LOG_FILE"
+    "$@" < /dev/null 2>&1 | tee -a "$LOG_FILE"
     local rc="${PIPESTATUS[0]}"
+    restore_tty_state "$tty_state"
     if [[ "$rc" -eq 0 ]]; then
       ok "$msg"
       log_line "OK: $msg"
@@ -265,12 +274,13 @@ run_cmd() {
   SPINNER_PID="$!"
 
   set +e
-  "$@" >> "$LOG_FILE" 2>&1
+  "$@" < /dev/null >> "$LOG_FILE" 2>&1
   local rc="$?"
   set -e
 
   cleanup_spinner
   printf "\r\033[K"
+  restore_tty_state "$tty_state"
 
   if [[ "$rc" -eq 0 ]]; then
     ok "$msg"
@@ -287,15 +297,21 @@ run_cmd() {
 run_shell() {
   local msg="$1"
   local cmd="$2"
+  local tty_state
 
   mkdir -p "$(dirname "$LOG_FILE")"
   log_line "START: $msg"
   log_line "SHELL: $cmd"
 
+  # Как и в run_cmd: неинтерактивный шаг, поэтому stdin от терминала отвязан,
+  # а состояние tty снимается и возвращается (см. комментарий там).
+  tty_state="$(save_tty_state)"
+
   if [[ "$DEBUG" == "1" ]]; then
     echo "${C_CYAN}  [..]${C_RESET} $msg"
-    bash -lc "$cmd" 2>&1 | tee -a "$LOG_FILE"
+    bash -lc "$cmd" < /dev/null 2>&1 | tee -a "$LOG_FILE"
     local rc="${PIPESTATUS[0]}"
+    restore_tty_state "$tty_state"
     if [[ "$rc" -eq 0 ]]; then
       ok "$msg"
       log_line "OK: $msg"
@@ -310,12 +326,13 @@ run_shell() {
   SPINNER_PID="$!"
 
   set +e
-  bash -lc "$cmd" >> "$LOG_FILE" 2>&1
+  bash -lc "$cmd" < /dev/null >> "$LOG_FILE" 2>&1
   local rc="$?"
   set -e
 
   cleanup_spinner
   printf "\r\033[K"
+  restore_tty_state "$tty_state"
 
   if [[ "$rc" -eq 0 ]]; then
     ok "$msg"
@@ -341,9 +358,72 @@ save_tty_state() {
 restore_tty_state() {
   [[ -t 1 ]] || return 0
   if [[ -n "${1:-}" ]]; then
-    stty "$1" 2>/dev/null && return 0
+    stty "$1" 2>/dev/null && { tty_ensure_sane; return 0; }
   fi
   stty sane 2>/dev/null || true
+  tty_ensure_sane
+}
+
+# Возвращает терминал в нормальный построчный режим: canonical + эхо +
+# работающий backspace. Нужно потому, что внешние команды (apt с прогресс-барами,
+# certbot, docker, сторонние инсталляторы вроде selfsteal.sh) переводят tty в
+# свой режим и не всегда его восстанавливают. Тогда стереть введённое нельзя:
+# символ стирания попадает прямо в строку как ^H, и ответ вида "0^H2" не
+# совпадает ни с одним пунктом меню — выглядит как «скрипт проглотил ввод».
+tty_ensure_sane() {
+  [[ -t 0 && -t 1 ]] || return 0
+
+  # Явный набор флагов аккуратнее, чем stty sane (не сбрасывает лишнего).
+  # Если терминал не понял какой-то флаг — падаем на sane.
+  stty icanon echo echoe echok icrnl onlcr 2>/dev/null && return 0
+  stty sane 2>/dev/null || true
+  return 0
+}
+
+# Применяет семантику backspace к уже прочитанной строке и вырезает остальные
+# управляющие символы. Страховка на случай, если tty всё-таки был в «сломанном»
+# режиме и стирание пришло в буфер символом (^H / DEL), а не удалило предыдущий.
+apply_backspaces() {
+  local s="${1:-}" out="" ch i
+
+  for (( i = 0; i < ${#s}; i++ )); do
+    ch="${s:i:1}"
+    case "$ch" in
+      $'\b'|$'\177') out="${out%?}" ;;
+      *) [[ "$ch" == [[:cntrl:]] ]] || out+="$ch" ;;
+    esac
+  done
+
+  printf '%s' "$out"
+}
+
+# Единая точка интерактивного ввода: нормализует терминал ПЕРЕД чтением,
+# читает строку и чистит её от управляющих символов.
+# Использование: ask ИМЯ_ПЕРЕМЕННОЙ "текст вопроса"
+# Код возврата — от read, поэтому конструкции вида `ask choice "..." || choice=0`
+# продолжают работать (EOF/закрытый stdin).
+ask() {
+  local __ask_var="$1" __ask_prompt="${2:-}" __ask_raw="" __ask_rc=0
+
+  tty_ensure_sane
+
+  read -rp "$__ask_prompt" __ask_raw || __ask_rc=$?
+
+  printf -v "$__ask_var" '%s' "$(apply_backspaces "$__ask_raw")"
+  return "$__ask_rc"
+}
+
+# То же, но без эха (пароли/ключи). Перевод строки печатаем сами.
+ask_secret() {
+  local __ask_var="$1" __ask_prompt="${2:-}" __ask_raw="" __ask_rc=0
+
+  tty_ensure_sane
+
+  read -rsp "$__ask_prompt" __ask_raw || __ask_rc=$?
+  echo
+
+  printf -v "$__ask_var" '%s' "$(apply_backspaces "$__ask_raw")"
+  return "$__ask_rc"
 }
 
 run_shell_live() {
@@ -848,7 +928,7 @@ check_for_updates() {
     warn "Если ты точно хочешь заменить локальный файл удалённым — подтверди вручную."
   fi
 
-  read -rp "  Установить файл с GitHub сейчас? [y/N]: " ans
+  ask ans "  Установить файл с GitHub сейчас? [y/N]: "
 
   case "${ans,,}" in
     y|yes|д|да)
@@ -1078,7 +1158,7 @@ ask_node_install_type() {
 
   local choice
   while true; do
-    read -rp "  Выбор [1/2]: " choice
+    ask choice "  Выбор [1/2]: "
 
     case "${choice:-}" in
       1)
@@ -2108,7 +2188,7 @@ optional_speedtest() {
   echo
 
   local ans
-  read -rp "  Выбор [1/2/3/0]: " ans
+  ask ans "  Выбор [1/2/3/0]: "
 
   case "${ans:-0}" in
     1) run_iperf3_ru_speedtest ;;
@@ -2126,7 +2206,7 @@ optional_selfsteal() {
   info "REALITY маскируется под неё (target = 127.0.0.1). Без selfsteal REALITY"
   info "маскируется под чужой реальный сайт (borrowed SNI, напр. www.samsung.com)."
   echo
-  read -rp "  Запустить selfsteal.sh сейчас? [y/N]: " ans
+  ask ans "  Запустить selfsteal.sh сейчас? [y/N]: "
 
   case "${ans,,}" in
     y|yes|д|да)
@@ -2148,7 +2228,7 @@ ask_domain() {
   local input=""
 
   while true; do
-    read -rp "  Домен для сертификата (например, node.example.com): " input
+    ask input "  Домен для сертификата (например, node.example.com): "
     input="$(echo "${input:-}" | tr -d '[:space:]')"
 
     if [[ "$input" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
@@ -2361,7 +2441,7 @@ issue_tls_certificate() {
     if [[ -n "$saved_domain" ]] && check_existing_certificate "$saved_domain"; then
       echo
       info "Найден действующий сертификат для сохранённого ранее домена: $saved_domain"
-      read -rp "  Использовать его? (n — указать другой домен/сертификат) [Y/n]: " saved_ans
+      ask saved_ans "  Использовать его? (n — указать другой домен/сертификат) [Y/n]: "
 
       case "${saved_ans,,}" in
         n|no|н|нет)
@@ -2395,7 +2475,7 @@ issue_tls_certificate() {
     echo
 
     local reuse_ans reuse_domain
-    read -rp "  Использовать один из них вместо выпуска нового? [Y/n]: " reuse_ans
+    ask reuse_ans "  Использовать один из них вместо выпуска нового? [Y/n]: "
 
     case "${reuse_ans,,}" in
       n|no|н|нет)
@@ -2404,7 +2484,7 @@ issue_tls_certificate() {
         if [[ "$found_count" -eq 1 ]]; then
           reuse_domain="$found_certs"
         else
-          read -rp "  Введи домен из списка выше: " reuse_domain
+          ask reuse_domain "  Введи домен из списка выше: "
           reuse_domain="$(echo "${reuse_domain:-}" | tr -d '[:space:]')"
         fi
 
@@ -2484,7 +2564,7 @@ issue_tls_certificate() {
     fi
 
     echo
-    read -rp "  Попробовать снова с другим доменом? [Y/n]: " ans
+    ask ans "  Попробовать снова с другим доменом? [Y/n]: "
 
     case "${ans,,}" in
       n|no|н|нет)
@@ -2500,7 +2580,7 @@ issue_tls_certificate() {
 
 ask_enable_hysteria2() {
   echo
-  read -rp "  Добавить Hysteria2 (UDP) inbound к этой ноде? [y/N]: " ans
+  ask ans "  Добавить Hysteria2 (UDP) inbound к этой ноде? [y/N]: "
 
   case "${ans,,}" in
     y|yes|д|да)
@@ -2585,10 +2665,41 @@ TG_CONFIG="$TG_DIR/config"
 TG_SCRIPT="/usr/local/sbin/eclipse-torrent-guard.sh"
 TG_LOG="/var/log/ds-guard-install.log"
 
+# ── Слой B: почему netstat-эвристики выключены по умолчанию ─────────────────
+#
+# У Go-блокера есть два независимых источника решений:
+#
+#   1) РЕАЛЬНЫЙ детект торрентов — разбор access.log xray по тегу TORRENT
+#      (его ставит routing-правило ноды) и по совпадениям DPI. Это то, что нам
+#      нужно: банится тот, кто действительно качал торрент.
+#
+#   2) Эвристики по netstat — «много ESTABLISHED с одного IP» и «шторм
+#      FIN_WAIT». Это НЕ детект торрентов: признак чисто количественный.
+#      Мост/релей/вторая нода, которая гонит через этот сервер трафик, легко
+#      даёт 400+ соединений и попадает под бан с причиной
+#      multi_conn_large_sendq — при том, что торрентов там нет вообще.
+#      Поэтому TB_NETSTAT=0 по умолчанию.
+#
+# Вторая мина вендорского инсталлятора: он прописывает
+# --log /var/log/remnanode/access.log — это путь ВНУТРИ контейнера. На хосте
+# логи ноды лежат в <папка ноды>/logs/access.log (compose монтирует
+# ./logs:/var/log/remnanode). С неверным путём разбор логов молчит, и
+# единственным работающим механизмом остаётся именно эвристика из п.2 —
+# то есть блокер банит только своих. tb_detect_access_log определяет
+# настоящий путь на хосте.
+
 # Настройки слоёв (перезаписываются из $TG_CONFIG).
 TG_TORRENT=1
 TG_SURICATA=1
 TG_PACKETSDK=1
+
+# Слой B (torrent-blocker).
+TB_NETSTAT=0            # 1 — включить эвристики по числу соединений (см. выше)
+TB_BYPASS=""            # белый список IP: мосты, релеи, свои сервисы
+TB_CONN_THRESH=1000     # порог ESTABLISHED (действует только при TB_NETSTAT=1)
+TB_SENDQ_THRESH=50      # порог соединений с большой send-queue
+TB_BAN_DURATION=10      # минут бана
+TB_UNIT="/etc/systemd/system/torrent-blocker.service"
 TG_DOMAINS=""
 
 is_torrent_blocker_installed() {
@@ -2605,6 +2716,7 @@ tg_load_config() {
   # Локальные — чтобы значения из файла не оставались глобальными и не
   # перебивали то, что пользователь только что переключил в меню настроек.
   local DS_TORRENT DS_SURICATA DS_PACKETSDK DS_DOMAINS
+  local TB_NETSTAT_F TB_BYPASS_F TB_CONN_F TB_SENDQ_F TB_BAN_F
   # shellcheck disable=SC1090
   source "$TG_CONFIG" 2>/dev/null || return 0
 
@@ -2612,18 +2724,325 @@ tg_load_config() {
   TG_SURICATA="${DS_SURICATA:-$TG_SURICATA}"
   TG_PACKETSDK="${DS_PACKETSDK:-$TG_PACKETSDK}"
   TG_DOMAINS="${DS_DOMAINS:-$TG_DOMAINS}"
+
+  # TB_* приходят из того же файла напрямую (имена совпадают), поэтому здесь
+  # только подставляем дефолты, если ключа в файле не было.
+  TB_NETSTAT="${TB_NETSTAT:-0}"
+  TB_BYPASS="${TB_BYPASS:-}"
+  TB_CONN_THRESH="${TB_CONN_THRESH:-1000}"
+  TB_SENDQ_THRESH="${TB_SENDQ_THRESH:-50}"
+  TB_BAN_DURATION="${TB_BAN_DURATION:-10}"
 }
 
 tg_save_config() {
   mkdir -p "$TG_DIR"
   cat > "$TG_CONFIG" <<CFG
 # Настройки Torrent Guard. Файл читают и сам guard-скрипт, и Eclipse Node Manager.
+
+# Слой A (ds-guard): DPI-глушение трафика.
 DS_TORRENT=$TG_TORRENT
 DS_SURICATA=$TG_SURICATA
 DS_PACKETSDK=$TG_PACKETSDK
 DS_DOMAINS="$TG_DOMAINS"
+
+# Слой B (torrent-blocker): бан клиента.
+# TB_NETSTAT=1 включает эвристики по ЧИСЛУ соединений — они не отличают торрент
+# от моста/релея и умеют банить свою же инфраструктуру. Держи 0, если через
+# сервер ходят мосты или другие ноды.
+TB_NETSTAT=$TB_NETSTAT
+TB_BYPASS="$TB_BYPASS"
+TB_CONN_THRESH=$TB_CONN_THRESH
+TB_SENDQ_THRESH=$TB_SENDQ_THRESH
+TB_BAN_DURATION=$TB_BAN_DURATION
 CFG
   chmod 600 "$TG_CONFIG"
+}
+
+# ── Ротация логов ───────────────────────────────────────────────────────────
+#
+# Как только в конфиге ноды включён access.log (а он нужен слою B, чтобы видеть
+# торрент-трафик по тегу TORRENT), лог начинает расти быстро: на нагруженной
+# ноде это десятки МБ в сутки. Без ротации он рано или поздно съест диск.
+#
+# copytruncate здесь принципиален: xray держит файл открытым и не переоткрывает
+# его по сигналу. При обычной ротации (переименование) xray продолжил бы писать
+# в переименованный inode, и новый access.log остался бы пустым — то есть слой B
+# ослеп бы после первой же ротации. copytruncate копирует содержимое и обрезает
+# исходный файл на месте, дескриптор остаётся валидным.
+#
+# maxsize вместе с daily даёт «раз в сутки ИЛИ при превышении размера» — защита
+# от того, что за одни сутки лог распухнет сильнее, чем есть места на диске.
+
+ECLIPSE_LOGROTATE="/etc/logrotate.d/eclipse-node"
+
+ensure_logrotate() {
+  command -v logrotate >/dev/null 2>&1 && return 0
+  run_cmd "Устанавливаю logrotate" env DEBIAN_FRONTEND=noninteractive apt-get install -y logrotate
+}
+
+install_log_rotation() {
+  section "Ротация логов (раз в сутки)"
+
+  if ! ensure_logrotate; then
+    warn "logrotate не установлен — ротация не настроена."
+    return 1
+  fi
+
+  # Пути нод перечислены шаблонами: одна конфигурация покрывает все варианты
+  # размещения (/opt/remnanode, /root/remnanode, /home/<user>/remnanode, ...).
+  cat > "$ECLIPSE_LOGROTATE" <<'ROTATE'
+# Логи Remnawave Node (access.log / error.log от xray).
+# copytruncate — xray держит файл открытым и не переоткрывает его по сигналу.
+/opt/remnanode/logs/*.log
+/root/remnanode/logs/*.log
+/home/*/remnanode/logs/*.log
+/opt/*-Node/logs/*.log
+{
+    daily
+    rotate 7
+    maxsize 200M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    dateext
+    su root root
+}
+
+# Логи самого менеджера и анти-торрент слоя A.
+/var/log/bbr3-remnanode-install.log
+/var/log/ds-guard-install.log
+/var/log/warp-auto-install.log
+{
+    daily
+    rotate 14
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+ROTATE
+
+  chmod 644 "$ECLIPSE_LOGROTATE"
+  ok "Конфигурация ротации записана: $ECLIPSE_LOGROTATE"
+
+  # Проверяем синтаксис в режиме отладки (ничего не ротируя).
+  if logrotate --debug "$ECLIPSE_LOGROTATE" >> "$LOG_FILE" 2>&1; then
+    ok "Конфигурация logrotate прошла проверку (--debug)."
+  else
+    warn "logrotate --debug вернул ошибку. Подробности: $LOG_FILE"
+  fi
+
+  # На Debian/Ubuntu ротацию запускает системный таймер logrotate.timer
+  # (или cron.daily на старых релизах) — свой таймер не нужен, только убедимся,
+  # что штатный включён.
+  if systemctl list-unit-files 2>/dev/null | grep -q '^logrotate.timer'; then
+    systemctl enable --now logrotate.timer >> "$LOG_FILE" 2>&1 || true
+    info "Запуск ротации: logrotate.timer ($(systemctl is-active logrotate.timer 2>/dev/null || echo inactive))"
+  elif [[ -d /etc/cron.daily ]]; then
+    info "Запуск ротации: /etc/cron.daily/logrotate"
+  else
+    warn "Не нашёл ни logrotate.timer, ни /etc/cron.daily — ротацию нужно запускать самому."
+  fi
+
+  echo
+  info "Хранится: логи ноды 7 суток, логи менеджера 14 суток, сжатие включено."
+  info "Проверить вручную, ничего не меняя: logrotate --debug $ECLIPSE_LOGROTATE"
+  info "Прогнать принудительно: logrotate --force $ECLIPSE_LOGROTATE"
+}
+
+# ── Слой B: путь к логу, белый список, свой systemd-юнит ────────────────────
+
+# Печатает путь к access.log ноды НА ХОСТЕ. Compose монтирует ./logs в
+# /var/log/remnanode внутри контейнера, поэтому вендорский дефолт
+# /var/log/remnanode/access.log на хосте обычно не существует.
+tb_detect_access_log() {
+  local d
+
+  d="$(find_node_dir || true)"
+  if [[ -n "$d" && -d "$d/logs" ]]; then
+    echo "$d/logs/access.log"
+    return 0
+  fi
+
+  for d in /opt/remnanode /root/remnanode /home/*/remnanode /opt/*-Node; do
+    [[ -f "$d/logs/access.log" ]] && { echo "$d/logs/access.log"; return 0; }
+  done
+
+  # Фоллбэк: вендорский путь (верен, только если логи реально лежат на хосте там).
+  echo "/var/log/remnanode/access.log"
+}
+
+# Печатает итоговый белый список IP для --bypass (через запятую):
+# localhost + IP панели + IP текущей SSH-сессии + то, что добавил пользователь.
+# Панель и своя SSH-сессия — чтобы блокер физически не мог отрезать управление.
+tb_build_bypass() {
+  local ips=("127.0.0.1" "::1") ip panel_domain
+
+  panel_domain="$(tr -d '[:space:]' < "$ECLIPSE_PANEL_DOMAIN_FILE" 2>/dev/null || true)"
+  if [[ -n "$panel_domain" ]]; then
+    for ip in $(na_resolve_domain_v4 "$panel_domain" 2>/dev/null || true); do
+      ips+=("$ip")
+    done
+    for ip in $(na_resolve_domain_v6 "$panel_domain" 2>/dev/null || true); do
+      ips+=("$ip")
+    done
+  fi
+
+  for ip in $(na_detect_ssh_client_ip 2>/dev/null || true); do
+    ips+=("$ip")
+  done
+
+  for ip in $TB_BYPASS; do
+    ips+=("$ip")
+  done
+
+  printf '%s\n' "${ips[@]}" | awk 'NF' | sort -u | paste -sd, -
+}
+
+# Пишет СВОЙ systemd-юнит для torrent-blocker вместо вендорского: правильный
+# путь к логу, белый список и netstat-эвристики по нашему конфигу.
+tb_write_unit() {
+  local logpath bypass netstat_flags
+
+  logpath="$(tb_detect_access_log)"
+  bypass="$(tb_build_bypass)"
+
+  if [[ "$TB_NETSTAT" == "1" ]]; then
+    # Эвристики включены осознанно — оставляем только вариант conns+sendq,
+    # шторм FIN_WAIT отключён (он ложно срабатывает ещё чаще).
+    netstat_flags="--no-finwait-ban --conn-thresh $TB_CONN_THRESH --sendq-thresh $TB_SENDQ_THRESH"
+  else
+    # --no-netstat полностью убирает решения по числу соединений. Остаётся
+    # разбор access.log по тегу TORRENT и DPI — то есть только торренты.
+    netstat_flags="--no-netstat --no-finwait-ban"
+  fi
+
+  cat > "$TB_UNIT" <<UNIT
+[Unit]
+Description=Torrent Blocker (Eclipse Torrent Guard, слой B)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$TORRENT_BLOCKER_BIN --log $logpath --tag TORRENT --ban-duration $TB_BAN_DURATION --bypass $bypass $netstat_flags
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  ok "Юнит torrent-blocker перезаписан под ноду:"
+  info "лог: $logpath"
+  info "белый список: $bypass"
+  if [[ "$TB_NETSTAT" == "1" ]]; then
+    warn "netstat-эвристики ВКЛЮЧЕНЫ (conn>$TB_CONN_THRESH, sendq>$TB_SENDQ_THRESH) — возможны ложные баны мостов."
+  else
+    info "netstat-эвристики выключены: банится только реальный торрент-трафик."
+  fi
+
+  if [[ ! -f "$logpath" ]]; then
+    warn "Файла $logpath пока нет. Он появится, когда нода начнёт писать access.log."
+    warn "Проверь, что в конфиге ноды в панели включён лог доступа (loglevel не 'none')."
+  fi
+}
+
+# Применяет настройки слоя B: юнит + перезапуск сервиса.
+tb_apply() {
+  is_torrent_blocker_installed || { warn "torrent-blocker не установлен."; return 1; }
+
+  # Слой B работает по access.log, поэтому ротация обязательна: иначе лог,
+  # который мы только что задействовали, со временем забьёт диск.
+  install_log_rotation || warn "Ротация логов не настроена — следи за размером access.log."
+
+  tb_write_unit
+  run_shell "Перечитываю systemd и перезапускаю torrent-blocker" \
+    "systemctl daemon-reload; systemctl enable torrent-blocker >/dev/null 2>&1 || true; systemctl restart torrent-blocker" || return 1
+
+  sleep 2
+  if systemctl is-active --quiet torrent-blocker 2>/dev/null; then
+    ok "Сервис torrent-blocker активен с новыми настройками."
+  else
+    warn "Сервис не поднялся. Смотри: journalctl -u torrent-blocker -n 30"
+    return 1
+  fi
+}
+
+# Снимает все текущие баны (после ложного срабатывания).
+tb_unban_all() {
+  local ips ip n=0
+
+  is_torrent_blocker_installed || { warn "torrent-blocker не установлен."; return 1; }
+
+  ips="$("$TORRENT_BLOCKER_BIN" status 2>/dev/null \
+    | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u || true)"
+
+  if [[ -z "$ips" ]]; then
+    ok "Забаненных IP не найдено."
+    return 0
+  fi
+
+  for ip in $ips; do
+    "$TORRENT_BLOCKER_BIN" unban "$ip" >/dev/null 2>&1 && n=$((n + 1)) || true
+  done
+
+  ok "Снято банов: $n"
+}
+
+torrent_blocker_whitelist_menu() {
+  section "Слой B — белый список (мосты, релеи, свои сервисы)"
+
+  tg_load_config
+
+  local choice input ip
+  while true; do
+    echo
+    info "Свои IP в белом списке: ${TB_BYPASS:-<нет>}"
+    info "Итоговый --bypass (плюс localhost, IP панели и твоя SSH-сессия):"
+    echo "${C_DIM}    $(tb_build_bypass)${C_RESET}"
+    echo
+    echo "  ${C_GREEN}1${C_RESET}) Добавить IP"
+    echo "  ${C_GREEN}2${C_RESET}) Удалить IP"
+    echo "  ${C_GREEN}3${C_RESET}) Очистить свой список"
+    echo "  ${C_CYAN}4${C_RESET}) Сохранить и применить"
+    echo "  ${C_YELLOW}0${C_RESET}) Назад без применения"
+    echo
+    ask choice "  Выбор: "
+
+    case "${choice:-}" in
+      1)
+        ask input "  IP (можно несколько через пробел): "
+        for ip in ${input:-}; do
+          if [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
+            TB_BYPASS="$(printf '%s %s\n' "$TB_BYPASS" "$ip" | tr ' ' '\n' | awk 'NF' | sort -u | paste -sd' ' -)"
+          else
+            warn "Пропускаю некорректный IP: $ip"
+          fi
+        done
+        ;;
+      2)
+        ask input "  IP для удаления: "
+        input="$(echo "${input:-}" | tr -d '[:space:]')"
+        TB_BYPASS="$(printf '%s\n' $TB_BYPASS | awk 'NF' | grep -vxF "$input" | paste -sd' ' - || true)"
+        ;;
+      3) TB_BYPASS="" ;;
+      4)
+        tg_save_config
+        ok "Белый список сохранён."
+        tb_apply || true
+        return 0
+        ;;
+      0|"") return 0 ;;
+      *) warn "Некорректный выбор." ;;
+    esac
+  done
 }
 
 # Записывает на диск guard-скрипт (слой A). Внешний heredoc в кавычках ('GUARD'),
@@ -3051,19 +3470,25 @@ install_torrent_blocker() {
     info "torrent-blocker не найден на сервере. Устанавливаю с нуля."
   fi
 
+  tg_load_config
+
   if run_shell_live "Скачиваю и устанавливаю torrent-blocker" \
     "curl -fsSL '$TORRENT_BLOCKER_INSTALL_URL' | bash"; then
-    ok "Установка torrent-blocker завершена."
-
-    if systemctl is-active --quiet torrent-blocker 2>/dev/null; then
-      ok "Сервис torrent-blocker активен."
-    else
-      warn "Сервис torrent-blocker не выглядит активным. Проверь: systemctl status torrent-blocker"
-    fi
+    ok "Сборка torrent-blocker завершена."
   else
     warn "Установка torrent-blocker завершилась с ошибкой или была прервана. Смотри вывод выше."
     return 1
   fi
+
+  # Вендорский юнит переписываем своим: у него неверный путь к логу (путь
+  # внутри контейнера) и включённые эвристики по числу соединений, из-за
+  # которых банились мосты. Подробности — в комментарии к TB_NETSTAT выше.
+  tg_save_config
+  tb_apply || return 1
+
+  # Ложные баны из прошлых запусков снимаем, иначе мост останется отрезанным
+  # до истечения таймера.
+  tb_unban_all || true
 }
 
 install_torrent_guard_all() {
@@ -3133,17 +3558,23 @@ torrent_guard_ban_menu() {
     return 1
   fi
 
+  echo
+  echo "${C_DIM}  Текущие баны:${C_RESET}"
+  "$TORRENT_BLOCKER_BIN" status 2>/dev/null | sed 's/^/    /' || true
+
   local act ip
   echo
   echo "  ${C_GREEN}1${C_RESET}) Забанить IP"
   echo "  ${C_GREEN}2${C_RESET}) Разбанить IP"
+  echo "  ${C_CYAN}3${C_RESET}) Снять ВСЕ баны ${C_DIM}(после ложного срабатывания)${C_RESET}"
   echo "  ${C_YELLOW}0${C_RESET}) Назад"
   echo
-  read -rp "  Выбор: " act
+  ask act "  Выбор: "
 
   case "${act:-}" in
-    1) read -rp "  IP для бана: " ip ;;
-    2) read -rp "  IP для разбана: " ip ;;
+    1) ask ip "  IP для бана: " ;;
+    2) ask ip "  IP для разбана: " ;;
+    3) tb_unban_all; return 0 ;;
     *) return 0 ;;
   esac
 
@@ -3171,25 +3602,37 @@ torrent_guard_settings() {
     info "Suricata (L2, IPS по UDP):            $( [[ "$TG_SURICATA" == 1 ]] && echo включена || echo выключена )"
     info "Блок домена packetsdk (L3):           $( [[ "$TG_PACKETSDK" == 1 ]] && echo включён || echo выключен )"
     info "Доп. домены для блокировки:           ${TG_DOMAINS:-<нет>}"
+    info "Слой B: эвристики по числу соединений: $( [[ "$TB_NETSTAT" == 1 ]] && echo "ВКЛЮЧЕНЫ (риск бана мостов)" || echo "выключены (банится только торрент)" )"
     echo
     echo "  ${C_GREEN}1${C_RESET}) Переключить nDPI (L1)"
     echo "  ${C_GREEN}2${C_RESET}) Переключить Suricata (L2) ${C_DIM}— на Hysteria2-нодах это заметная нагрузка на CPU${C_RESET}"
     echo "  ${C_GREEN}3${C_RESET}) Переключить блок packetsdk (L3)"
     echo "  ${C_GREEN}4${C_RESET}) Задать доп. домены"
-    echo "  ${C_CYAN}5${C_RESET}) Сохранить и применить"
+    echo "  ${C_GREEN}5${C_RESET}) Переключить netstat-эвристики слоя B ${C_DIM}(не различают торрент и мост)${C_RESET}"
+    echo "  ${C_CYAN}6${C_RESET}) Сохранить и применить"
     echo "  ${C_YELLOW}0${C_RESET}) Назад без применения"
     echo
-    read -rp "  Выбор: " choice
+    ask choice "  Выбор: "
 
     case "${choice:-}" in
       1) [[ "$TG_TORRENT"   == 1 ]] && TG_TORRENT=0   || TG_TORRENT=1 ;;
       2) [[ "$TG_SURICATA"  == 1 ]] && TG_SURICATA=0  || TG_SURICATA=1 ;;
       3) [[ "$TG_PACKETSDK" == 1 ]] && TG_PACKETSDK=0 || TG_PACKETSDK=1 ;;
       4)
-        read -rp "  Домены через пробел или запятую (пусто — очистить): " input
+        ask input "  Домены через пробел или запятую (пусто — очистить): "
         TG_DOMAINS="$(echo "${input:-}" | tr -s ', ' ' ' | sed 's/^ *//; s/ *$//')"
         ;;
       5)
+        if [[ "$TB_NETSTAT" == 1 ]]; then
+          TB_NETSTAT=0
+        else
+          TB_NETSTAT=1
+          warn "Эвристики считают только количество соединений. Мост или вторая нода"
+          warn "легко даёт 400+ соединений и будет забанен как 'multi_conn_large_sendq'."
+          warn "Если через сервер ходят мосты — добавь их в белый список (пункт меню)."
+        fi
+        ;;
+      6)
         tg_save_config
         ok "Настройки сохранены: $TG_CONFIG"
         if tg_guard_installed; then
@@ -3197,6 +3640,7 @@ torrent_guard_settings() {
         else
           warn "Слой A ещё не установлен — примени пункт «Установить/обновить всё»."
         fi
+        is_torrent_blocker_installed && { tb_apply || true; }
         return 0
         ;;
       0|"") return 0 ;;
@@ -3209,7 +3653,7 @@ torrent_guard_uninstall() {
   section "Torrent Guard — удаление"
 
   local ans
-  read -rp "  Удалить оба слоя (правила, сервисы, таймеры)? [y/N]: " ans
+  ask ans "  Удалить оба слоя (правила, сервисы, таймеры)? [y/N]: "
   case "${ans,,}" in y|yes|д|да) ;; *) info "Отменено."; return 0 ;; esac
 
   if tg_guard_installed; then
@@ -3245,14 +3689,15 @@ torrent_guard_menu() {
     echo "  ${C_CYAN}3${C_RESET}) Только слой B ${C_DIM}(torrent-blocker, бан клиентов)${C_RESET}"
     echo "  ${C_CYAN}4${C_RESET}) Статус"
     echo "  ${C_CYAN}5${C_RESET}) Логи и сработки"
-    echo "  ${C_CYAN}6${C_RESET}) Ручной бан / разбан IP"
-    echo "  ${C_CYAN}7${C_RESET}) Настройки слоёв"
-    echo "  ${C_RED}8${C_RESET}) Удалить всё"
+    echo "  ${C_CYAN}6${C_RESET}) Баны: посмотреть / забанить / разбанить / снять все"
+    echo "  ${C_GREEN}7${C_RESET}) Белый список слоя B ${C_DIM}(мосты, релеи — чтобы их не банило)${C_RESET}"
+    echo "  ${C_CYAN}8${C_RESET}) Настройки слоёв"
+    echo "  ${C_RED}9${C_RESET}) Удалить всё"
     echo "  ${C_YELLOW}0${C_RESET}) Назад"
     echo
 
     local choice
-    read -rp "  Выбор [1..8/0]: " choice || choice="0"
+    ask choice "  Выбор [1..9/0]: " || choice="0"
 
     case "${choice:-}" in
       1) install_torrent_guard_all || true; pause_menu ;;
@@ -3261,8 +3706,9 @@ torrent_guard_menu() {
       4) torrent_guard_status; pause_menu ;;
       5) torrent_guard_logs; pause_menu ;;
       6) torrent_guard_ban_menu || true; pause_menu ;;
-      7) torrent_guard_settings || true; pause_menu ;;
-      8) torrent_guard_uninstall || true; pause_menu ;;
+      7) torrent_blocker_whitelist_menu || true; pause_menu ;;
+      8) torrent_guard_settings || true; pause_menu ;;
+      9) torrent_guard_uninstall || true; pause_menu ;;
       0|q|Q) return 0 ;;
       *) warn "Неверный выбор: ${choice:-empty}"; sleep 1 ;;
     esac
@@ -3308,7 +3754,7 @@ ask_node_port() {
   local port_dec=""
 
   while true; do
-    read -rp "  NODE_PORT [${DEFAULT_NODE_PORT}]: " input
+    ask input "  NODE_PORT [${DEFAULT_NODE_PORT}]: "
     input="${input:-$DEFAULT_NODE_PORT}"
 
     if [[ "$input" =~ ^[0-9]{1,5}$ ]]; then
@@ -3341,7 +3787,7 @@ ask_node_location() {
 
   local choice user_input path_input
   while true; do
-    read -rp "  Выбор [1/2/3/4]: " choice
+    ask choice "  Выбор [1/2/3/4]: "
 
     case "${choice:-1}" in
       1)
@@ -3350,7 +3796,7 @@ ask_node_location() {
         ;;
       2)
         while true; do
-          read -rp "  Имя пользователя (папка в /home): " user_input
+          ask user_input "  Имя пользователя (папка в /home): "
           user_input="$(echo "${user_input:-}" | tr -d '[:space:]')"
           if [[ -n "$user_input" && "$user_input" =~ ^[a-zA-Z0-9._-]+$ ]]; then
             REMNANODE_DIR="/home/$user_input/remnanode"
@@ -3367,7 +3813,7 @@ ask_node_location() {
         ;;
       4)
         while true; do
-          read -rp "  Абсолютный путь установки: " path_input
+          ask path_input "  Абсолютный путь установки: "
           path_input="$(echo "${path_input:-}" | tr -d '[:space:]')"
           if [[ "$path_input" == /* ]]; then
             REMNANODE_DIR="$path_input"
@@ -3397,7 +3843,7 @@ prepare_node_paths() {
 
   echo
   echo "  Имя ноды/контейнера (латиница, для docker). Пустое = remnanode."
-  read -rp "  Имя ноды [remnanode]: " name_input
+  ask name_input "  Имя ноды [remnanode]: "
   name_input="${name_input:-remnanode}"
 
   NODE_DISPLAY_NAME="$(sanitize_node_name "$name_input")"
@@ -3420,7 +3866,7 @@ ask_hysteria2_port() {
   local input=""
 
   while true; do
-    read -rp "  Порт Hysteria2 (UDP) [${DEFAULT_HY2_PORT}]: " input
+    ask input "  Порт Hysteria2 (UDP) [${DEFAULT_HY2_PORT}]: "
     input="${input:-$DEFAULT_HY2_PORT}"
 
     if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
@@ -3438,7 +3884,7 @@ ask_tls_ports() {
   local input=""
 
   while true; do
-    read -rp "  Порт VLESS+TCP+TLS [${DEFAULT_TLS_VLESS_PORT}]: " input
+    ask input "  Порт VLESS+TCP+TLS [${DEFAULT_TLS_VLESS_PORT}]: "
     input="${input:-$DEFAULT_TLS_VLESS_PORT}"
 
     if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
@@ -3473,7 +3919,9 @@ generate_tls_panel_config() {
   cat > "$config_path" <<EOF_PANEL
 {
   "log": {
-    "loglevel": "none"
+    "loglevel": "warning",
+    "access": "/var/log/remnanode/access.log",
+    "error": "/var/log/remnanode/error.log"
   },
   "inbounds": [
     {
@@ -3563,6 +4011,10 @@ generate_tls_panel_config() {
     {
       "tag": "BLOCK",
       "protocol": "blackhole"
+    },
+    {
+      "tag": "TORRENT",
+      "protocol": "blackhole"
     }
   ],
   "routing": {
@@ -3583,7 +4035,9 @@ generate_tls_panel_config() {
         "protocol": [
           "bittorrent"
         ],
-        "outboundTag": "BLOCK"
+        "type": "field",
+        "ruleTag": "TORRENT_BY_PROTOCOL",
+        "outboundTag": "TORRENT"
       },
       {
         "type": "field",
@@ -3591,13 +4045,13 @@ generate_tls_panel_config() {
           "geosite:category-public-tracker"
         ],
         "ruleTag": "TORRENT_BY_DOMAIN",
-        "outboundTag": "BLOCK"
+        "outboundTag": "TORRENT"
       },
       {
         "port": "6881-6889,51413,21413,17417,37305",
         "type": "field",
         "ruleTag": "TORRENT_BY_PORT",
-        "outboundTag": "BLOCK"
+        "outboundTag": "TORRENT"
       }
     ]
   }
@@ -3722,7 +4176,7 @@ ask_reality_params() {
 
   if [[ "$SELFSTEAL_ENABLED" -eq 1 ]]; then
     while true; do
-      read -rp "  Порт VLESS+REALITY (TCP) [${DEFAULT_REALITY_PORT}]: " input
+      ask input "  Порт VLESS+REALITY (TCP) [${DEFAULT_REALITY_PORT}]: "
       input="${input:-$DEFAULT_REALITY_PORT}"
       if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
         REALITY_PORT="$((10#$input))"
@@ -3732,7 +4186,7 @@ ask_reality_params() {
     done
 
     while true; do
-      read -rp "  Домен selfsteal (serverName), например safeeclipse.ru: " input
+      ask input "  Домен selfsteal (serverName), например safeeclipse.ru: "
       input="$(echo "${input:-}" | tr -d '[:space:]')"
       if [[ "$input" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
         REALITY_SNI="$input"
@@ -3742,7 +4196,7 @@ ask_reality_params() {
     done
 
     while true; do
-      read -rp "  Локальный target-порт selfsteal (Caddy) [${DEFAULT_REALITY_TARGET_PORT}]: " input
+      ask input "  Локальный target-порт selfsteal (Caddy) [${DEFAULT_REALITY_TARGET_PORT}]: "
       input="${input:-$DEFAULT_REALITY_TARGET_PORT}"
       if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
         REALITY_TARGET_PORT="$((10#$input))"
@@ -3763,7 +4217,7 @@ ask_reality_params() {
     info "Примеры: www.samsung.com, www.microsoft.com, www.nvidia.com"
 
     while true; do
-      read -rp "  Внешний домен (SNI/target), например www.samsung.com: " input
+      ask input "  Внешний домен (SNI/target), например www.samsung.com: "
       input="$(echo "${input:-}" | tr -d '[:space:]')"
       # На всякий случай убираем протокол/путь, если пользователь вставил URL.
       input="${input#http://}"
@@ -3795,7 +4249,7 @@ ask_vless_encryption() {
   info "VLESS, поверх REALITY. Скрывает содержимое даже при компрометации ключей"
   info "REALITY. Требует свежий Xray на клиенте и сервере (25.9+). Режим: $VLESS_ENC_MODE."
   echo
-  read -rp "  Использовать шифрование (VLESS Encryption)? [y/N]: " ans
+  ask ans "  Использовать шифрование (VLESS Encryption)? [y/N]: "
 
   case "${ans,,}" in
     y|yes|д|да)
@@ -3911,7 +4365,9 @@ generate_reality_panel_config() {
   cat > "$config_path" <<EOF_REALITY
 {
   "log": {
-    "loglevel": "none"
+    "loglevel": "warning",
+    "access": "/var/log/remnanode/access.log",
+    "error": "/var/log/remnanode/error.log"
   },
   "inbounds": [
     {
@@ -3955,6 +4411,10 @@ generate_reality_panel_config() {
     {
       "tag": "BLOCK",
       "protocol": "blackhole"
+    },
+    {
+      "tag": "TORRENT",
+      "protocol": "blackhole"
     }
   ],
   "routing": {
@@ -3975,7 +4435,9 @@ generate_reality_panel_config() {
         "protocol": [
           "bittorrent"
         ],
-        "outboundTag": "BLOCK"
+        "type": "field",
+        "ruleTag": "TORRENT_BY_PROTOCOL",
+        "outboundTag": "TORRENT"
       },
       {
         "type": "field",
@@ -3983,13 +4445,13 @@ generate_reality_panel_config() {
           "geosite:category-public-tracker"
         ],
         "ruleTag": "TORRENT_BY_DOMAIN",
-        "outboundTag": "BLOCK"
+        "outboundTag": "TORRENT"
       },
       {
         "port": "6881-6889,51413,21413,17417,37305",
         "type": "field",
         "ruleTag": "TORRENT_BY_PORT",
-        "outboundTag": "BLOCK"
+        "outboundTag": "TORRENT"
       }
     ]
   }
@@ -4102,8 +4564,8 @@ setup_remnanode() {
   echo
   echo "  Вставь SECRET_KEY из панели Remnawave."
   echo "  Ввод скрытый, это нормально."
-  read -rsp "  SECRET_KEY: " SECRET_KEY
-  echo
+  # ask_secret сам переводит строку после скрытого ввода.
+  ask_secret SECRET_KEY "  SECRET_KEY: "
 
   [[ -n "${SECRET_KEY:-}" ]] || die "SECRET_KEY пустой."
 
@@ -4135,6 +4597,9 @@ setup_remnanode() {
     "$RU_GEOIP_URL"
 
   touch "$REMNANODE_LOG_DIR/access.log" "$REMNANODE_LOG_DIR/error.log"
+
+  # Ротация сразу: конфиг ноды включает access.log, он будет расти.
+  install_log_rotation || warn "Ротация логов не настроена — следи за размером access.log."
 
   cat > "$REMNANODE_DIR/.env" <<EOF_ENV
 NODE_PORT=$NODE_PORT
@@ -4367,12 +4832,12 @@ select_xray_version() {
   } >&2
 
   while true; do
-    read -rp "  Выбор [1/2/3/0]: " choice
+    ask choice "  Выбор [1/2/3/0]: "
     case "${choice:-}" in
       1) target_ver="$stable_ver"; break ;;
       2) target_ver="$actual_ver"; break ;;
       3)
-        read -rp "  Тег версии (с v, например v1.8.24): " input
+        ask input "  Тег версии (с v, например v1.8.24): "
         input="$(echo "${input:-}" | tr -d '[:space:]')"
         if [[ "$input" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
           [[ "$input" == v* ]] || input="v$input"
@@ -4631,10 +5096,10 @@ panel_domain_prompt() {
 
   while true; do
     if [[ -n "$saved" ]]; then
-      read -rp "  Домен панели [$saved]: " input
+      ask input "  Домен панели [$saved]: "
       input="${input:-$saved}"
     else
-      read -rp "  Домен панели: " input
+      ask input "  Домен панели: "
     fi
 
     input="$(panel_domain_normalize "${input:-}")"
@@ -4652,7 +5117,7 @@ panel_domain_prompt() {
 
   if [[ -z "$v4$v6" ]]; then
     warn "DNS не вернул IP для $input. Ограничивать порт ноды этим доменом сейчас нельзя."
-    read -rp "  Всё равно сохранить домен и продолжить? [y/N]: " ans
+    ask ans "  Всё равно сохранить домен и продолжить? [y/N]: "
     case "${ans,,}" in y|yes|д|да) ;; *) warn "Отменено."; return 1 ;; esac
   fi
 
@@ -4822,11 +5287,11 @@ manage_firewall() {
     echo "  ${C_CYAN}6${C_RESET}) Порты нод — только для панели ${C_DIM}(указать домен панели)${C_RESET}"
     echo "  ${C_YELLOW}0${C_RESET}) Назад"
     echo
-    read -rp "  Выбор: " choice
+    ask choice "  Выбор: "
 
     case "${choice:-}" in
       1)
-        read -rp "  Порт (например 2222 или 2222/udp): " port
+        ask port "  Порт (например 2222 или 2222/udp): "
         port="$(echo "${port:-}" | tr -d '[:space:]')"
         if valid_port_spec "$port"; then
           if ufw allow "$port" >/dev/null 2>&1; then
@@ -4839,11 +5304,11 @@ manage_firewall() {
         fi
         ;;
       2)
-        read -rp "  Порт для закрытия (например 2222 или 2222/udp): " port
+        ask port "  Порт для закрытия (например 2222 или 2222/udp): "
         port="$(echo "${port:-}" | tr -d '[:space:]')"
         if [[ "$port" =~ ^(22|80|443)(/tcp)?$ ]]; then
           warn "Порт $port относится к базовым (22/80/443) — закрывать не рекомендую (можно потерять доступ)."
-          read -rp "  Всё равно закрыть? [y/N]: " ans
+          ask ans "  Всё равно закрыть? [y/N]: "
           case "${ans,,}" in y|yes|д|да) ;; *) continue ;; esac
         fi
         if valid_port_spec "$port"; then
@@ -4861,7 +5326,7 @@ manage_firewall() {
         # порты нод точечно (тот же домен, что использует Eclipse Firewall).
         echo
         info "Порт ноды нужен только панели Remnawave — остальным его можно закрыть."
-        read -rp "  Ограничить порты нод IP панели? [Y/n]: " ans
+        ask ans "  Ограничить порты нод IP панели? [Y/n]: "
         case "${ans,,}" in
           n|no|н|нет)
             info "Порты нод остаются открытыми для всех."
@@ -5001,7 +5466,7 @@ offer_cleanup_previous() {
   [[ -n "$caddy_ctrs" ]] && info "Контейнеры Caddy/selfsteal: $(echo "$caddy_ctrs" | tr '\n' ' ')"
   echo
   info "Можно остановить/удалить прошлое, чтобы освободить порты и не мешать новой установке."
-  read -rp "  Очистить предыдущую установку? [y/N]: " ans
+  ask ans "  Очистить предыдущую установку? [y/N]: "
 
   case "${ans,,}" in
     y|yes|д|да) ;;
@@ -5039,7 +5504,7 @@ stage_before_reboot() {
   warn "Перед установкой ядра убедись, что у VPS есть VNC/Rescue-консоль на случай, если сервер не загрузится после reboot."
 
   echo
-  read -rp "  Продолжить установку? [y/N]: " ans
+  ask ans "  Продолжить установку? [y/N]: "
 
   case "${ans,,}" in
     y|yes|д|да) ;;
@@ -5086,7 +5551,7 @@ stage_after_reboot() {
         if set_grub_default_to_kernel "$KERNEL_VER"; then
           warn "Готово. Чтобы получить BBR v3, перезагрузи сервер ещё раз (reboot) и снова зайди по SSH — установка продолжится."
           echo
-          read -rp "  Перезагрузить сейчас, чтобы загрузиться в XanMod? [y/N]: " reboot_ans
+          ask reboot_ans "  Перезагрузить сейчас, чтобы загрузиться в XanMod? [y/N]: "
           case "${reboot_ans,,}" in
             y|yes|д|да)
               set_state "need_post_reboot"
@@ -5186,7 +5651,8 @@ EOF_MANUAL
 
 pause_menu() {
   echo
-  read -rp "  Нажми Enter для возврата в меню..." _ || true
+  local _unused
+  ask _unused "  Нажми Enter для возврата в меню..." || true
 }
 
 # ============================================================================
@@ -5506,7 +5972,7 @@ na_apply_with_rollback() {
   warn "АНТИ-САМОБЛОКИРОВКА: если связь оборвётся — просто НЕ подтверждай."
   warn "Через 180 секунд фаервол автоматически откатится (таблица удалится)."
   echo
-  read -rp "  Связь работает нормально, оставить фаервол включённым? [y/N]: " ans
+  ask ans "  Связь работает нормально, оставить фаервол включённым? [y/N]: "
 
   case "${ans,,}" in
     y|yes|д|да)
@@ -5610,7 +6076,7 @@ na_firewall_disable() {
   local nft_bin ans
   nft_bin="$(command -v nft || echo nft)"
 
-  read -rp "  Точно выключить Eclipse Firewall (удалить таблицу и автозапуск)? [y/N]: " ans
+  ask ans "  Точно выключить Eclipse Firewall (удалить таблицу и автозапуск)? [y/N]: "
   case "${ans,,}" in y|yes|д|да) ;; *) info "Отменено."; return 0 ;; esac
 
   "$nft_bin" delete table inet na_filter >/dev/null 2>&1 || true
@@ -5635,7 +6101,7 @@ eclipse_firewall_menu() {
     echo
 
     local choice
-    read -rp "  Выбор [1/2/3/4/5/6/0]: " choice || choice="0"
+    ask choice "  Выбор [1/2/3/4/5/6/0]: " || choice="0"
 
     case "${choice:-}" in
       1) na_set_panel_domain; pause_menu ;;
@@ -5681,7 +6147,7 @@ main_menu() {
     echo "  ${C_YELLOW}0${C_RESET}) Выход"
     echo
 
-    read -rp "  Выбор [1..10/0]: " choice || choice="0"
+    ask choice "  Выбор [1..10/0]: " || choice="0"
 
     case "${choice:-}" in
       1)
@@ -5768,6 +6234,10 @@ case "${1:-}" in
     need_root
     torrent_guard_status
     ;;
+  --logrotate|logrotate)
+    need_root
+    install_log_rotation
+    ;;
   --xray-core|--update-xray|xray-core)
     need_root
     update_xray_core
@@ -5803,6 +6273,7 @@ case "${1:-}" in
   $0 --torrent-guard    меню Torrent Guard (анти-торрент)
   $0 --torrent-blocker  установить/обновить оба слоя Torrent Guard
   $0 --torrent-status   статус анти-торрент защиты
+  $0 --logrotate        настроить суточную ротацию логов ноды и менеджера
   $0 --xray-core        обновить ядро Xray в контейнере ноды
   $0 --firewall         настройка портов (UFW)
   $0 --panel-port       порт ноды только для панели (nftables)
