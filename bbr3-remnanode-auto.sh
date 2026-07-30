@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.6.0"
+SCRIPT_VERSION="3.6.1"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -2975,25 +2975,115 @@ tb_apply() {
   fi
 }
 
-# Снимает все текущие баны (после ложного срабатывания).
+# ── Снятие банов слоя B ─────────────────────────────────────────────────────
+#
+# ВАЖНО: одного `torrent-blocker unban` недостаточно. Состояние блокера
+# (/var/lib/torrent-blocker/blocked.json) и правила iptables — это ДВЕ разные
+# вещи. Вендорский инсталлятор при переустановке удаляет blocked.json, а
+# цепочка TORRENT_BAN в таблице raw остаётся как была. Результат: в статусе
+# «banned IPs: 0», а трафик IP по-прежнему дропается, и счётчик пакетов в
+# TORRENT_BAN растёт. Такие правила надо снимать напрямую.
+
+# Печатает IP, которые ПРЯМО СЕЙЧАС дропаются цепочками слоя B.
+# 0.0.0.0 отбрасываем: он приходит из записи 0.0.0.0/0 (destination any),
+# а не является забаненным адресом.
+# Всегда возвращает 0: цепочек может не быть вовсе (тогда вывод пустой), а
+# скрипт работает под `set -Eeuo pipefail` — иначе отсутствие цепочки роняло бы
+# вызывающего.
+tb_active_ban_rules() {
+  { iptables  -t raw -S TORRENT_BAN   2>/dev/null || true
+    iptables         -S TORRENT_PEERS 2>/dev/null || true
+    ip6tables -t raw -S TORRENT_BAN   2>/dev/null || true
+  } | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b|\b([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b' \
+    | grep -vxE '0\.0\.0\.0|127\.0\.0\.1|::1' \
+    | sort -u || true
+}
+
+# Чистит цепочки и ipset слоя B от осиротевших правил.
+tb_purge_ban_rules() {
+  local before left s
+
+  before="$(tb_active_ban_rules | paste -sd' ' - || true)"
+
+  iptables  -t raw -F TORRENT_BAN   2>/dev/null || true
+  iptables         -F TORRENT_PEERS 2>/dev/null || true
+  ip6tables -t raw -F TORRENT_BAN   2>/dev/null || true
+  ip6tables        -F TORRENT_PEERS 2>/dev/null || true
+
+  for s in auto_peers_v4 auto_peers_v6 auto_trackers_v4 auto_trackers_v6; do
+    ipset flush "$s" 2>/dev/null || true
+  done
+
+  if [[ -n "$before" ]]; then
+    ok "Из цепочек слоя B убраны IP: $before"
+  else
+    info "Осиротевших DROP-правил в цепочках слоя B не было."
+  fi
+
+  left="$(tb_active_ban_rules | paste -sd' ' - || true)"
+  if [[ -n "$left" ]]; then
+    warn "Всё ещё дропаются: $left"
+    warn "Проверь вручную: iptables -t raw -S TORRENT_BAN; iptables -S TORRENT_PEERS"
+    return 1
+  fi
+
+  return 0
+}
+
+# Снимает бан с одного IP: и в состоянии блокера, и в правилах iptables.
+tb_unban_ip() {
+  local ip="$1" removed=0
+
+  "$TORRENT_BLOCKER_BIN" unban "$ip" >/dev/null 2>&1 || true
+
+  # Правила могли остаться, если блокер про этот IP уже забыл (истёк таймер
+  # или было удалено blocked.json) — снимаем их напрямую, в обе стороны.
+  while iptables -t raw -C TORRENT_BAN -s "$ip" -j DROP 2>/dev/null; do
+    iptables -t raw -D TORRENT_BAN -s "$ip" -j DROP && removed=$((removed + 1))
+  done
+  while iptables -t raw -C TORRENT_BAN -d "$ip" -j DROP 2>/dev/null; do
+    iptables -t raw -D TORRENT_BAN -d "$ip" -j DROP && removed=$((removed + 1))
+  done
+  while iptables -C TORRENT_PEERS -d "$ip" -j DROP 2>/dev/null; do
+    iptables -D TORRENT_PEERS -d "$ip" -j DROP && removed=$((removed + 1))
+  done
+
+  ipset del auto_peers_v4    "$ip" 2>/dev/null || true
+  ipset del auto_trackers_v4 "$ip" 2>/dev/null || true
+
+  if [[ "$removed" -gt 0 ]]; then
+    ok "IP $ip разбанен (снято правил iptables: $removed)."
+  else
+    ok "IP $ip разбанен (правил iptables для него не было)."
+  fi
+}
+
+# Снимает ВСЕ баны: состояние блокера + правила iptables/ipset.
 tb_unban_all() {
   local ips ip n=0
 
   is_torrent_blocker_installed || { warn "torrent-blocker не установлен."; return 1; }
 
+  # 1) То, что блокер ещё помнит сам — берём только из секции «Banned IPs»,
+  #    иначе в выборку попадают адреса из дампа iptables (включая 0.0.0.0/0).
   ips="$("$TORRENT_BLOCKER_BIN" status 2>/dev/null \
-    | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u || true)"
-
-  if [[ -z "$ips" ]]; then
-    ok "Забаненных IP не найдено."
-    return 0
-  fi
+    | sed -n '/Banned IPs/,/^[[:space:]]*$/p' \
+    | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' \
+    | grep -vxE '0\.0\.0\.0|127\.0\.0\.1' | sort -u || true)"
 
   for ip in $ips; do
     "$TORRENT_BLOCKER_BIN" unban "$ip" >/dev/null 2>&1 && n=$((n + 1)) || true
   done
 
-  ok "Снято банов: $n"
+  if [[ "$n" -gt 0 ]]; then
+    ok "Блокер снял банов из своего состояния: $n"
+  else
+    info "В состоянии блокера банов не было."
+  fi
+
+  # 2) Дочищаем правила — именно из-за этого шага «banned IPs: 0», а трафик
+  #    всё равно дропался.
+  tb_purge_ban_rules
 }
 
 torrent_blocker_whitelist_menu() {
@@ -3526,6 +3616,19 @@ torrent_guard_status() {
   echo "${C_BOLD}  Слой B · бан клиентов (torrent-blocker)${C_RESET}"
   if is_torrent_blocker_installed; then
     info "Сервис: $(systemctl is-active torrent-blocker 2>/dev/null || echo inactive)"
+
+    # Фактически дропаемые IP показываем ОТДЕЛЬНО от статистики блокера:
+    # «banned IPs: 0» относится к его состоянию, а правила iptables могут
+    # остаться осиротевшими и продолжать дропать трафик.
+    local active
+    active="$(tb_active_ban_rules | paste -sd' ' - || true)"
+    if [[ -n "$active" ]]; then
+      warn "Реально дропаются цепочками слоя B: $active"
+      info "Если это свои мосты — пункт «Баны» → «Снять ВСЕ баны», затем добавь их в белый список."
+    else
+      ok "Активных DROP-правил слоя B нет."
+    fi
+
     "$TORRENT_BLOCKER_BIN" status 2>/dev/null | sed 's/^/    /' || warn "Не удалось получить статистику."
   else
     warn "Слой B не установлен."
@@ -3558,9 +3661,18 @@ torrent_guard_ban_menu() {
     return 1
   fi
 
+  local active
+  active="$(tb_active_ban_rules | paste -sd' ' - || true)"
+
   echo
-  echo "${C_DIM}  Текущие баны:${C_RESET}"
-  "$TORRENT_BLOCKER_BIN" status 2>/dev/null | sed 's/^/    /' || true
+  if [[ -n "$active" ]]; then
+    warn "Реально дропаются прямо сейчас: $active"
+  else
+    ok "Активных DROP-правил слоя B нет."
+  fi
+
+  echo "${C_DIM}  Статистика блокера (её «banned IPs» — только его состояние):${C_RESET}"
+  "$TORRENT_BLOCKER_BIN" status 2>/dev/null | sed -n '1,6p' | sed 's/^/    /' || true
 
   local act ip
   echo
@@ -3585,8 +3697,8 @@ torrent_guard_ban_menu() {
   fi
 
   case "$act" in
-    1) "$TORRENT_BLOCKER_BIN" ban "$ip"   && ok "IP $ip забанен."   || warn "Не удалось забанить $ip." ;;
-    2) "$TORRENT_BLOCKER_BIN" unban "$ip" && ok "IP $ip разбанен." || warn "Не удалось разбанить $ip." ;;
+    1) "$TORRENT_BLOCKER_BIN" ban "$ip" && ok "IP $ip забанен." || warn "Не удалось забанить $ip." ;;
+    2) tb_unban_ip "$ip" ;;
   esac
 }
 
