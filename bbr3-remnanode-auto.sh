@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.7.5"
+SCRIPT_VERSION="3.7.6"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -179,8 +179,19 @@ cleanup_spinner() {
 
 trap cleanup_spinner EXIT
 
+# Чистит экран вместе с буфером прокрутки и уводит курсор в левый верхний угол.
+#
+# Своя реализация вместо `clear`: терминфо-шный clear на многих терминалах
+# отправляет только \033[2J (видимая область), а прокрутка остаётся забита
+# предыдущим выводом, из-за чего меню «тонет» в старых логах. \033[3J чистит
+# именно scrollback. Ту же функцию скрипт прописывает в ~/.bashrc/~/.zshrc
+# (install_clear_fix), чтобы и ручной `clear` в консоли вёл себя так же.
+clear_screen() {
+  printf '\033[2J\033[3J\033[H' 2>/dev/null || clear 2>/dev/null || true
+}
+
 print_banner() {
-  clear 2>/dev/null || true
+  clear_screen
 
   cat <<BANNER
 ${C_CYAN}${C_BOLD}
@@ -4020,6 +4031,7 @@ torrent_guard_menu() {
   tg_load_config
 
   while true; do
+    clear_screen
     section "Torrent Guard (анти-торрент)"
     echo
     echo "  ${C_DIM}Слой A — глушит торрент-трафик (nDPI + Suricata + блок домена packetsdk).${C_RESET}"
@@ -4039,6 +4051,10 @@ torrent_guard_menu() {
 
     local choice
     ask choice "  Выбор [1..9/0]: " || choice="0"
+
+    case "${choice:-}" in
+      [1-9]) clear_screen ;;
+    esac
 
     case "${choice:-}" in
       1) install_torrent_guard_all || true; pause_menu ;;
@@ -5435,9 +5451,57 @@ update_xray_core() {
   ok "Обновление ядра Xray завершено."
 }
 
+# Прописывает в rc-файлы функцию clear, которая чистит и буфер прокрутки.
+#
+# Штатный clear шлёт только \033[2J — видимая область очищается, а scrollback
+# остаётся, и после выхода из меню вся консоль забита предыдущим выводом.
+# \033[3J чистит именно его. Пишем блоком с маркерами и проверяем маркер перед
+# записью, поэтому функция идемпотентна: повторный запуск не плодит дубли.
+ECLIPSE_CLEAR_MARKER="# >>> eclipse clear fix >>>"
+
+install_clear_fix() {
+  local rc changed=0
+
+  # ${HOME:-/root}: под `set -u` голое $HOME уронило бы скрипт там, где
+  # переменная не выставлена (sudo -E, systemd-юнит, cron).
+  for rc in "${HOME:-/root}/.bashrc" "${HOME:-/root}/.zshrc"; do
+    # .zshrc создаём только если zsh реально есть или файл уже существует —
+    # иначе оставляли бы мусор в домашнем каталоге на серверах без zsh.
+    if [[ "$rc" == *.zshrc && ! -e "$rc" ]] && ! command -v zsh >/dev/null 2>&1; then
+      continue
+    fi
+
+    if [[ -f "$rc" ]] && grep -qF "$ECLIPSE_CLEAR_MARKER" "$rc" 2>/dev/null; then
+      continue
+    fi
+
+    cat >> "$rc" <<EOF_CLEARFIX
+
+$ECLIPSE_CLEAR_MARKER
+# Чистит экран вместе с буфером прокрутки (\\033[3J), а не только видимую часть.
+clear() {
+    printf '\\033[2J\\033[3J\\033[H'
+}
+# <<< eclipse clear fix <<<
+EOF_CLEARFIX
+
+    changed=1
+    log_line "clear fix appended to $rc"
+  done
+
+  [[ "$changed" -eq 1 ]] && return 0
+  return 1
+}
+
 # Создаёт короткую команду `eclipse` для запуска менеджера. Если системной
 # копии скрипта ещё нет — сохраняет туда текущий файл, затем делает симлинк.
 ensure_eclipse_command() {
+  # Ставим заодно фикс clear — функция идемпотентна, повторные запуски ничего
+  # не дописывают. В ТЕКУЩЕЙ оболочке он не подхватится (её rc уже прочитан):
+  # нужен новый вход по SSH или `source ~/.bashrc`. Меню это не касается — оно
+  # чистит экран через clear_screen напрямую.
+  install_clear_fix >/dev/null 2>&1 || true
+
   if [[ ! -s "$SCRIPT_PATH" ]]; then
     local src
     src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
@@ -5682,6 +5746,8 @@ manage_firewall() {
 
   local choice port ans
   while true; do
+    clear_screen
+    section "Настройка портов (UFW)"
     firewall_show
     echo
     echo "  ${C_GREEN}1${C_RESET}) Разрешить порт"
@@ -5693,6 +5759,10 @@ manage_firewall() {
     echo "  ${C_YELLOW}0${C_RESET}) Назад"
     echo
     ask choice "  Выбор: "
+
+    case "${choice:-}" in
+      [1-6]) clear_screen ;;
+    esac
 
     case "${choice:-}" in
       1)
@@ -5759,11 +5829,15 @@ manage_firewall() {
           warn "Не удалось выключить UFW."
         fi
         ;;
-      5) ;;
+      5) continue ;;
       6) ufw_setup_panel_access || true ;;
       0|"") break ;;
       *) warn "Некорректный выбор." ;;
     esac
+
+    # Экран чистится в начале следующей итерации, поэтому без паузы результат
+    # («Разрешён порт 2222») мелькнул бы и пропал.
+    pause_menu
   done
 }
 
@@ -6838,6 +6912,7 @@ eclipse_firewall_menu() {
   need_root
 
   while true; do
+    clear_screen
     section "Eclipse Firewall (nftables)"
     echo
     echo "  ${C_GREEN}1${C_RESET}) Порт ноды — только для панели ${C_DIM}(указать домен панели)${C_RESET}"
@@ -6851,6 +6926,10 @@ eclipse_firewall_menu() {
 
     local choice
     ask choice "  Выбор [1/2/3/4/5/6/0]: " || choice="0"
+
+    case "${choice:-}" in
+      [1-6]) clear_screen ;;
+    esac
 
     case "${choice:-}" in
       1) na_set_panel_domain; pause_menu ;;
@@ -6899,6 +6978,13 @@ main_menu() {
     echo
 
     ask choice "  Выбор [1..12/0]: " || choice="0"
+
+    # Перед выполнением пункта чистим экран, чтобы на нём остался только вывод
+    # этого пункта. Неверный выбор сюда не попадает — его предупреждение должно
+    # быть видно на фоне меню.
+    case "${choice:-}" in
+      [1-9]|1[0-2]) clear_screen ;;
+    esac
 
     case "${choice:-}" in
       1)
