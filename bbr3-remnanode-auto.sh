@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.7.0"
+SCRIPT_VERSION="3.7.1"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -85,6 +85,13 @@ XRAY_CORE_REPO="XTLS/Xray-core"
 
 # Куда ставить wrapper-команду для быстрого запуска (eclipse).
 ECLIPSE_CMD="/usr/local/bin/eclipse"
+
+# Общий каталог состояния Eclipse: домен панели, режим фаервола, лимит канала.
+# Определён ЗДЕСЬ, а не в секции фаервола ниже, потому что на него ссылаются
+# присваивания верхнего уровня из более ранних секций (например,
+# ECLIPSE_SHAPE_FILE). Под `set -u` ссылка на ещё не заданную переменную роняет
+# скрипт сразу при загрузке — и bash -n такое не ловит, только реальный запуск.
+ECLIPSE_FW_DIR="/etc/eclipse"
 
 # Случайный суффикс для тегов инбаундов (схема: протокол+порт+рандом), чтобы
 # имена были уникальными между нодами и их не приходилось править руками.
@@ -767,6 +774,12 @@ ensure_saved_script_is_latest() {
       return 0
     fi
 
+    if ! script_loads_ok "$tmp"; then
+      rm -f "$tmp"
+      warn "Удалённый скрипт новее, но падает при загрузке. Оставляю текущую локальную копию."
+      return 0
+    fi
+
     mv -f "$tmp" "$SCRIPT_PATH"
     chmod 700 "$SCRIPT_PATH"
     ok "Системная копия обновлена с GitHub до версии $remote_version"
@@ -842,6 +855,21 @@ sha256_text() {
   printf '%s\n' "$1" | sha256sum | awk '{print $1}'
 }
 
+# Проверяет, что скрипт не только парсится, но и ЗАГРУЖАЕТСЯ: прогоняет его с
+# --help, то есть исполняет весь верхний уровень.
+#
+# Зачем отдельно от bash -n: под `set -u` ссылка на переменную, которая задаётся
+# ниже по файлу (например VAR="$LATER_VAR/x" на верхнем уровне), проходит
+# проверку синтаксиса, но роняет скрипт сразу при старте — "unbound variable".
+# Именно так версия 3.7.0 окирпичила команду eclipse на нодах: bash -n был
+# чистый, а скрипт не запускался вообще.
+script_loads_ok() {
+  local f="$1"
+
+  [[ -s "$f" ]] || return 1
+  timeout 30 bash "$f" --help >/dev/null 2>>"$LOG_FILE"
+}
+
 short_hash() {
   local h="${1:-}"
   [[ -n "$h" ]] && echo "${h:0:12}" || echo "unknown"
@@ -864,6 +892,13 @@ update_self_and_restart() {
   if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
     rm -f "$tmp"
     die "Скачанный скрипт не прошёл проверку синтаксиса (bash -n). Обновление отменено."
+  fi
+
+  # Мало распарситься — надо ещё загрузиться. Без этой проверки скрипт с
+  # unbound variable на верхнем уровне устанавливается и убивает команду eclipse.
+  if ! script_loads_ok "$tmp"; then
+    rm -f "$tmp"
+    die "Скачанный скрипт не запускается (падает при загрузке, см. $LOG_FILE). Обновление отменено, текущая версия оставлена."
   fi
 
   mv -f "$tmp" "$SCRIPT_PATH"
@@ -5998,7 +6033,8 @@ pause_menu() {
 # не подтвердит, что связь жива.
 # ============================================================================
 
-ECLIPSE_FW_DIR="/etc/eclipse"
+# ECLIPSE_FW_DIR задан в блоке констант в начале файла (на него ссылаются
+# присваивания верхнего уровня из секций выше).
 ECLIPSE_FW_FILE="$ECLIPSE_FW_DIR/na_filter.nft"
 ECLIPSE_FW_MODE_FILE="$ECLIPSE_FW_DIR/fw_mode"
 ECLIPSE_PANEL_DOMAIN_FILE="$ECLIPSE_FW_DIR/panel_domain"
