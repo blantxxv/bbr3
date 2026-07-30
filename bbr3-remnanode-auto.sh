@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.6.1"
+SCRIPT_VERSION="3.7.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -4673,6 +4673,11 @@ setup_remnanode() {
     fi
   fi
 
+  # Ограничение канала спрашиваем здесь, вместе с остальными параметрами:
+  # tc применяется мгновенно и не зависит от того, поднята ли уже нода.
+  section "Ограничение канала (опционально)"
+  bandwidth_prompt install || true
+
   echo
   echo "  Вставь SECRET_KEY из панели Remnawave."
   echo "  Ввод скрытый, это нормально."
@@ -5508,6 +5513,216 @@ EOF_HOOK
   info "После каждого обновления сертификата нода перезапустится автоматически."
 }
 
+# ── Ограничение исходящего канала (shaping через tc) ────────────────────────
+#
+# Ограничиваем именно ИСХОДЯЩУЮ скорость WAN-интерфейса: на VPN-ноде это то,
+# что уходит клиентам и в интернет, и именно за это считает трафик провайдер.
+# Входящий шейпить с самого хоста смысла нет — пакеты уже прошли по каналу, и
+# ingress-ограничение даёт только потери, от которых TCP становится хуже.
+#
+# Чем применяем:
+#   1) sch_cake, если модуль есть в ядре — одна строка, честное разделение
+#      между потоками и встроенное сглаживание. Лучший вариант для шейпинга,
+#      в XanMod и штатных ядрах Ubuntu/Debian он есть.
+#   2) Фоллбэк — HTB с fq на листе. fq на листе оставлен сознательно: BBR
+#      полагается на пакетное сглаживание (pacing), а замена root-qdisc на
+#      голый HTB его убирает.
+#
+# Значение хранится в файле, применяется systemd-юнитом при загрузке — иначе
+# qdisc теряется после каждого reboot и при переподнятии интерфейса.
+
+ECLIPSE_SHAPE_FILE="$ECLIPSE_FW_DIR/bandwidth_mbit"
+ECLIPSE_SHAPE_SCRIPT="/usr/local/sbin/eclipse-bandwidth.sh"
+
+# Текущее сохранённое ограничение в Мбит/с (пусто = ограничения нет).
+bandwidth_current() {
+  local v
+  v="$(tr -cd '0-9' < "$ECLIPSE_SHAPE_FILE" 2>/dev/null || true)"
+  [[ -n "$v" && "$v" != "0" ]] && echo "$v" || true
+}
+
+# Пишет на диск скрипт применения ограничения. Его же вызывает systemd при
+# загрузке, поэтому вся логика выбора qdisc живёт там, а не в меню.
+bandwidth_write_script() {
+  mkdir -p "$(dirname "$ECLIPSE_SHAPE_SCRIPT")" "$ECLIPSE_FW_DIR"
+
+  cat > "$ECLIPSE_SHAPE_SCRIPT" <<'SHAPE'
+#!/usr/bin/env bash
+# Применяет ограничение ИСХОДЯЩЕЙ скорости на WAN-интерфейсе.
+# Значение (Мбит/с) читается из /etc/eclipse/bandwidth_mbit.
+# Пусто, 0 или аргумент --clear = ограничения нет, qdisc сбрасывается.
+set -u
+
+LIMIT_FILE=/etc/eclipse/bandwidth_mbit
+
+IFACE="$(ip -4 route show default 2>/dev/null | awk '/default/{print $5; exit}')"
+if [ -z "${IFACE:-}" ]; then
+  echo "WAN-интерфейс не определён — нечего ограничивать."
+  exit 0
+fi
+
+if [ "${1:-}" = "--clear" ]; then
+  MBIT=""
+else
+  MBIT="$(tr -cd '0-9' < "$LIMIT_FILE" 2>/dev/null || true)"
+fi
+
+# Снимаем наш qdisc в любом случае: и при сбросе, и перед переприменением
+# (иначе повторный add вернёт "File exists").
+tc qdisc del dev "$IFACE" root 2>/dev/null || true
+
+if [ -z "$MBIT" ] || [ "$MBIT" = "0" ]; then
+  echo "Ограничение снято: $IFACE вернулся к дефолтному qdisc ядра."
+  exit 0
+fi
+
+# 1) CAKE — предпочтительный вариант.
+modprobe sch_cake 2>/dev/null || true
+if tc qdisc add dev "$IFACE" root cake bandwidth "${MBIT}mbit" 2>/dev/null; then
+  echo "CAKE: $IFACE ограничен ${MBIT} Мбит/с"
+  exit 0
+fi
+
+# 2) Фоллбэк HTB + fq на листе (fq нужен для pacing, на который опирается BBR).
+if tc qdisc add dev "$IFACE" root handle 1: htb default 10 2>/dev/null \
+  && tc class add dev "$IFACE" parent 1: classid 1:10 htb \
+       rate "${MBIT}mbit" ceil "${MBIT}mbit" burst 1mbit 2>/dev/null; then
+  tc qdisc add dev "$IFACE" parent 1:10 handle 10: fq 2>/dev/null || true
+  echo "HTB+fq: $IFACE ограничен ${MBIT} Мбит/с"
+  exit 0
+fi
+
+echo "Не удалось применить ограничение на $IFACE (проверь: tc qdisc show dev $IFACE)"
+exit 1
+SHAPE
+
+  chmod 755 "$ECLIPSE_SHAPE_SCRIPT"
+
+  cat > /etc/systemd/system/eclipse-bandwidth.service <<EOF_SHAPESVC
+[Unit]
+Description=Eclipse egress bandwidth limit (tc)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$ECLIPSE_SHAPE_SCRIPT
+ExecStop=-$ECLIPSE_SHAPE_SCRIPT --clear
+
+[Install]
+WantedBy=multi-user.target
+EOF_SHAPESVC
+
+  systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
+}
+
+# Применяет ограничение $1 Мбит/с (пусто/0 — снимает) и включает автозапуск.
+bandwidth_apply() {
+  local mbit="${1:-}"
+
+  command -v tc >/dev/null 2>&1 || run_cmd "Устанавливаю iproute2 (tc)" \
+    env DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 || true
+
+  mkdir -p "$ECLIPSE_FW_DIR"
+  bandwidth_write_script
+
+  if [[ -z "$mbit" || "$mbit" == "0" ]]; then
+    : > "$ECLIPSE_SHAPE_FILE"
+    "$ECLIPSE_SHAPE_SCRIPT" --clear | sed 's/^/  /' || true
+    systemctl disable --now eclipse-bandwidth.service >> "$LOG_FILE" 2>&1 || true
+    ok "Ограничение канала снято."
+    return 0
+  fi
+
+  echo "$mbit" > "$ECLIPSE_SHAPE_FILE"
+
+  if "$ECLIPSE_SHAPE_SCRIPT" | sed 's/^/  /'; then
+    systemctl enable --now eclipse-bandwidth.service >> "$LOG_FILE" 2>&1 || true
+    ok "Исходящая скорость ограничена: ${mbit} Мбит/с (применяется и после reboot)."
+  else
+    warn "Не удалось применить ограничение. Значение сохранено, но qdisc не встал."
+    return 1
+  fi
+}
+
+bandwidth_status() {
+  local iface cur
+  iface="$(detect_iface)"
+  cur="$(bandwidth_current)"
+
+  echo
+  if [[ -n "$cur" ]]; then
+    ok "Ограничение исходящей скорости: ${cur} Мбит/с (интерфейс ${iface:-неизвестен})"
+  else
+    info "Ограничения исходящей скорости нет."
+  fi
+
+  info "Автозапуск: $(systemctl is-enabled eclipse-bandwidth.service 2>/dev/null || echo '<не установлен>')"
+
+  if [[ -n "$iface" ]] && command -v tc >/dev/null 2>&1; then
+    echo
+    echo "${C_DIM}  Активный qdisc на $iface:${C_RESET}"
+    tc -s qdisc show dev "$iface" 2>/dev/null | sed 's/^/    /' || true
+  fi
+}
+
+# Спрашивает скорость и применяет. $1=install — формулировка для установки
+# (Enter = без ограничения); иначе меню (Enter = отмена, 0 = снять).
+bandwidth_prompt() {
+  local mode="${1:-menu}"
+  local iface cur input
+
+  iface="$(detect_iface)"
+  cur="$(bandwidth_current)"
+
+  echo
+  info "Ограничение вешается на ИСХОДЯЩИЙ трафик WAN-интерфейса (${iface:-не определён})."
+  info "Входящую скорость с самого сервера ограничить нельзя — трафик уже пришёл по каналу."
+  [[ -n "$cur" ]] && info "Сейчас установлено: ${cur} Мбит/с" || info "Сейчас ограничения нет."
+  echo
+
+  if [[ "$mode" == "install" ]]; then
+    ask input "  Ограничить канал? Если да — введи скорость в Мбит/с (Enter — без ограничения): "
+  else
+    ask input "  Скорость в Мбит/с (Enter — отмена, 0 — снять ограничение): "
+  fi
+
+  input="$(echo "${input:-}" | tr -d '[:space:]')"
+
+  if [[ -z "$input" ]]; then
+    if [[ "$mode" == "install" ]]; then
+      ok "Канал не ограничиваем."
+    else
+      info "Отменено, ничего не изменено."
+    fi
+    return 0
+  fi
+
+  if [[ "$input" == "0" ]]; then
+    bandwidth_apply ""
+    return 0
+  fi
+
+  if [[ ! "$input" =~ ^[0-9]+$ ]] || (( 10#$input < 1 || 10#$input > 100000 )); then
+    warn "Некорректная скорость. Нужно целое число от 1 до 100000 (Мбит/с)."
+    return 1
+  fi
+
+  bandwidth_apply "$((10#$input))"
+}
+
+manage_bandwidth() {
+  need_root
+  section "Ограничение канала (исходящая скорость)"
+
+  bandwidth_status
+  bandwidth_prompt menu || true
+
+  echo
+  bandwidth_status
+}
+
 # ── Ookla Speedtest ──────────────────────────────────────────────────────────
 
 # Ставит официальный Ookla Speedtest CLI (пакет speedtest) через их
@@ -6256,10 +6471,11 @@ main_menu() {
     echo "  ${C_CYAN}8${C_RESET}) Обновление ядра Xray"
     echo "  ${C_CYAN}9${C_RESET}) Настройка портов (UFW)"
     echo "  ${C_CYAN}10${C_RESET}) Eclipse Firewall (nftables): порт ноды для панели + защита"
+    echo "  ${C_CYAN}11${C_RESET}) Ограничение канала ${C_DIM}(исходящая скорость, Мбит/с)${C_RESET}"
     echo "  ${C_YELLOW}0${C_RESET}) Выход"
     echo
 
-    ask choice "  Выбор [1..10/0]: " || choice="0"
+    ask choice "  Выбор [1..11/0]: " || choice="0"
 
     case "${choice:-}" in
       1)
@@ -6299,6 +6515,10 @@ main_menu() {
         ;;
       10)
         eclipse_firewall_menu
+        ;;
+      11)
+        manage_bandwidth
+        pause_menu
         ;;
       0|q|Q|exit|quit)
         echo "Выход."
@@ -6350,6 +6570,10 @@ case "${1:-}" in
     need_root
     install_log_rotation
     ;;
+  --bandwidth|--limit|bandwidth|limit)
+    need_root
+    manage_bandwidth
+    ;;
   --xray-core|--update-xray|xray-core)
     need_root
     update_xray_core
@@ -6386,6 +6610,7 @@ case "${1:-}" in
   $0 --torrent-blocker  установить/обновить оба слоя Torrent Guard
   $0 --torrent-status   статус анти-торрент защиты
   $0 --logrotate        настроить суточную ротацию логов ноды и менеджера
+  $0 --bandwidth        ограничение исходящей скорости (Мбит/с)
   $0 --xray-core        обновить ядро Xray в контейнере ноды
   $0 --firewall         настройка портов (UFW)
   $0 --panel-port       порт ноды только для панели (nftables)
