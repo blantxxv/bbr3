@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.7.6"
+SCRIPT_VERSION="3.7.7"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -373,6 +373,112 @@ run_shell() {
   fail "$msg"
   log_line "FAIL: $msg rc=$rc"
   show_last_log
+  return "$rc"
+}
+
+# ── Скорость загрузок ────────────────────────────────────────────────────────
+#
+# Все скачивания в скрипте идут через run_download и печатают фактическую
+# среднюю скорость с цветовой оценкой. Это не украшательство: именно по этой
+# строке видно, что установка «висит» не из-за скрипта, а из-за медленного
+# зеркала — и что имеет смысл прервать шаг и перезапустить.
+#
+# Пороги в МБ/с (1 МБ/с = 8 Мбит/с):
+DL_SPEED_GOOD_MBS=10    # >= 10 МБ/с (~80 Мбит/с) — зелёный
+DL_SPEED_OKAY_MBS=2     # 2..10 МБ/с — жёлтый; ниже — красный
+
+# Ниже этой средней скорости за столько секунд curl обрывает попытку и уходит
+# на --retry (часто это выводит на другое зеркало). Файлы меньше DL_STALL_SECS
+# секунд качаются быстрее, чем срабатывает проверка, поэтому мелким загрузкам
+# это не мешает.
+DL_STALL_BYTES=51200    # 50 КБ/с
+DL_STALL_SECS=30
+
+# Ниже этого объёма оценка скорости не имеет смысла: время передачи
+# определяется рукопожатием TLS и задержкой до сервера, а не каналом. Такие
+# загрузки показываем без вердикта, иначе быстрый сервер получал бы красное
+# «низкая» просто потому, что файл маленький.
+DL_MIN_MEASURABLE_BYTES=1048576   # 1 МБ
+
+# Печатает цветную строку по данным curl: $1 — байт/с, $2 — всего байт,
+# $3 — секунд. Вся арифметика в awk: в bash нет плавающей точки, а curl
+# отдаёт скорость дробным числом.
+format_speed() {
+  awk -v bps="${1:-0}" -v bytes="${2:-0}" -v secs="${3:-0}" \
+      -v good="$DL_SPEED_GOOD_MBS" -v okay="$DL_SPEED_OKAY_MBS" \
+      -v minb="$DL_MIN_MEASURABLE_BYTES" \
+      -v g="$C_GREEN" -v y="$C_YELLOW" -v r="$C_RED" -v d="$C_DIM" -v z="$C_RESET" '
+    BEGIN {
+      mbs  = bps / 1048576;
+      mbit = bps * 8 / 1000000;
+
+      if (bytes < minb) {
+        printf "%s%.0f КБ за %.1f с (слишком мало для оценки скорости)%s",
+               d, bytes / 1024, secs, z;
+        exit;
+      }
+
+      if (mbs >= good)      { col = g; mark = "хорошая"; }
+      else if (mbs >= okay) { col = y; mark = "средняя"; }
+      else                  { col = r; mark = "низкая";  }
+
+      printf "%s%.1f МБ/с · %.0f Мбит/с · %s%s %s(%.1f МБ за %.1f с)%s",
+             col, mbs, mbit, mark, z, d, bytes / 1048576, secs, z;
+    }'
+}
+
+# Скачивает файл и печатает фактическую скорость.
+# run_download "Сообщение" <файл> <url> [доп. аргументы curl...]
+run_download() {
+  local msg="$1" dest="$2" url="$3"
+  shift 3
+
+  local stats rc bps bytes secs
+
+  mkdir -p "$(dirname "$LOG_FILE")"
+  log_line "START DL: $msg"
+  log_line "URL: $url"
+
+  if [[ "$DEBUG" != "1" ]]; then
+    spinner "$msg" &
+    SPINNER_PID="$!"
+  else
+    echo "${C_CYAN}  [..]${C_RESET} $msg"
+  fi
+
+  # -w печатает статистику в stdout, тело идёт в файл через -o, поэтому
+  # подстановка команды забирает ровно три числа и ничего лишнего.
+  set +e
+  stats="$(curl -fL --retry 3 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
+    --speed-limit "$DL_STALL_BYTES" --speed-time "$DL_STALL_SECS" \
+    -w '%{speed_download} %{size_download} %{time_total}' \
+    -o "$dest" "$@" "$url" 2>>"$LOG_FILE")"
+  rc=$?
+  set -e
+
+  if [[ "$DEBUG" != "1" ]]; then
+    cleanup_spinner
+    printf "\r\033[K"
+  fi
+
+  read -r bps bytes secs <<< "${stats:-0 0 0}"
+  log_line "DL stats: rc=$rc speed=${bps:-0}B/s size=${bytes:-0} time=${secs:-0}"
+
+  if [[ "$rc" -eq 0 ]]; then
+    ok "$msg"
+    echo "         $(format_speed "${bps:-0}" "${bytes:-0}" "${secs:-0}")"
+    return 0
+  fi
+
+  # 28 — таймаут curl, в том числе срабатывание --speed-limit. Для пользователя
+  # это принципиально другая ситуация, чем 404: файл есть, но зеркало не тянет.
+  if [[ "$rc" -eq 28 ]]; then
+    fail "$msg — зеркало отдаёт медленнее ${DL_STALL_BYTES} Б/с, попытки прерваны."
+  else
+    fail "$msg (curl rc=$rc)"
+  fi
+
+  log_line "FAIL DL: $msg rc=$rc"
   return "$rc"
 }
 
@@ -1397,26 +1503,74 @@ setup_xanmod_repo() {
     return 1
   fi
 
-  # Пробуем и http, и https — иногда у deb.xanmod.org (за Cloudflare) битый
-  # только один из эндпоинтов. apt-get update гоняем тихо: недоступный XanMod
-  # это не сбой установки (нода поставится и без своего ядра), поэтому не
-  # используем run_cmd, чтобы не пугать красным [FAIL] и не дампить лог.
-  local scheme
+  # Suite репозитория — КОДОВОЕ ИМЯ дистрибутива (bookworm, noble, trixie...),
+  # как в текущей официальной инструкции XanMod:
+  #   deb [signed-by=...] http://deb.xanmod.org $(lsb_release -sc) main
+  #
+  # Раньше здесь было жёстко прописано `releases`. Этот suite XanMod убрал —
+  # https://deb.xanmod.org/dists/releases/Release теперь отдаёт 404, apt-get
+  # update падает, и скрипт делал ложный вывод «репозиторий недоступен, беру
+  # ядро с SourceForge». Отсюда и многоминутное скачивание .deb с медленного
+  # зеркала при полностью живом APT-репозитории.
+  local codename="${OS_CODENAME:-}"
+  if [[ -z "$codename" || "$codename" == "unknown" ]]; then
+    codename="$(lsb_release -sc 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$codename" || "$codename" == "unknown" ]]; then
+    warn "Не удалось определить кодовое имя дистрибутива — репозиторий XanMod подключить нельзя."
+    return 1
+  fi
+
+  # Проверяем ИМЕННО наличие suite до подключения: так мы отличаем «XanMod не
+  # собирает пакеты для этого релиза» от «apt упал из-за чужого репозитория».
+  local scheme found_scheme=""
   for scheme in https http; do
-    echo "deb [signed-by=$XANMOD_KEYRING] ${scheme}://deb.xanmod.org releases main" > "$XANMOD_REPO_LIST"
-    log_line "XanMod repo: пробую ${scheme}://deb.xanmod.org"
-    if env DEBIAN_FRONTEND=noninteractive apt-get update >> "$LOG_FILE" 2>&1; then
-      ok "Репозиторий XanMod подключён (${scheme})."
-      return 0
+    if curl -fsI --connect-timeout 10 --max-time 30 \
+      "${scheme}://deb.xanmod.org/dists/${codename}/Release" >> "$LOG_FILE" 2>&1; then
+      found_scheme="$scheme"
+      break
     fi
+    log_line "XanMod repo: ${scheme}://deb.xanmod.org/dists/${codename}/Release недоступен"
   done
 
-  # Оба варианта не сработали — убираем .list, чтобы он не ломал apt на
-  # следующих шагах, и восстанавливаем чистый индекс.
-  warn "Репозиторий XanMod сейчас недоступен (deb.xanmod.org отдаёт 404 — временная проблема их CDN). Пропускаю ядро, продолжаю без него."
-  rm -f "$XANMOD_REPO_LIST"
-  env DEBIAN_FRONTEND=noninteractive apt-get update >> "$LOG_FILE" 2>&1 || true
-  return 1
+  if [[ -z "$found_scheme" ]]; then
+    warn "XanMod не публикует пакеты для этого релиза (suite '${codename}' на deb.xanmod.org отсутствует)."
+    return 1
+  fi
+
+  echo "deb [signed-by=$XANMOD_KEYRING] ${found_scheme}://deb.xanmod.org ${codename} main" > "$XANMOD_REPO_LIST"
+  log_line "XanMod repo: ${found_scheme}://deb.xanmod.org ${codename} main"
+
+  # apt-get update гоняем тихо: недоступный XanMod — не сбой установки (нода
+  # поставится и без своего ядра), поэтому не используем run_cmd, чтобы не
+  # пугать красным [FAIL] и не дампить лог.
+  local out rc
+  set +e
+  out="$(env DEBIAN_FRONTEND=noninteractive apt-get update 2>&1)"
+  rc=$?
+  set -e
+  printf '%s\n' "$out" >> "$LOG_FILE"
+
+  if [[ $rc -eq 0 ]]; then
+    ok "Репозиторий XanMod подключён (${found_scheme}, suite ${codename})."
+    return 0
+  fi
+
+  # apt-get update возвращает ненулевой код, если СЛОМАН ЛЮБОЙ подключённый
+  # репозиторий. Раньше это списывалось на XanMod, хотя ругаться мог чужой
+  # .list, оставшийся на сервере. Смотрим, упоминается ли в ошибках именно
+  # deb.xanmod.org, и только тогда отказываемся от репозитория.
+  if grep -qi 'deb\.xanmod\.org' <<< "$out"; then
+    warn "Репозиторий XanMod подключён, но apt его не принял (см. $LOG_FILE). Пропускаю ядро из APT."
+    rm -f "$XANMOD_REPO_LIST"
+    env DEBIAN_FRONTEND=noninteractive apt-get update >> "$LOG_FILE" 2>&1 || true
+    return 1
+  fi
+
+  warn "apt-get update ругается на ДРУГОЙ репозиторий (не XanMod) — XanMod оставляю подключённым."
+  ok "Репозиторий XanMod подключён (${found_scheme}, suite ${codename})."
+  return 0
 }
 
 # Делает установленное ядро XanMod ($1 = uname-версия, напр. 7.1.4-x64v3-xanmod1)
@@ -1520,9 +1674,9 @@ install_xanmod_from_sourceforge() {
   ok "Самое свежее ядро XanMod на SourceForge: ${kver:-неизвестно}"
 
   tmpdeb="$(mktemp --suffix=.deb 2>/dev/null || mktemp)"
-  if ! run_cmd "Скачиваю ядро XanMod с SourceForge ($kver)" \
-    curl -fL --connect-timeout 15 --max-time 900 --retry 3 --retry-delay 3 $CURL_RETRY_ALL_ERRORS_FLAG \
-    -o "$tmpdeb" "$url"; then
+  info "SourceForge отдаёт файл через случайное зеркало — скорость сильно зависит от того, какое досталось."
+  if ! run_download "Скачиваю ядро XanMod с SourceForge ($kver)" "$tmpdeb" "$url" \
+    --connect-timeout 15 --max-time 900; then
     rm -f "$tmpdeb"
     warn "Не удалось скачать .deb ядра с SourceForge."
     return 1
@@ -4852,12 +5006,35 @@ EOF_REALITY
 # по IP) пробует публичные зеркала из DOCKER_HUB_MIRRORS и перетегирует
 # образ обратно в исходное имя, чтобы docker compose не пытался качать его
 # заново.
+# Тянет образ и печатает приблизительную скорость.
+#
+# Приблизительную честно: docker не сообщает объём скачанного, а размер образа
+# на диске — это уже РАСПАКОВАННЫЕ слои, обычно в 2-3 раза больше того, что
+# реально прошло по сети. Как индикатор «быстро/медленно» этого достаточно,
+# поэтому число помечено «≈».
+docker_pull_timed() {
+  local msg="$1" image="$2"
+  local t0 dt size
+
+  t0="$SECONDS"
+  run_cmd "$msg" docker pull "$image" || return 1
+  dt=$(( SECONDS - t0 ))
+  (( dt > 0 )) || dt=1
+
+  size="$(docker image inspect --format '{{.Size}}' "$image" 2>/dev/null || true)"
+  if [[ "$size" =~ ^[0-9]+$ ]]; then
+    echo "         ≈ $(format_speed "$(( size / dt ))" "$size" "$dt")"
+  fi
+
+  return 0
+}
+
 pull_docker_image_with_fallback() {
   local image="$1"
   local attempt mirror mirror_image
 
   for attempt in 1 2 3; do
-    if run_cmd "Скачиваю образ $image (попытка $attempt/3)" docker pull "$image"; then
+    if docker_pull_timed "Скачиваю образ $image (попытка $attempt/3)" "$image"; then
       return 0
     fi
     sleep 5
@@ -4868,7 +5045,7 @@ pull_docker_image_with_fallback() {
   for mirror in "${DOCKER_HUB_MIRRORS[@]}"; do
     mirror_image="${mirror}/${image}"
 
-    if run_cmd "Скачиваю образ через зеркало $mirror" docker pull "$mirror_image"; then
+    if docker_pull_timed "Скачиваю образ через зеркало $mirror" "$mirror_image"; then
       if run_cmd "Перетегирую образ в $image" docker tag "$mirror_image" "$image"; then
         ok "Образ $image получен через зеркало $mirror"
         return 0
@@ -5010,25 +5187,15 @@ setup_remnanode() {
   # Один суффикс на ноду — все её теги инбаундов будут уникальны между нодами.
   TAG_SUFFIX="$(gen_tag_suffix)"
 
-  run_cmd "Скачиваю geosite.dat" \
-    curl -fsSL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
-    -o geosite.dat \
-    https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+  run_download "Скачиваю geosite.dat" geosite.dat \
+    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
 
-  run_cmd "Скачиваю geoip.dat" \
-    curl -fsSL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
-    -o geoip.dat \
-    https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+  run_download "Скачиваю geoip.dat" geoip.dat \
+    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
 
-  run_cmd "Скачиваю geosite_2.dat (RU rules)" \
-    curl -fsSL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
-    -o geosite_2.dat \
-    "$RU_GEOSITE_URL"
+  run_download "Скачиваю geosite_2.dat (RU rules)" geosite_2.dat "$RU_GEOSITE_URL"
 
-  run_cmd "Скачиваю geoip_2.dat (RU rules)" \
-    curl -fsSL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
-    -o geoip_2.dat \
-    "$RU_GEOIP_URL"
+  run_download "Скачиваю geoip_2.dat (RU rules)" geoip_2.dat "$RU_GEOIP_URL"
 
   # Каталог логов создаём и наполняем ДО первого старта контейнера: compose
   # монтирует ./logs в /var/log/remnanode, и если каталога нет, docker создаст
@@ -5320,8 +5487,7 @@ download_xray_core() {
 
   info "Архитектура сервера · ассет ядра: $asset"
 
-  if ! run_cmd "Скачиваю Xray $tag" \
-    curl -fL --retry 5 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG -o "$tmpdir/xray.zip" "$url"; then
+  if ! run_download "Скачиваю Xray $tag" "$tmpdir/xray.zip" "$url"; then
     rm -rf "$tmpdir"
     warn "Не удалось скачать ядро Xray $tag ($asset). Проверь, что такой релиз/ассет существует."
     return 1
