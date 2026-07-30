@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.3.0"
+SCRIPT_VERSION="3.4.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -2543,26 +2543,517 @@ run_warp_setup() {
   fi
 }
 
+# ============================================================================
+# Torrent Guard — объединённая защита ноды от торрентов.
+#
+# Здесь слиты в один модуль два независимых блокера, которые решают РАЗНЫЕ
+# половины задачи и поэтому дополняют друг друга:
+#
+#   Слой A — ds-guard (DoubleServers VPS Guard v1.6): ГЛУШИТ САМ ТРАФИК на
+#     выходе с сервера.
+#       L1 nDPI     — модуль ядра xt_ndpi + правило
+#                     iptables -o WAN -m ndpi --proto bittorrent -j DROP
+#                     (настоящая классификация протокола, не только порты)
+#       L2 Suricata — IPS через NFQUEUE на исходящий UDP: DHT, uTP, UDP-трекеры,
+#                     LSD BT-SEARCH, HTTP-announce/scrape, торрентовые User-Agent
+#       L3 domains  — цепочка DS_DOMAINS: -m string блок домена packetsdk
+#                     (абуз proxy-SDK) плюс свои домены
+#       Self-heal   — systemd-таймер каждые 5 минут заново вставляет правила
+#                     (их сносит перезагрузка ufw/docker), а DKMS пересобирает
+#                     модуль ядра после его обновления.
+#     Вендор раздаёт этот слой как shc-бинарник (закрытый). Его исходник
+#     распакован и вшит в скрипт целиком (tg_write_guard_script) — ничего
+#     закрытого с чужого хоста больше не скачивается и не запускается от root.
+#
+#   Слой B — torrent-blocker (Go, mahmudali1337-lab): БАНИТ КЛИЕНТА, который
+#     торрентит. Читает access.log xray по тегу TORRENT, плюс эвристики по
+#     netstat (шторм FIN_WAIT, много ESTABLISHED с большой send-queue). Банит IP
+#     клиента и IP пиров/трекеров (ipset auto_peers/auto_trackers, цепочки
+#     TORRENT_DPI / TORRENT_BAN / TORRENT_PEERS).
+#
+# Конфликта цепочек между слоями нет — у каждого свои. Оба вставляют правила в
+# начало OUTPUT, и это нормально: порядок DROP'ов между собой не важен.
+#
+# Отличия вшитого слоя A от вендорского бинарника (помечены "# [eclipse]"):
+#   - читает настройки из $TG_CONFIG, чтобы выбор в меню жил после перезагрузки;
+#   - Suricata (L2) выключается отдельно от nDPI (L1): на Hysteria2-нодах весь
+#     исходящий UDP через NFQUEUE — заметная нагрузка, иногда её лучше не платить.
+# ============================================================================
+
+TG_DIR="/etc/ds-guard"
+TG_CONFIG="$TG_DIR/config"
+TG_SCRIPT="/usr/local/sbin/eclipse-torrent-guard.sh"
+TG_LOG="/var/log/ds-guard-install.log"
+
+# Настройки слоёв (перезаписываются из $TG_CONFIG).
+TG_TORRENT=1
+TG_SURICATA=1
+TG_PACKETSDK=1
+TG_DOMAINS=""
+
 is_torrent_blocker_installed() {
   [[ -x "$TORRENT_BLOCKER_BIN" ]]
 }
 
-install_torrent_blocker() {
-  section "Torrent Blocker"
+tg_guard_installed() {
+  [[ -x "$TG_SCRIPT" ]]
+}
 
-  if is_torrent_blocker_installed; then
-    ok "Torrent Blocker уже установлен: $TORRENT_BLOCKER_BIN"
-    info "Переустанавливаю: останавливаю сервис, удаляю бинарник, ставлю заново."
+tg_load_config() {
+  [[ -r "$TG_CONFIG" ]] || return 0
 
-    run_shell "Останавливаю и удаляю старую версию Torrent Blocker" \
-      "systemctl stop torrent-blocker >/dev/null 2>&1 || true; rm -f '$TORRENT_BLOCKER_BIN'"
-  else
-    info "Torrent Blocker не найден на сервере. Устанавливаю с нуля."
+  # Локальные — чтобы значения из файла не оставались глобальными и не
+  # перебивали то, что пользователь только что переключил в меню настроек.
+  local DS_TORRENT DS_SURICATA DS_PACKETSDK DS_DOMAINS
+  # shellcheck disable=SC1090
+  source "$TG_CONFIG" 2>/dev/null || return 0
+
+  TG_TORRENT="${DS_TORRENT:-$TG_TORRENT}"
+  TG_SURICATA="${DS_SURICATA:-$TG_SURICATA}"
+  TG_PACKETSDK="${DS_PACKETSDK:-$TG_PACKETSDK}"
+  TG_DOMAINS="${DS_DOMAINS:-$TG_DOMAINS}"
+}
+
+tg_save_config() {
+  mkdir -p "$TG_DIR"
+  cat > "$TG_CONFIG" <<CFG
+# Настройки Torrent Guard. Файл читают и сам guard-скрипт, и Eclipse Node Manager.
+DS_TORRENT=$TG_TORRENT
+DS_SURICATA=$TG_SURICATA
+DS_PACKETSDK=$TG_PACKETSDK
+DS_DOMAINS="$TG_DOMAINS"
+CFG
+  chmod 600 "$TG_CONFIG"
+}
+
+# Записывает на диск guard-скрипт (слой A). Внешний heredoc в кавычках ('GUARD'),
+# поэтому весь текст попадает на диск как есть, без подстановок.
+tg_write_guard_script() {
+  mkdir -p "$(dirname "$TG_SCRIPT")" "$TG_DIR"
+
+  cat > "$TG_SCRIPT" <<'GUARD'
+#!/bin/bash
+# =============================================================================
+#  ds-guard.sh  —  DoubleServers VPS Guard (anti-torrent + packetsdk block)
+#
+#  Universal, self-healing installer for Ubuntu (all) / Debian 11/12/13.
+#  What it installs (each auto-skipped if prerequisites are missing):
+#    L1 nDPI     : inline DROP of BitTorrent (TCP peer-wire + UDP) via xt_ndpi
+#    L2 Suricata : NFQUEUE IPS on UDP egress — DHT / uTP / tracker (ds-p2p rules)
+#    L3 Domains  : SNI/HTTP-Host/DNS string-block of packetsdk (proxy-SDK abuse)
+#                  + any extra domains via DS_DOMAINS
+#
+#  Non-interactive. Idempotent. Reboot- and firewall-reload-safe. Self-heals
+#  the nDPI kernel module across kernel upgrades (DKMS + ExecStartPre).
+#
+#  Config via environment (all optional):
+#    DS_TORRENT=1     enable L1 nDPI + L2 Suricata-UDP           (default 1)
+#    DS_SURICATA=1    enable L2 Suricata separately from L1      (default 1)
+#    DS_PACKETSDK=1   block packetsdk domain (built-in)          (default 1)
+#    DS_DOMAINS=""    extra domains to block (space/comma list)  (default none)
+#    DS_WAN=auto      egress interface                           (default auto)
+#
+#  Usage:  ds-guard.sh [--uninstall] [--status] [--dry-run]
+#  Exit:   0 ok / partial-ok, 1 fatal (unsupported OS / no WAN)
+# =============================================================================
+set -u
+export DEBIAN_FRONTEND=noninteractive
+VERSION="1.6"
+LOG=/var/log/ds-guard-install.log
+NDPI_REPO="https://github.com/vel21ripn/nDPI.git"
+NDPI_BRANCH="flow_info-4"
+STATE_DIR=/etc/ds-guard
+SBIN=/usr/local/sbin
+
+# [eclipse] Настройки из файла, чтобы выбор в меню Eclipse Node Manager жил
+# после перезагрузки и переустановки. Переменные окружения имеют приоритет.
+[ -r "$STATE_DIR/config" ] && . "$STATE_DIR/config"
+
+DS_TORRENT="${DS_TORRENT:-1}"
+DS_SURICATA="${DS_SURICATA:-1}"   # [eclipse] L2 отключается отдельно от L1
+DS_PACKETSDK="${DS_PACKETSDK:-1}"
+DS_DOMAINS="${DS_DOMAINS:-}"
+DS_WAN="${DS_WAN:-auto}"
+
+c_g="\033[32m"; c_y="\033[33m"; c_r="\033[31m"; c_0="\033[0m"
+log(){ printf '%s %b\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG" ; }
+ok(){  log "${c_g}[ OK ]${c_0} $*"; }
+warn(){ log "${c_y}[WARN]${c_0} $*"; }
+err(){ log "${c_r}[FAIL]${c_0} $*"; }
+die(){ err "$*"; log "aborting."; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+retry(){ local n=$1; shift; local i=1; until "$@"; do [ "$i" -ge "$n" ] && return 1; warn "retry $i/$n"; sleep $((i*3)); i=$((i+1)); done; }
+APT_NET_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=25 -o Acquire::https::Timeout=25"
+apt_install(){ retry 3 apt-get $APT_NET_OPTS -o DPkg::Lock::Timeout=300 -y -q install "$@" >>"$LOG" 2>&1; }
+ensure_repos(){
+  # nDPI/Suricata build deps (dkms, libpcap-dev, libxtables-dev, suricata, flex, bison...)
+  # live in the 'universe' component. Minimal/cloud images sometimes ship without it,
+  # which makes those packages "have no installation candidate". Enable it before deps.
+  if grep -rhqs -E 'universe' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+    return 0
+  fi
+  log "universe repo not enabled — adding it (needed for build deps + suricata)"
+  local did=0 f
+  # deb822 format (Ubuntu 24.04 /etc/apt/sources.list.d/ubuntu.sources)
+  for f in /etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    if grep -q '^Components:' "$f" && ! grep -q '^Components:.*universe' "$f"; then
+      sed -i -E '/^Components:/ s/$/ universe/' "$f"; did=1
+    fi
+  done
+  # legacy one-line format (deb ... noble main ...)
+  if [ -f /etc/apt/sources.list ] && grep -qE '^[[:space:]]*deb .* main' /etc/apt/sources.list && ! grep -qE '^[[:space:]]*deb .* universe' /etc/apt/sources.list; then
+    sed -i -E '/^[[:space:]]*deb .* main/ { /universe/! s/[[:space:]]*$/ universe/ }' /etc/apt/sources.list; did=1
+  fi
+  # last resort
+  if [ "$did" = 0 ] && have add-apt-repository; then
+    add-apt-repository -y universe >>"$LOG" 2>&1 && did=1
+  fi
+  [ "$did" = 1 ] && ok "universe enabled" || warn "could not enable universe automatically"
+}
+
+# ============================ PREFLIGHT =====================================
+preflight(){
+  [ "$(id -u)" = 0 ] || die "must run as root"
+  mkdir -p "$STATE_DIR" "$SBIN"
+  : > "$LOG" 2>/dev/null || LOG=/tmp/ds-guard-install.log
+  log "=== ds-guard v$VERSION  $(date -u) ==="
+  [ -r /etc/os-release ] || die "no /etc/os-release"
+  . /etc/os-release
+  case "${ID:-}" in
+    ubuntu|debian) ok "OS: ${ID} ${VERSION_ID:-?}";;
+    *) die "unsupported OS '${ID:-?}' (Ubuntu/Debian only)";;
+  esac
+  KREL="$(uname -r)"
+  VIRT="$(systemd-detect-virt 2>/dev/null || echo unknown)"
+  case "$VIRT" in
+    openvz|lxc|lxc-libvirt|docker|podman|wsl) MODULES_OK=0; warn "virt=$VIRT — container: kernel modules not loadable (nDPI/NFQUEUE limited)";;
+    *) MODULES_OK=1; ok "virt=$VIRT — own kernel";;
+  esac
+  if [ "$DS_WAN" = auto ]; then WAN="$(ip -4 route show default 2>/dev/null | awk '/default/{print $5; exit}')"; else WAN="$DS_WAN"; fi
+  { [ -n "${WAN:-}" ] && ip link show "$WAN" >/dev/null 2>&1; } || die "cannot determine WAN interface (set DS_WAN=)"
+  ok "WAN interface: $WAN"
+  have iptables || apt_install iptables
+  IPT="iptables -w"; $IPT -S >/dev/null 2>&1 || die "iptables not functional"
+  [ -d "/lib/modules/$KREL/build" ] && HEADERS_OK=1 || HEADERS_OK=0
+}
+
+base_deps(){
+  log "--- apt update + base deps ---"
+  ensure_repos
+  if ! retry 3 apt-get $APT_NET_OPTS -o DPkg::Lock::Timeout=300 -y -q update >>"$LOG" 2>&1; then
+    warn "apt update failed — falling back to archive.ubuntu.com"
+    sed -i -E 's#https?://mirror\.hetzner\.com/ubuntu/packages#http://archive.ubuntu.com/ubuntu#g; s#https?://mirror\.hetzner\.com/ubuntu/security#http://security.ubuntu.com/ubuntu#g; s#https?://mirror\.hetzner\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+    retry 3 apt-get $APT_NET_OPTS -o DPkg::Lock::Timeout=300 -y -q update >>"$LOG" 2>&1 || warn "apt update issues (after fallback)"
+  fi
+  apt_install ca-certificates curl iptables >>"$LOG" 2>&1 || warn "some base deps failed"
+  STRING_OK=0; $IPT -m string -h >/dev/null 2>&1 && STRING_OK=1
+  NFQ_OK=0; modprobe nfnetlink_queue 2>/dev/null; $IPT -m conntrack -h >/dev/null 2>&1 && NFQ_OK=1
+  ok "caps: string=$STRING_OK nfqueue=$NFQ_OK headers=$HEADERS_OK modules=$MODULES_OK"
+}
+
+# ============================ L1: nDPI ======================================
+build_ndpi(){
+  [ "$MODULES_OK" = 1 ] || { warn "L1 nDPI skipped (container)"; return 1; }
+  # Re-run aware: was OUR nDPI already working before this run? If a rebuild
+  # then fails, we fall back to it so a re-run never breaks a healthy server.
+  local had_ndpi=0
+  if modprobe xt_ndpi 2>/dev/null && $IPT -m ndpi --help >/dev/null 2>&1; then had_ndpi=1; fi
+  [ "$had_ndpi" = 1 ] && log "--- L1: nDPI present — reinstalling (fresh rebuild) ---" || log "--- L1: installing nDPI (xt_ndpi) ---"
+  # Kernel toolchain: Clang-built kernels (XanMod / custom) need the LLVM
+  # toolchain for the out-of-tree module; a stock GCC kernel uses the default.
+  local KMAKE=""
+  if grep -qs 'CONFIG_CC_IS_CLANG=y' "/boot/config-$KREL" 2>/dev/null || grep -qi clang /proc/version 2>/dev/null; then
+    log "custom Clang-built kernel detected (e.g. XanMod) — building module with LLVM=1"
+    apt_install clang lld llvm || warn "clang/lld/llvm install failed"
+    KMAKE="LLVM=1"
+  fi
+  apt_install "linux-headers-$KREL" || true
+  if [ ! -d "/lib/modules/$KREL/build" ]; then
+    _da="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+    for _hp in linux-headers-generic "linux-headers-$_da" "linux-headers-cloud-$_da"; do apt_install "$_hp" && break; done
+  fi
+  [ -d "/lib/modules/$KREL/build" ] || { warn "no kernel headers for $KREL — L1 skipped"; return 1; }
+  apt_install build-essential git autoconf automake libtool pkg-config libpcap-dev libgcrypt20-dev flex bison libxtables-dev dkms || warn "some nDPI deps failed to install"
+  _miss=""; for _b in gcc make dkms pkg-config git; do have "$_b" || _miss="$_miss $_b"; done
+  [ -n "$_miss" ] && { warn "nDPI build tools missing:$_miss — L1 skipped (enable universe/base repos)"; return 1; }
+  cd /opt || return 1; rm -rf ndpi-build
+  retry 2 git clone --depth 1 -b "$NDPI_BRANCH" "$NDPI_REPO" ndpi-build >>"$LOG" 2>&1 || { warn "git clone failed"; return 1; }
+  ( cd /opt/ndpi-build && ./autogen.sh && ./configure && make -j"$(nproc)" ) >>"$LOG" 2>&1 || { warn "libnDPI build failed"; return 1; }
+  ( cd /opt/ndpi-build/ndpi-netfilter && make -j"$(nproc)" $KMAKE ) >>"$LOG" 2>&1
+  local KO SO; KO=$(find /opt/ndpi-build -name xt_ndpi.ko|head -1); SO=$(find /opt/ndpi-build -name libxt_ndpi.so|head -1)
+  if [ -z "$KO" ] || [ -z "$SO" ]; then
+    if [ "$had_ndpi" = 1 ]; then warn "nDPI rebuild did not complete — keeping the existing working module"; ndpi_conf; return 0; fi
+    warn "L1 nDPI skipped (module could not be built on this kernel)"; return 1
   fi
 
-  if run_shell_live "Скачиваю и устанавливаю Torrent Blocker" \
+  rm -rf /usr/src/ndpi-1.0; cp -a /opt/ndpi-build /usr/src/ndpi-1.0
+  cat > /usr/src/ndpi-1.0/dkms.conf <<DK
+PACKAGE_NAME="ndpi"
+PACKAGE_VERSION="1.0"
+BUILT_MODULE_NAME[0]="xt_ndpi"
+BUILT_MODULE_LOCATION[0]="ndpi-netfilter/src"
+DEST_MODULE_LOCATION[0]="/updates/dkms"
+MAKE[0]="make -C ndpi-netfilter/src KERNEL_DIR=/lib/modules/\${kernelver}/build modules $KMAKE"
+CLEAN="make -C ndpi-netfilter/src KERNEL_DIR=/lib/modules/\${kernelver}/build clean"
+AUTOINSTALL="yes"
+DK
+  dkms add -m ndpi -v 1.0 >>"$LOG" 2>&1; dkms build -m ndpi -v 1.0 >>"$LOG" 2>&1; dkms install -m ndpi -v 1.0 --force >>"$LOG" 2>&1
+  modinfo xt_ndpi >/dev/null 2>&1 || { mkdir -p "/lib/modules/$KREL/updates/dkms"; cp "$KO" "/lib/modules/$KREL/updates/dkms/"; depmod -a; }
+  local XTDIR; XTDIR="$(pkg-config --variable=xtlibdir xtables 2>/dev/null || echo /usr/lib/$(uname -m)-linux-gnu/xtables)"
+  cp "$SO" "$XTDIR/libxt_ndpi.so" 2>/dev/null
+  ndpi_conf
+  # Reinstall refreshes the on-disk module (DKMS) + userspace lib; the running
+  # module stays loaded (no live churn) and the OUTPUT rule is left to the
+  # enforcer (install_enforcer / 5-min timer), so a re-run never drops it.
+  modprobe xt_ndpi 2>/dev/null && $IPT -m ndpi --help >/dev/null 2>&1 && { ok "L1 nDPI (re)installed + loaded (bt_hash=32)"; return 0; }
+  warn "xt_ndpi built but not loadable — L1 degraded"; return 1
+}
+ndpi_conf(){ echo 'options xt_ndpi bt_hash_size=32 bt_hash_timeout=1200' > /etc/modprobe.d/xt_ndpi.conf; echo 'xt_ndpi' > /etc/modules-load.d/xt_ndpi.conf; }
+
+# ============================ L2: Suricata (UDP only) =======================
+setup_suricata(){
+  [ "$NFQ_OK" = 1 ] || { warn "L2 Suricata skipped (no NFQUEUE)"; return 1; }
+  log "--- L2: Suricata (NFQUEUE, UDP) ---"
+  have suricata || apt_install suricata || { warn "suricata install failed — L2 skipped"; return 1; }
+  mkdir -p /etc/suricata/rules; write_ds_p2p_rules
+  sed -i 's|^default-rule-path:.*|default-rule-path: /etc/suricata/rules|' /etc/suricata/suricata.yaml 2>/dev/null
+  sed -i 's|^\([[:space:]]*\)- suricata.rules|\1- ds-p2p.rules|' /etc/suricata/suricata.yaml 2>/dev/null
+  grep -q 'ds-p2p.rules' /etc/suricata/suricata.yaml 2>/dev/null || sed -i 's|^rule-files:.*|rule-files:\n  - ds-p2p.rules|' /etc/suricata/suricata.yaml 2>/dev/null
+  mkdir -p /etc/systemd/system/suricata.service.d
+  cat > /etc/systemd/system/suricata.service.d/nfqueue.conf <<'OVR'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/suricata -D -q 0 -q 1 -c /etc/suricata/suricata.yaml --pidfile /run/suricata.pid
+OVR
+  systemctl daemon-reload; systemctl reset-failed suricata 2>/dev/null
+  suricata -T -c /etc/suricata/suricata.yaml >>"$LOG" 2>&1 || warn "suricata -T reported issues"
+  systemctl enable suricata >>"$LOG" 2>&1; retry 2 systemctl restart suricata; sleep 2
+  [ "$(systemctl is-active suricata)" = active ] && { ok "L2 Suricata active (NFQUEUE UDP)"; return 0; }
+  warn "suricata not active — L2 degraded"; return 1
+}
+write_ds_p2p_rules(){
+cat > /etc/suricata/rules/ds-p2p.rules <<'RULES'
+# DoubleServers focused P2P / torrent detection (fed UDP-only via NFQUEUE).
+drop tcp any any -> any any (msg:"DS P2P BitTorrent handshake"; flow:established; content:"|13|BitTorrent protocol"; depth:20; fast_pattern; classtype:policy-violation; sid:9000001; rev:1;)
+drop udp any any -> any any (msg:"DS P2P BitTorrent DHT query (id)"; content:"d1:ad2:id20:"; fast_pattern; classtype:policy-violation; sid:9000002; rev:1;)
+drop udp any any -> any any (msg:"DS P2P DHT get_peers"; content:"9:get_peers"; fast_pattern; classtype:policy-violation; sid:9000003; rev:1;)
+drop udp any any -> any any (msg:"DS P2P DHT announce_peer"; content:"13:announce_peer"; fast_pattern; classtype:policy-violation; sid:9000004; rev:1;)
+drop udp any any -> any any (msg:"DS P2P DHT find_node"; content:"9:find_node"; fast_pattern; classtype:policy-violation; sid:9000005; rev:1;)
+drop udp any any -> any any (msg:"DS P2P UDP tracker connect"; content:"|00 00 04 17 27 10 19 80|"; depth:8; offset:0; fast_pattern; classtype:policy-violation; sid:9000006; rev:1;)
+drop http any any -> any any (msg:"DS P2P HTTP tracker announce"; flow:to_server; http.uri; content:"info_hash="; fast_pattern; content:"peer_id="; classtype:policy-violation; sid:9000007; rev:1;)
+drop http any any -> any any (msg:"DS P2P HTTP tracker scrape"; flow:to_server; http.uri; content:"info_hash="; content:"/scrape"; classtype:policy-violation; sid:9000008; rev:1;)
+drop http any any -> any any (msg:"DS P2P torrent client User-Agent"; flow:to_server; http.user_agent; pcre:"/(uTorrent|BitTorrent\/|Transmission\/|libtorrent|Azureus|qBittorrent|Deluge|rtorrent|BitComet)/i"; classtype:policy-violation; sid:9000009; rev:1;)
+drop tcp any any -> any any (msg:"DS P2P BitTorrent LSD BT-SEARCH"; content:"BT-SEARCH "; depth:10; fast_pattern; classtype:policy-violation; sid:9000010; rev:1;)
+drop udp any any -> any any (msg:"DS P2P BitTorrent LSD BT-SEARCH (udp)"; content:"BT-SEARCH "; depth:10; fast_pattern; classtype:policy-violation; sid:9000011; rev:1;)
+drop udp any any -> any any (msg:"DS P2P BitTorrent uTP bencode"; content:"d1:rd2:id20:"; fast_pattern; classtype:policy-violation; sid:9000012; rev:1;)
+alert tcp any any -> any any (msg:"DS P2P magnet/info_hash in stream"; content:"xt=urn:btih:"; fast_pattern; classtype:policy-violation; sid:9000013; rev:1;)
+drop udp any any -> any any (msg:"DS P2P DHT ping (a id)"; content:"1:q4:ping"; fast_pattern; classtype:policy-violation; sid:9000014; rev:1;)
+RULES
+}
+
+# ============================ L3: domain block (packetsdk) ==================
+setup_domains(){
+  local list="$STATE_DIR/domains.txt"; : > "$list"
+  [ "$DS_PACKETSDK" = 1 ] && echo "packetsdk" >> "$list"
+  [ -n "$DS_DOMAINS" ] && echo "$DS_DOMAINS" | tr ', ' '\n' | sed '/^$/d' >> "$list"
+  sort -u "$list" -o "$list"
+  [ -s "$list" ] || { rm -f "$list"; return 0; }
+  [ "$STRING_OK" = 1 ] || { warn "L3 domain block skipped (no -m string)"; return 1; }
+  ok "L3 domain block list: $(tr '\n' ' ' <"$list")"
+  return 0
+}
+
+# ============================ enforcer + self-heal ==========================
+install_enforcer(){
+  cat > "$SBIN/ds-guard-ensure.sh" <<'ENS'
+#!/usr/bin/env bash
+set -u
+modprobe -q xt_ndpi 2>/dev/null && exit 0
+command -v dkms >/dev/null 2>&1 && dkms autoinstall -k "$(uname -r)" >/dev/null 2>&1
+modprobe -q xt_ndpi 2>/dev/null; exit 0
+ENS
+  cat > "$SBIN/ds-guard-apply.sh" <<APPLY
+#!/usr/bin/env bash
+# Re-assert egress protection at OUTPUT (top of chain, above UFW ACCEPT + NFQUEUE). Idempotent.
+set -u
+IPT="iptables -w"
+NIC="\$(ip -4 route show default 2>/dev/null | awk '/default/{print \$5; exit}')"
+[ -n "\$NIC" ] || exit 0
+LIST=$STATE_DIR/domains.txt
+del(){ while \$IPT -C OUTPUT \$1 2>/dev/null; do \$IPT -D OUTPUT \$1; done; }
+
+# --- L3 domain block chain (packetsdk etc.) ---
+if [ -s "\$LIST" ] && \$IPT -m string -h >/dev/null 2>&1; then
+  \$IPT -N DS_DOMAINS 2>/dev/null || \$IPT -F DS_DOMAINS
+  while IFS= read -r d; do [ -n "\$d" ] || continue
+    \$IPT -A DS_DOMAINS -m string --string "\$d" --algo bm --icase -m limit --limit 5/min -j LOG --log-prefix "DS-DOMBLK " 2>/dev/null
+    \$IPT -A DS_DOMAINS -m string --string "\$d" --algo bm --icase -j DROP
+  done < "\$LIST"
+fi
+
+# --- L1/L2 torrent ---
+if [ "${DS_TORRENT}" = 1 ]; then
+  modprobe -q xt_ndpi 2>/dev/null || true
+  R_NFQ="-o \$NIC -p udp -m conntrack --ctstate NEW -j NFQUEUE --queue-balance 0:1 --queue-bypass"
+  R_NDPI="-o \$NIC -m ndpi --proto bittorrent -j DROP"
+  # NFQUEUE: assert if Suricata is INSTALLED (not merely active). --queue-bypass keeps it
+  # safe while Suricata is (re)starting; this removes the first-boot race that left it off.
+  # [eclipse] плюс проверка DS_SURICATA: L2 можно выключить, оставив L1.
+  del "\$R_NFQ"
+  if [ "${DS_SURICATA}" = 1 ] && command -v suricata >/dev/null 2>&1; then \$IPT -I OUTPUT 1 \$R_NFQ; fi
+  # nDPI: let the freshly-built match settle before asserting the rule (bounded retry).
+  for _i in 1 2 3 4 5; do \$IPT -m ndpi --help >/dev/null 2>&1 && break; modprobe -q xt_ndpi 2>/dev/null; sleep 1; done
+  if \$IPT -m ndpi --help >/dev/null 2>&1; then del "\$R_NDPI"; \$IPT -I OUTPUT 1 \$R_NDPI; fi
+fi
+# domain-block jump LAST -> lands at OUTPUT pos 1 (above NFQUEUE so UDP DNS is caught)
+if \$IPT -L DS_DOMAINS -n >/dev/null 2>&1; then
+  while \$IPT -C OUTPUT -o "\$NIC" -j DS_DOMAINS 2>/dev/null; do \$IPT -D OUTPUT -o "\$NIC" -j DS_DOMAINS; done
+  \$IPT -I OUTPUT 1 -o "\$NIC" -j DS_DOMAINS
+fi
+exit 0
+APPLY
+  chmod +x "$SBIN/ds-guard-ensure.sh" "$SBIN/ds-guard-apply.sh"
+  cat > /etc/systemd/system/ds-guard.service <<'SVC'
+[Unit]
+Description=DoubleServers VPS Guard - anti-torrent + packetsdk block
+After=network-online.target suricata.service
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=600
+ExecStartPre=-/usr/local/sbin/ds-guard-ensure.sh
+ExecStart=/usr/local/sbin/ds-guard-apply.sh
+ExecStop=/bin/bash -c 'iptables -w -F DS_DOMAINS 2>/dev/null; true'
+[Install]
+WantedBy=multi-user.target
+SVC
+  cat > /etc/systemd/system/ds-guard-apply.service <<'ASVC'
+[Unit]
+Description=DoubleServers VPS Guard - re-assert egress rules (idempotent)
+After=network-online.target suricata.service
+[Service]
+Type=oneshot
+ExecStartPre=-/usr/local/sbin/ds-guard-ensure.sh
+ExecStart=/usr/local/sbin/ds-guard-apply.sh
+ASVC
+  cat > /etc/systemd/system/ds-guard.timer <<'TMR'
+[Unit]
+Description=DoubleServers VPS Guard - periodic rule re-assert (self-heal vs firewall reloads)
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=ds-guard-apply.service
+[Install]
+WantedBy=timers.target
+TMR
+  systemctl daemon-reload
+  systemctl enable --now ds-guard.service >>"$LOG" 2>&1
+  systemctl enable --now ds-guard.timer >>"$LOG" 2>&1
+  ok "enforcer + self-heal (5-min timer) installed (reboot & firewall-reload safe)"
+}
+
+# ============================ status / verify / uninstall ===================
+status(){
+  local IPT="iptables -w"
+  echo "== ds-guard status =="
+  echo "WAN: $(ip -4 route show default 2>/dev/null | awk '/default/{print $5; exit}')"
+  echo "xt_ndpi: loaded=$(lsmod 2>/dev/null|grep -c '^xt_ndpi') bt_hash=$(cat /sys/module/xt_ndpi/parameters/bt_hash_size 2>/dev/null)"
+  echo "suricata: $(systemctl is-active suricata 2>/dev/null)  ds-guard: $(systemctl is-active ds-guard 2>/dev/null)"
+  echo "domains blocked: $(tr '\n' ' ' </etc/ds-guard/domains.txt 2>/dev/null)"
+  echo "OUTPUT rules:"; $IPT -S OUTPUT 2>/dev/null | grep -iE 'ndpi|NFQUEUE|DS_DOMAINS' | sed 's/^/  /'
+  $IPT -L DS_DOMAINS -n -v 2>/dev/null | grep -i drop | sed 's/^/  domblk: /'
+}
+verify(){
+  local IPT="iptables -w" s=0 t=0
+  log "--- verify ---"
+  if [ "$DS_TORRENT" = 1 ]; then
+    t=$((t+1)); $IPT -S OUTPUT|grep -q 'ndpi --proto bittorrent' && { s=$((s+1)); ok "nDPI rule present"; } || warn "nDPI rule ABSENT"
+    if [ "$DS_SURICATA" = 1 ]; then
+      t=$((t+1)); systemctl is-active --quiet suricata && { s=$((s+1)); ok "suricata active"; } || warn "suricata not active"
+    fi
+  fi
+  if [ -s "$STATE_DIR/domains.txt" ]; then
+    t=$((t+1)); $IPT -S OUTPUT|grep -q 'DS_DOMAINS' && { s=$((s+1)); ok "domain-block (packetsdk) active"; } || warn "domain-block absent"
+  fi
+  log "verify: $s/$t layers confirmed"
+}
+uninstall(){
+  log "=== ds-guard uninstall ==="
+  systemctl disable --now ds-guard.timer ds-guard-apply.service ds-guard.service suricata 2>/dev/null
+  local IPT="iptables -w" NIC; NIC="$(ip -4 route show default|awk '/default/{print $5;exit}')"
+  for r in "-m ndpi --proto bittorrent -j DROP" "-p udp -m conntrack --ctstate NEW -j NFQUEUE --queue-balance 0:1 --queue-bypass" "-j DS_DOMAINS"; do
+    while $IPT -C OUTPUT -o "$NIC" $r 2>/dev/null; do $IPT -D OUTPUT -o "$NIC" $r; done
+  done
+  $IPT -F DS_DOMAINS 2>/dev/null; $IPT -X DS_DOMAINS 2>/dev/null
+  rm -f "$SBIN"/ds-guard-*.sh /etc/systemd/system/ds-guard.service /etc/systemd/system/ds-guard-apply.service /etc/systemd/system/ds-guard.timer /etc/systemd/system/suricata.service.d/nfqueue.conf
+  systemctl daemon-reload
+  ok "uninstalled (packages left; 'dkms remove ndpi/1.0 --all' to purge module)"; exit 0
+}
+
+# ============================ main ==========================================
+case "${1:-}" in
+  --uninstall) preflight; uninstall;;
+  --status)    status; exit 0;;
+esac
+preflight
+base_deps
+[ "${1:-}" = --dry-run ] && { status; exit 0; }
+# [eclipse] L1 и L2 включаются раздельно (DS_SURICATA).
+if [ "$DS_TORRENT" = 1 ]; then
+  build_ndpi
+  [ "$DS_SURICATA" = 1 ] && setup_suricata || warn "L2 Suricata disabled by config (DS_SURICATA=0)"
+fi
+setup_domains
+install_enforcer
+verify
+echo
+status
+log "=== done. log: $LOG ==="
+GUARD
+
+  chmod 700 "$TG_SCRIPT"
+}
+
+# Слой A: nDPI + Suricata + блок доменов. Долгий шаг (сборка модуля ядра из
+# исходников), поэтому вывод живой.
+install_torrent_guard_layer() {
+  section "Torrent Guard · слой A (nDPI + Suricata + домены)"
+
+  tg_load_config
+  tg_save_config
+  tg_write_guard_script
+  ok "Guard-скрипт записан: $TG_SCRIPT"
+
+  info "Слои: nDPI=$( [[ "$TG_TORRENT" == 1 ]] && echo вкл || echo выкл ) · Suricata=$( [[ "$TG_SURICATA" == 1 ]] && echo вкл || echo выкл ) · packetsdk=$( [[ "$TG_PACKETSDK" == 1 ]] && echo вкл || echo выкл )"
+  info "Сборка модуля ядра nDPI занимает несколько минут — это нормально."
+
+  if run_shell_live "Устанавливаю слой A (nDPI/Suricata/домены)" "'$TG_SCRIPT'"; then
+    ok "Слой A установлен. Правила переустанавливаются таймером ds-guard.timer каждые 5 мин."
+  else
+    warn "Слой A завершился с ошибкой. Лог: $TG_LOG"
+    return 1
+  fi
+}
+
+# Слой B: Go-блокер, который банит клиента по логам xray.
+install_torrent_blocker() {
+  section "Torrent Guard · слой B (torrent-blocker, бан клиентов)"
+
+  if is_torrent_blocker_installed; then
+    ok "torrent-blocker уже установлен: $TORRENT_BLOCKER_BIN"
+    info "Переустанавливаю: останавливаю сервис, удаляю бинарник, ставлю заново."
+
+    run_shell "Останавливаю и удаляю старую версию torrent-blocker" \
+      "systemctl stop torrent-blocker >/dev/null 2>&1 || true; rm -f '$TORRENT_BLOCKER_BIN'"
+  else
+    info "torrent-blocker не найден на сервере. Устанавливаю с нуля."
+  fi
+
+  if run_shell_live "Скачиваю и устанавливаю torrent-blocker" \
     "curl -fsSL '$TORRENT_BLOCKER_INSTALL_URL' | bash"; then
-    ok "Установка Torrent Blocker завершена."
+    ok "Установка torrent-blocker завершена."
 
     if systemctl is-active --quiet torrent-blocker 2>/dev/null; then
       ok "Сервис torrent-blocker активен."
@@ -2570,8 +3061,212 @@ install_torrent_blocker() {
       warn "Сервис torrent-blocker не выглядит активным. Проверь: systemctl status torrent-blocker"
     fi
   else
-    warn "Установка Torrent Blocker завершилась с ошибкой или была прервана. Смотри вывод выше."
+    warn "Установка torrent-blocker завершилась с ошибкой или была прервана. Смотри вывод выше."
+    return 1
   fi
+}
+
+install_torrent_guard_all() {
+  local rc=0
+
+  install_torrent_guard_layer || rc=1
+  install_torrent_blocker || rc=1
+
+  echo
+  if [[ "$rc" -eq 0 ]]; then
+    ok "Torrent Guard установлен полностью: трафик глушится (слой A), клиенты банятся (слой B)."
+  else
+    warn "Часть слоёв Torrent Guard не установилась. Подробности выше и в логах."
+  fi
+
+  return "$rc"
+}
+
+torrent_guard_status() {
+  section "Torrent Guard — статус"
+
+  tg_load_config
+
+  echo
+  echo "${C_BOLD}  Слой A · трафик (nDPI / Suricata / домены)${C_RESET}"
+  if tg_guard_installed; then
+    "$TG_SCRIPT" --status 2>/dev/null | sed 's/^/    /' || true
+    echo
+    info "Таймер self-heal: $(systemctl is-enabled ds-guard.timer 2>/dev/null || echo '<не установлен>') · $(systemctl is-active ds-guard.timer 2>/dev/null || echo inactive)"
+  else
+    warn "Слой A не установлен."
+  fi
+
+  echo
+  echo "${C_BOLD}  Слой B · бан клиентов (torrent-blocker)${C_RESET}"
+  if is_torrent_blocker_installed; then
+    info "Сервис: $(systemctl is-active torrent-blocker 2>/dev/null || echo inactive)"
+    "$TORRENT_BLOCKER_BIN" status 2>/dev/null | sed 's/^/    /' || warn "Не удалось получить статистику."
+  else
+    warn "Слой B не установлен."
+  fi
+}
+
+torrent_guard_logs() {
+  section "Torrent Guard — логи"
+
+  echo
+  echo "${C_DIM}  Установка слоя A (последние 30 строк $TG_LOG):${C_RESET}"
+  tail -n 30 "$TG_LOG" 2>/dev/null | sed 's/^/    /' || info "Лога пока нет."
+
+  echo
+  echo "${C_DIM}  Сработавшие правила Suricata (ds-p2p, последние 20):${C_RESET}"
+  grep -h 'DS P2P' /var/log/suricata/fast.log 2>/dev/null | tail -n 20 | sed 's/^/    /' \
+    || info "Совпадений Suricata пока нет."
+
+  echo
+  echo "${C_DIM}  Баны torrent-blocker (последние 20):${C_RESET}"
+  journalctl -u torrent-blocker -n 20 --no-pager 2>/dev/null | sed 's/^/    /' \
+    || info "Сервис torrent-blocker не установлен."
+}
+
+torrent_guard_ban_menu() {
+  section "Torrent Guard — ручной бан/разбан IP"
+
+  if ! is_torrent_blocker_installed; then
+    warn "Слой B (torrent-blocker) не установлен — бан-листом управляет он."
+    return 1
+  fi
+
+  local act ip
+  echo
+  echo "  ${C_GREEN}1${C_RESET}) Забанить IP"
+  echo "  ${C_GREEN}2${C_RESET}) Разбанить IP"
+  echo "  ${C_YELLOW}0${C_RESET}) Назад"
+  echo
+  read -rp "  Выбор: " act
+
+  case "${act:-}" in
+    1) read -rp "  IP для бана: " ip ;;
+    2) read -rp "  IP для разбана: " ip ;;
+    *) return 0 ;;
+  esac
+
+  ip="$(echo "${ip:-}" | tr -d '[:space:]')"
+  if [[ ! "$ip" =~ ^[0-9a-fA-F:.]+$ || -z "$ip" ]]; then
+    warn "Некорректный IP."
+    return 1
+  fi
+
+  case "$act" in
+    1) "$TORRENT_BLOCKER_BIN" ban "$ip"   && ok "IP $ip забанен."   || warn "Не удалось забанить $ip." ;;
+    2) "$TORRENT_BLOCKER_BIN" unban "$ip" && ok "IP $ip разбанен." || warn "Не удалось разбанить $ip." ;;
+  esac
+}
+
+torrent_guard_settings() {
+  section "Torrent Guard — настройки слоёв"
+
+  tg_load_config
+
+  local choice input
+  while true; do
+    echo
+    info "nDPI (L1, DROP торрент-трафика):      $( [[ "$TG_TORRENT" == 1 ]] && echo включён || echo выключен )"
+    info "Suricata (L2, IPS по UDP):            $( [[ "$TG_SURICATA" == 1 ]] && echo включена || echo выключена )"
+    info "Блок домена packetsdk (L3):           $( [[ "$TG_PACKETSDK" == 1 ]] && echo включён || echo выключен )"
+    info "Доп. домены для блокировки:           ${TG_DOMAINS:-<нет>}"
+    echo
+    echo "  ${C_GREEN}1${C_RESET}) Переключить nDPI (L1)"
+    echo "  ${C_GREEN}2${C_RESET}) Переключить Suricata (L2) ${C_DIM}— на Hysteria2-нодах это заметная нагрузка на CPU${C_RESET}"
+    echo "  ${C_GREEN}3${C_RESET}) Переключить блок packetsdk (L3)"
+    echo "  ${C_GREEN}4${C_RESET}) Задать доп. домены"
+    echo "  ${C_CYAN}5${C_RESET}) Сохранить и применить"
+    echo "  ${C_YELLOW}0${C_RESET}) Назад без применения"
+    echo
+    read -rp "  Выбор: " choice
+
+    case "${choice:-}" in
+      1) [[ "$TG_TORRENT"   == 1 ]] && TG_TORRENT=0   || TG_TORRENT=1 ;;
+      2) [[ "$TG_SURICATA"  == 1 ]] && TG_SURICATA=0  || TG_SURICATA=1 ;;
+      3) [[ "$TG_PACKETSDK" == 1 ]] && TG_PACKETSDK=0 || TG_PACKETSDK=1 ;;
+      4)
+        read -rp "  Домены через пробел или запятую (пусто — очистить): " input
+        TG_DOMAINS="$(echo "${input:-}" | tr -s ', ' ' ' | sed 's/^ *//; s/ *$//')"
+        ;;
+      5)
+        tg_save_config
+        ok "Настройки сохранены: $TG_CONFIG"
+        if tg_guard_installed; then
+          install_torrent_guard_layer || true
+        else
+          warn "Слой A ещё не установлен — примени пункт «Установить/обновить всё»."
+        fi
+        return 0
+        ;;
+      0|"") return 0 ;;
+      *) warn "Некорректный выбор." ;;
+    esac
+  done
+}
+
+torrent_guard_uninstall() {
+  section "Torrent Guard — удаление"
+
+  local ans
+  read -rp "  Удалить оба слоя (правила, сервисы, таймеры)? [y/N]: " ans
+  case "${ans,,}" in y|yes|д|да) ;; *) info "Отменено."; return 0 ;; esac
+
+  if tg_guard_installed; then
+    run_shell_live "Удаляю слой A" "'$TG_SCRIPT' --uninstall" || warn "Слой A удалился не полностью."
+    rm -f "$TG_SCRIPT"
+  fi
+
+  if is_torrent_blocker_installed; then
+    run_shell "Удаляю слой B (torrent-blocker)" \
+      "systemctl disable --now torrent-blocker >/dev/null 2>&1 || true;
+       '$TORRENT_BLOCKER_BIN' stop >/dev/null 2>&1 || true;
+       rm -f '$TORRENT_BLOCKER_BIN' /etc/systemd/system/torrent-blocker.service;
+       rm -rf /var/lib/torrent-blocker;
+       systemctl daemon-reload" || warn "Слой B удалился не полностью."
+  fi
+
+  ok "Torrent Guard удалён. Пакеты (suricata, dkms, nDPI-модуль) оставлены."
+  info "Полностью убрать модуль ядра: dkms remove ndpi/1.0 --all"
+}
+
+torrent_guard_menu() {
+  need_root
+  tg_load_config
+
+  while true; do
+    section "Torrent Guard (анти-торрент)"
+    echo
+    echo "  ${C_DIM}Слой A — глушит торрент-трафик (nDPI + Suricata + блок домена packetsdk).${C_RESET}"
+    echo "  ${C_DIM}Слой B — банит клиента, который торрентит (по логам xray и netstat).${C_RESET}"
+    echo
+    echo "  ${C_GREEN}1${C_RESET}) Установить / обновить всё ${C_DIM}(оба слоя)${C_RESET}"
+    echo "  ${C_CYAN}2${C_RESET}) Только слой A ${C_DIM}(nDPI / Suricata / домены)${C_RESET}"
+    echo "  ${C_CYAN}3${C_RESET}) Только слой B ${C_DIM}(torrent-blocker, бан клиентов)${C_RESET}"
+    echo "  ${C_CYAN}4${C_RESET}) Статус"
+    echo "  ${C_CYAN}5${C_RESET}) Логи и сработки"
+    echo "  ${C_CYAN}6${C_RESET}) Ручной бан / разбан IP"
+    echo "  ${C_CYAN}7${C_RESET}) Настройки слоёв"
+    echo "  ${C_RED}8${C_RESET}) Удалить всё"
+    echo "  ${C_YELLOW}0${C_RESET}) Назад"
+    echo
+
+    local choice
+    read -rp "  Выбор [1..8/0]: " choice || choice="0"
+
+    case "${choice:-}" in
+      1) install_torrent_guard_all || true; pause_menu ;;
+      2) install_torrent_guard_layer || true; pause_menu ;;
+      3) install_torrent_blocker || true; pause_menu ;;
+      4) torrent_guard_status; pause_menu ;;
+      5) torrent_guard_logs; pause_menu ;;
+      6) torrent_guard_ban_menu || true; pause_menu ;;
+      7) torrent_guard_settings || true; pause_menu ;;
+      8) torrent_guard_uninstall || true; pause_menu ;;
+      0|q|Q) return 0 ;;
+      *) warn "Неверный выбор: ${choice:-empty}"; sleep 1 ;;
+    esac
+  done
 }
 
 sanitize_node_name() {
@@ -3889,6 +4584,88 @@ ensure_eclipse_command() {
   ln -sf "$SCRIPT_PATH" "$ECLIPSE_CMD" 2>/dev/null || true
 }
 
+# ── Домен панели (общий для UFW и Eclipse Firewall) ──────────────────────────
+
+# Заполняются panel_domain_prompt.
+PANEL_DOMAIN=""
+PANEL_IPV4=""
+PANEL_IPV6=""
+
+# Вырезает домен из того, что вставил пользователь: схему, креды, порт, путь.
+# Позволяет вставить ссылку целиком, например
+# https://panel.cloud134.ru/dashboard/management/nodes → panel.cloud134.ru
+# Печатает домен или ничего, если это не похоже на FQDN.
+panel_domain_normalize() {
+  local s="${1:-}"
+
+  s="$(echo "$s" | tr -d '[:space:]')"
+  s="${s#*://}"     # схема
+  s="${s#*@}"       # user:pass@
+  s="${s%%/*}"      # путь
+  s="${s%%\?*}"     # query
+  s="${s%%:*}"      # порт
+  s="${s,,}"
+
+  [[ "$s" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]] || return 0
+  echo "$s"
+}
+
+# Спрашивает домен панели Remnawave, резолвит A/AAAA и сохраняет в
+# $ECLIPSE_PANEL_DOMAIN_FILE. Файл общий для UFW и Eclipse Firewall (пункт 10):
+# домен указывается один раз, оба фаервола берут IP панели оттуда.
+# Заполняет PANEL_DOMAIN / PANEL_IPV4 / PANEL_IPV6.
+# Возвращает 1, если пользователь отменил ввод.
+panel_domain_prompt() {
+  local input v4 v6 ans saved
+
+  PANEL_DOMAIN=""
+  PANEL_IPV4=""
+  PANEL_IPV6=""
+
+  saved="$(tr -d '[:space:]' < "$ECLIPSE_PANEL_DOMAIN_FILE" 2>/dev/null || true)"
+
+  echo
+  info "Укажи домен панели Remnawave (например, panel.example.com). Можно вставить"
+  info "ссылку целиком — https://panel.example.com/dashboard/... — лишнее отрежется."
+  echo
+
+  while true; do
+    if [[ -n "$saved" ]]; then
+      read -rp "  Домен панели [$saved]: " input
+      input="${input:-$saved}"
+    else
+      read -rp "  Домен панели: " input
+    fi
+
+    input="$(panel_domain_normalize "${input:-}")"
+    [[ -n "$input" ]] && break
+    warn "Некорректный домен. Пример: panel.example.com"
+  done
+
+  v4="$(na_resolve_domain_v4 "$input" | xargs || true)"
+  v6="$(na_resolve_domain_v6 "$input" | xargs || true)"
+
+  echo
+  info "Домен панели: $input"
+  info "IPv4 панели: ${v4:-<не найдено>}"
+  info "IPv6 панели: ${v6:-<нет>}"
+
+  if [[ -z "$v4$v6" ]]; then
+    warn "DNS не вернул IP для $input. Ограничивать порт ноды этим доменом сейчас нельзя."
+    read -rp "  Всё равно сохранить домен и продолжить? [y/N]: " ans
+    case "${ans,,}" in y|yes|д|да) ;; *) warn "Отменено."; return 1 ;; esac
+  fi
+
+  mkdir -p "$ECLIPSE_FW_DIR"
+  echo "$input" > "$ECLIPSE_PANEL_DOMAIN_FILE"
+  ok "Домен панели сохранён: $input"
+
+  PANEL_DOMAIN="$input"
+  PANEL_IPV4="$v4"
+  PANEL_IPV6="$v6"
+  return 0
+}
+
 # ── UFW / порты ──────────────────────────────────────────────────────────────
 
 ensure_ufw() {
@@ -3909,11 +4686,11 @@ ufw_allow_if_active() {
   ufw allow "$spec" >/dev/null 2>&1 || true
 }
 
-# Открывает порт(ы) уже установленных нод (NODE_PORT из их .env) — через них
-# панель Remnawave достукивается до ноды. Контейнер поднят с network_mode: host,
-# поэтому нода слушает этот порт прямо на хосте. Печатает открытые порты.
-firewall_allow_node_ports() {
-  local d port opened=()
+# Печатает NODE_PORT всех установленных на сервере нод Remnawave (по одному на
+# строку, без дублей). Контейнер поднят с network_mode: host, поэтому нода
+# слушает этот порт прямо на хосте — именно через него панель достукивается.
+detect_node_ports() {
+  local d port
 
   for d in /opt/remnanode /root/remnanode /home/*/remnanode /opt/*-Node; do
     [[ -f "$d/.env" && -f "$d/docker-compose.yml" ]] || continue
@@ -3922,19 +4699,82 @@ firewall_allow_node_ports() {
     port="$(grep -E '^NODE_PORT=' "$d/.env" 2>/dev/null | head -n1 | cut -d= -f2 | tr -d '[:space:]')"
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || continue
 
+    echo "$port"
+  done | sort -un
+}
+
+# Открывает порты установленных нод всем (allow <port>/tcp). Печатает открытые.
+firewall_allow_node_ports() {
+  local port opened=()
+
+  while IFS= read -r port; do
+    [[ -n "$port" ]] || continue
     ufw allow "${port}/tcp" >/dev/null 2>&1 || true
     opened+=("$port")
-  done
+  done < <(detect_node_ports)
 
   [[ ${#opened[@]} -gt 0 ]] && info "Порты нод (NODE_PORT) открыты: ${opened[*]}"
   return 0
 }
 
-# По умолчанию всегда открыты 22/tcp (SSH), 80/tcp, 443/tcp и 443/udp
+# Открывает порты нод ТОЛЬКО для IP панели: снимает общее «allow <port>/tcp»
+# и вместо него добавляет точечные «allow from <ip> to any port <port>».
+# Аргументы: список IPv4 и список IPv6 панели (через пробел).
+# Возвращает 1, если IP панели неизвестны или нод на сервере нет — в этом случае
+# правила не трогаются, чтобы панель не потеряла ноду.
+ufw_restrict_node_ports_to_panel() {
+  local v4="${1:-}" v6="${2:-}"
+  local port ip restricted=()
+
+  if [[ -z "${v4}${v6}" ]]; then
+    warn "IP панели неизвестны — порты нод не ограничиваю."
+    return 1
+  fi
+
+  while IFS= read -r port; do
+    [[ -n "$port" ]] || continue
+
+    # Снимаем «открыто всем», если такое правило уже добавляли раньше.
+    ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+
+    for ip in $v4 $v6; do
+      ufw allow from "$ip" to any port "$port" proto tcp >/dev/null 2>&1 || true
+    done
+
+    restricted+=("$port")
+  done < <(detect_node_ports)
+
+  if [[ ${#restricted[@]} -eq 0 ]]; then
+    warn "Установленных нод не найдено — ограничивать нечего."
+    return 1
+  fi
+
+  ok "Порты нод (${restricted[*]}) открыты только для IP панели: ${v4} ${v6}"
+  info "Если у панели сменится IP — повтори этот пункт (UFW не ре-резолвит домен сам)."
+  return 0
+}
+
+# Спрашивает домен панели и ограничивает порты нод её IP. Отдельным пунктом
+# меню — чтобы можно было обновить IP панели, не переключая UFW.
+ufw_setup_panel_access() {
+  section "Порты нод — доступ только для панели"
+
+  panel_domain_prompt || return 1
+  ufw_restrict_node_ports_to_panel "$PANEL_IPV4" "$PANEL_IPV6"
+}
+
+# По умолчанию всегда открыты порты SSH, 80/tcp, 443/tcp и 443/udp
 # (QUIC/HTTP3/Hysteria2 идут по UDP), плюс порты установленных нод. SSH первым —
-# чтобы не потерять доступ при включении фаервола.
+# чтобы не потерять доступ при включении фаервола. Порт SSH берём из
+# sshd_config и из текущей сессии ($SSH_CONNECTION), а не только 22: на многих
+# серверах SSH перевешен, и «ufw allow 22» отрезал бы доступ вместе с фаерволом.
 apply_firewall_defaults() {
-  ufw allow 22/tcp  >/dev/null 2>&1 || true
+  local p
+
+  for p in $(na_detect_ssh_ports); do
+    ufw allow "${p}/tcp" >/dev/null 2>&1 || true
+  done
+
   ufw allow 80/tcp  >/dev/null 2>&1 || true
   ufw allow 443/tcp >/dev/null 2>&1 || true
   ufw allow 443/udp >/dev/null 2>&1 || true
@@ -3970,7 +4810,7 @@ manage_firewall() {
   info "По умолчанию открыты 22/tcp (SSH), 80/tcp, 443/tcp, 443/udp и порты установленных нод."
   apply_firewall_defaults
 
-  local choice port
+  local choice port ans
   while true; do
     firewall_show
     echo
@@ -3979,6 +4819,7 @@ manage_firewall() {
     echo "  ${C_GREEN}3${C_RESET}) Включить UFW"
     echo "  ${C_GREEN}4${C_RESET}) Выключить UFW"
     echo "  ${C_GREEN}5${C_RESET}) Обновить список открытых портов"
+    echo "  ${C_CYAN}6${C_RESET}) Порты нод — только для панели ${C_DIM}(указать домен панели)${C_RESET}"
     echo "  ${C_YELLOW}0${C_RESET}) Назад"
     echo
     read -rp "  Выбор: " choice
@@ -4014,8 +4855,29 @@ manage_firewall() {
         ;;
       3)
         apply_firewall_defaults
+
+        # Порт ноды нужен только панели Remnawave, а не всему интернету —
+        # поэтому при включении фаервола сразу спрашиваем её адрес и открываем
+        # порты нод точечно (тот же домен, что использует Eclipse Firewall).
+        echo
+        info "Порт ноды нужен только панели Remnawave — остальным его можно закрыть."
+        read -rp "  Ограничить порты нод IP панели? [Y/n]: " ans
+        case "${ans,,}" in
+          n|no|н|нет)
+            info "Порты нод остаются открытыми для всех."
+            ;;
+          *)
+            if panel_domain_prompt; then
+              ufw_restrict_node_ports_to_panel "$PANEL_IPV4" "$PANEL_IPV6" \
+                || warn "Порты нод оставлены открытыми для всех."
+            else
+              warn "Домен панели не указан — порты нод остаются открытыми для всех."
+            fi
+            ;;
+        esac
+
         if ufw --force enable >/dev/null 2>&1; then
-          ok "UFW включён (22/tcp, 80/tcp, 443/tcp, 443/udp, порты нод и добавленные порты открыты)."
+          ok "UFW включён (SSH, 80/tcp, 443/tcp, 443/udp, порты нод и добавленные порты открыты)."
         else
           warn "Не удалось включить UFW."
         fi
@@ -4028,6 +4890,7 @@ manage_firewall() {
         fi
         ;;
       5) ;;
+      6) ufw_setup_panel_access || true ;;
       0|"") break ;;
       *) warn "Некорректный выбор." ;;
     esac
@@ -4704,42 +5567,15 @@ na_firewall_enable_open() {
 na_set_panel_domain() {
   section "Порт ноды — доступ только для панели"
 
-  local input v4 v6 mode ans
+  local mode
 
-  echo
-  info "Укажи домен панели Remnawave (например, panel.example.com или"
-  info "remnawave.icu). Скрипт резолвит его IP и откроет порт ноды ТОЛЬКО им."
-  echo
+  info "Скрипт резолвит IP домена панели и откроет порт ноды ТОЛЬКО им."
+  info "Домен сохраняется в $ECLIPSE_PANEL_DOMAIN_FILE и переиспользуется в UFW."
 
-  while true; do
-    read -rp "  Домен панели: " input
-    input="$(echo "${input:-}" | tr -d '[:space:]')"
-    input="${input#http://}"; input="${input#https://}"; input="${input%%/*}"
-    if [[ "$input" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
-      break
-    fi
-    warn "Некорректный домен. Пример: panel.example.com"
-  done
-
-  v4="$(na_resolve_domain_v4 "$input" | xargs || true)"
-  v6="$(na_resolve_domain_v6 "$input" | xargs || true)"
-
-  echo
-  info "Домен панели: $input"
-  info "IPv4 панели: ${v4:-<не найдено>}"
-  info "IPv6 панели: ${v6:-<нет>}"
-
-  if [[ -z "$v4$v6" ]]; then
-    warn "DNS не вернул IP для $input. Порт ноды будет закрыт для всех, пока резолв не заработает."
-    read -rp "  Всё равно продолжить? [y/N]: " ans
-    case "${ans,,}" in y|yes|д|да) ;; *) warn "Отменено."; return 1 ;; esac
-  fi
+  # Общий промпт: ввод/нормализация домена, резолв A/AAAA, сохранение.
+  panel_domain_prompt || return 1
 
   na_ensure_nftables || { warn "nftables не установлен."; return 1; }
-
-  mkdir -p "$ECLIPSE_FW_DIR"
-  echo "$input" > "$ECLIPSE_PANEL_DOMAIN_FILE"
-  ok "Домен панели сохранён: $input"
 
   mode="$(cat "$ECLIPSE_FW_MODE_FILE" 2>/dev/null || true)"
   [[ "$mode" == "strict" || "$mode" == "open" ]] || mode="open"
@@ -4838,7 +5674,7 @@ main_menu() {
     echo "  ${C_CYAN}4${C_RESET}) Настройка WARP"
     echo "  ${C_CYAN}5${C_RESET}) Проверить/установить обновления скрипта"
     echo "  ${C_CYAN}6${C_RESET}) Проверить систему"
-    echo "  ${C_CYAN}7${C_RESET}) Torrent Blocker (установить/переустановить)"
+    echo "  ${C_CYAN}7${C_RESET}) Torrent Guard: анти-торрент ${C_DIM}(nDPI + Suricata + бан клиентов)${C_RESET}"
     echo "  ${C_CYAN}8${C_RESET}) Обновление ядра Xray"
     echo "  ${C_CYAN}9${C_RESET}) Настройка портов (UFW)"
     echo "  ${C_CYAN}10${C_RESET}) Eclipse Firewall (nftables): порт ноды для панели + защита"
@@ -4873,8 +5709,7 @@ main_menu() {
         pause_menu
         ;;
       7)
-        install_torrent_blocker
-        pause_menu
+        torrent_guard_menu
         ;;
       8)
         update_xray_core
@@ -4921,9 +5756,17 @@ case "${1:-}" in
     need_root
     run_final_test
     ;;
+  --torrent-guard|torrent-guard)
+    need_root
+    torrent_guard_menu
+    ;;
   --torrent-blocker|torrent-blocker)
     need_root
-    install_torrent_blocker
+    install_torrent_guard_all
+    ;;
+  --torrent-status|torrent-status)
+    need_root
+    torrent_guard_status
     ;;
   --xray-core|--update-xray|xray-core)
     need_root
@@ -4957,9 +5800,12 @@ case "${1:-}" in
   $0 --warp             запустить настройку WARP
   $0 --check-update     проверить обновления
   $0 --test             проверить систему
-  $0 --torrent-blocker  установить/переустановить Torrent Blocker
+  $0 --torrent-guard    меню Torrent Guard (анти-торрент)
+  $0 --torrent-blocker  установить/обновить оба слоя Torrent Guard
+  $0 --torrent-status   статус анти-торрент защиты
   $0 --xray-core        обновить ядро Xray в контейнере ноды
   $0 --firewall         настройка портов (UFW)
+  $0 --panel-port       порт ноды только для панели (nftables)
 
 После первой установки менеджер доступен короткой командой: eclipse
 EOF_HELP
