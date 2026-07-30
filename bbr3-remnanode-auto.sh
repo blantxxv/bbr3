@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.7.1"
+SCRIPT_VERSION="3.7.2"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -2918,7 +2918,9 @@ tb_detect_access_log() {
 tb_build_bypass() {
   local ips=("127.0.0.1" "::1") ip panel_domain
 
-  panel_domain="$(tr -d '[:space:]' < "$ECLIPSE_PANEL_DOMAIN_FILE" 2>/dev/null || true)"
+  # 2>/dev/null ДО `<`: иначе отсутствие файла печатает ошибку в терминал
+  # (перенаправления обрабатываются слева направо).
+  panel_domain="$(tr -d '[:space:]' 2>/dev/null < "$ECLIPSE_PANEL_DOMAIN_FILE" || true)"
   if [[ -n "$panel_domain" ]]; then
     for ip in $(na_resolve_domain_v4 "$panel_domain" 2>/dev/null || true); do
       ips+=("$ip")
@@ -5239,7 +5241,8 @@ panel_domain_prompt() {
   PANEL_IPV4=""
   PANEL_IPV6=""
 
-  saved="$(tr -d '[:space:]' < "$ECLIPSE_PANEL_DOMAIN_FILE" 2>/dev/null || true)"
+  # 2>/dev/null ДО `<` — см. комментарий в bandwidth_current.
+  saved="$(tr -d '[:space:]' 2>/dev/null < "$ECLIPSE_PANEL_DOMAIN_FILE" || true)"
 
   echo
   info "Укажи домен панели Remnawave (например, panel.example.com). Можно вставить"
@@ -5570,10 +5573,36 @@ ECLIPSE_SHAPE_FILE="$ECLIPSE_FW_DIR/bandwidth_mbit"
 ECLIPSE_SHAPE_SCRIPT="/usr/local/sbin/eclipse-bandwidth.sh"
 
 # Текущее сохранённое ограничение в Мбит/с (пусто = ограничения нет).
+#
+# Проверка -r обязательна: в `tr ... < "$FILE" 2>/dev/null` перенаправления
+# обрабатываются слева направо, поэтому падение `< $FILE` печатает
+# "No such file or directory" ЕЩЁ ДО того, как stderr уйдёт в /dev/null.
 bandwidth_current() {
   local v
-  v="$(tr -cd '0-9' < "$ECLIPSE_SHAPE_FILE" 2>/dev/null || true)"
+
+  [[ -r "$ECLIPSE_SHAPE_FILE" ]] || return 0
+
+  v="$(tr -cd '0-9' 2>/dev/null < "$ECLIPSE_SHAPE_FILE" || true)"
   [[ -n "$v" && "$v" != "0" ]] && echo "$v" || true
+}
+
+# Печатает первую строку root-qdisc интерфейса, если это шейпер — включая
+# ЧУЖОЙ (tbf от провайдера, htb от другого скрипта). Нужно, чтобы статус не
+# врал «ограничения нет», когда канал реально зажат не нами.
+bandwidth_detected_qdisc() {
+  local iface="${1:-}" line
+
+  [[ -n "$iface" ]] || return 0
+  command -v tc >/dev/null 2>&1 || return 0
+
+  line="$(tc qdisc show dev "$iface" root 2>/dev/null | head -n1 || true)"
+  [[ -n "$line" ]] || return 0
+
+  case " $line " in
+    *" cake "*|*" htb "*|*" tbf "*|*" hfsc "*|*" tbf,"*) printf '%s' "$line" ;;
+  esac
+
+  return 0
 }
 
 # Пишет на диск скрипт применения ограничения. Его же вызывает systemd при
@@ -5682,13 +5711,21 @@ bandwidth_apply() {
 }
 
 bandwidth_status() {
-  local iface cur
+  local iface cur foreign
   iface="$(detect_iface)"
   cur="$(bandwidth_current)"
+  foreign="$(bandwidth_detected_qdisc "$iface")"
 
   echo
   if [[ -n "$cur" ]]; then
-    ok "Ограничение исходящей скорости: ${cur} Мбит/с (интерфейс ${iface:-неизвестен})"
+    ok "Ограничение исходящей скорости (наше): ${cur} Мбит/с (интерфейс ${iface:-неизвестен})"
+  elif [[ -n "$foreign" ]]; then
+    # Канал зажат, но не нами: типичный случай — tbf, который выставил
+    # провайдер или прошлый скрипт. Если применить наше ограничение, этот
+    # qdisc будет заменён (tc qdisc del root), поэтому предупреждаем прямо.
+    warn "Своего ограничения нет, но на $iface УЖЕ висит шейпер (не наш):"
+    echo "${C_DIM}    $foreign${C_RESET}"
+    info "Если задать скорость здесь — этот qdisc будет заменён нашим."
   else
     info "Ограничения исходящей скорости нет."
   fi
