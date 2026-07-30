@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.7.2"
+SCRIPT_VERSION="3.7.4"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -19,6 +19,11 @@ TORRENT_BLOCKER_BIN="/usr/local/bin/torrent-blocker"
 
 CPU_LEVEL=""
 KERNEL_INSTALL_SKIPPED=0
+
+# Режим «только нода»: ставим Docker, транспорт и контейнер, без ядра XanMod,
+# сетевого тюнинга, лимитов, THP/RPS и reboot. Влияет и на заголовки шагов —
+# нумерация вида «7/12» относится к полному сценарию и здесь врала бы.
+NODE_ONLY=0
 
 # XanMod ставим последней версией из официального APT-репозитория: метапакет
 # linux-xanmod-x64vN сам тянет самый свежий образ ядра, поэтому фиксированные
@@ -193,8 +198,15 @@ BANNER
 }
 
 section() {
+  local title="$*"
+
+  # Заголовки шагов полного сценария пронумерованы («7/12 · Docker»).
+  # В режиме «только нода» выполняется меньше половины из них, поэтому номер
+  # срезаем — иначе прогресс выглядит сломанным (1/12 → 7/12 → 12/12).
+  [[ "${NODE_ONLY:-0}" -eq 1 ]] && title="${title#*/12 · }"
+
   echo
-  echo "${C_BLUE}${C_BOLD}▶ $*${C_RESET}"
+  echo "${C_BLUE}${C_BOLD}▶ $title${C_RESET}"
 }
 
 info() {
@@ -353,16 +365,46 @@ run_shell() {
   return "$rc"
 }
 
+# Есть ли у процесса управляющий терминал, и можно ли писать/читать /dev/tty.
+#
+# Проверять `[[ -r /dev/tty ]]` нельзя: access() смотрит только права на файл
+# устройства (0666), поэтому тест проходит и там, где управляющего терминала
+# нет вовсе — а сам редирект падает с ENXIO. Поэтому пробуем открыть по-честному
+# и запоминаем результат (открытие /dev/tty на каждый вопрос — лишний сисколл).
+ASK_TTY_OK=""
+have_ctty() {
+  if [[ -z "$ASK_TTY_OK" ]]; then
+    if { : < /dev/tty; } 2>/dev/null; then ASK_TTY_OK=1; else ASK_TTY_OK=0; fi
+  fi
+
+  [[ "$ASK_TTY_OK" -eq 1 ]]
+}
+
 # Многие «живые» команды (speedtest, apt с прогресс-барами, инсталляторы)
 # переводят tty в свой режим и не всегда его восстанавливают — тогда вывод
 # начинает «лесенкой» (потерян ONLCR: \n без \r) или пропадает эхо ввода.
-# Снимаем состояние терминала до команды и возвращаем после.
+# Снимаем состояние терминала до команды и возвращаем после — того же /dev/tty,
+# которое читает ask: иначе при запуске вида `bash <(curl ...)` stty работал бы
+# с fd 0, который терминалом не является, и молча ничего не сохранял и не чинил.
 save_tty_state() {
+  if have_ctty; then
+    stty -g < /dev/tty 2>/dev/null || true
+    return 0
+  fi
   [[ -t 1 ]] || return 0
   stty -g 2>/dev/null || true
 }
 
 restore_tty_state() {
+  if have_ctty; then
+    if [[ -n "${1:-}" ]]; then
+      stty "$1" < /dev/tty 2>/dev/null && { tty_ensure_sane; return 0; }
+    fi
+    stty sane < /dev/tty 2>/dev/null || true
+    tty_ensure_sane
+    return 0
+  fi
+
   [[ -t 1 ]] || return 0
   if [[ -n "${1:-}" ]]; then
     stty "$1" 2>/dev/null && { tty_ensure_sane; return 0; }
@@ -378,10 +420,19 @@ restore_tty_state() {
 # символ стирания попадает прямо в строку как ^H, и ответ вида "0^H2" не
 # совпадает ни с одним пунктом меню — выглядит как «скрипт проглотил ввод».
 tty_ensure_sane() {
-  [[ -t 0 && -t 1 ]] || return 0
-
+  # Настраиваем именно /dev/tty, а не fd 0: скрипт часто запускают как
+  # `bash <(curl ...)`, и тогда stdin процесса — вообще не терминал, а stty
+  # правил бы не тот дескриптор (или молча ничего не делал).
   # Явный набор флагов аккуратнее, чем stty sane (не сбрасывает лишнего).
   # Если терминал не понял какой-то флаг — падаем на sane.
+  if have_ctty; then
+    stty icanon echo echoe echok icrnl onlcr < /dev/tty 2>/dev/null && return 0
+    stty sane < /dev/tty 2>/dev/null || true
+    return 0
+  fi
+
+  [[ -t 0 && -t 1 ]] || return 0
+
   stty icanon echo echoe echok icrnl onlcr 2>/dev/null && return 0
   stty sane 2>/dev/null || true
   return 0
@@ -414,19 +465,45 @@ ask() {
 
   tty_ensure_sane
 
-  read -rp "$__ask_prompt" __ask_raw || __ask_rc=$?
+  # -e включает readline, и это принципиально для стирания: readline сам
+  # трактует И ^H (BS, 0x08), И ^? (DEL, 0x7F) как «удалить символ». Без него
+  # стирание работает только если нажатая клавиша совпала с erase-символом
+  # терминала: `stty sane` ставит erase=^?, а множество клиентов (PuTTY с
+  # «Backspace = Control-H», часть Windows-терминалов) присылают BS — он не
+  # совпадал, tty не стирал и печатал его в строку как ^H. Отсюда и был
+  # «Имя ноды: safeex^Hcl^H^H» на экране.
+  #
+  # Ключевой момент — редирект `< /dev/tty`. bash включает readline только
+  # когда fd 0 РЕАЛЬНО терминал, а при типичном запуске `bash <(curl ...)`
+  # (и тем более из пайпа) stdin процесса терминалом не является. Без редиректа
+  # -e молча выключался, ввод шёл через канонический режим ядра — и весь блок
+  # выше опять переставал работать, из-за чего ^H вылезал по всему меню.
+  if have_ctty; then
+    read -e -rp "$__ask_prompt" __ask_raw < /dev/tty || __ask_rc=$?
+  elif [[ -t 0 ]]; then
+    read -e -rp "$__ask_prompt" __ask_raw || __ask_rc=$?
+  else
+    read -rp "$__ask_prompt" __ask_raw || __ask_rc=$?
+  fi
 
   printf -v "$__ask_var" '%s' "$(apply_backspaces "$__ask_raw")"
   return "$__ask_rc"
 }
 
 # То же, но без эха (пароли/ключи). Перевод строки печатаем сами.
+# readline здесь применить нельзя (-e показал бы ввод), поэтому стирание
+# вычищается уже из прочитанной строки через apply_backspaces — эха всё равно
+# нет, так что визуально ничего не портится.
 ask_secret() {
   local __ask_var="$1" __ask_prompt="${2:-}" __ask_raw="" __ask_rc=0
 
   tty_ensure_sane
 
-  read -rsp "$__ask_prompt" __ask_raw || __ask_rc=$?
+  if have_ctty; then
+    read -rsp "$__ask_prompt" __ask_raw < /dev/tty || __ask_rc=$?
+  else
+    read -rsp "$__ask_prompt" __ask_raw || __ask_rc=$?
+  fi
   echo
 
   printf -v "$__ask_var" '%s' "$(apply_backspaces "$__ask_raw")"
@@ -5703,7 +5780,22 @@ bandwidth_apply() {
 
   if "$ECLIPSE_SHAPE_SCRIPT" | sed 's/^/  /'; then
     systemctl enable --now eclipse-bandwidth.service >> "$LOG_FILE" 2>&1 || true
-    ok "Исходящая скорость ограничена: ${mbit} Мбит/с (применяется и после reboot)."
+
+    # Скрипт может отчитаться успехом, а qdisc в ядре не остаться: нет sch_cake
+    # и sch_htb, LXC без CAP_NET_ADMIN, интерфейс переопределился. Проверяем
+    # фактом, а не кодом возврата.
+    local iface applied
+    iface="$(detect_iface)"
+    applied="$(bandwidth_detected_qdisc "$iface")"
+
+    if [[ -n "$applied" ]]; then
+      ok "Исходящая скорость ограничена: ${mbit} Мбит/с (применяется и после reboot)."
+      info "Активный qdisc: $applied"
+    else
+      warn "Значение сохранено (${mbit} Мбит/с), но шейпера на ${iface:-интерфейсе} не видно."
+      warn "Проверь вручную: tc qdisc show dev ${iface:-eth0}"
+      return 1
+    fi
   else
     warn "Не удалось применить ограничение. Значение сохранено, но qdisc не встал."
     return 1
@@ -5743,15 +5835,29 @@ bandwidth_status() {
 # (Enter = без ограничения); иначе меню (Enter = отмена, 0 = снять).
 bandwidth_prompt() {
   local mode="${1:-menu}"
-  local iface cur input
+  local iface cur foreign input
 
   iface="$(detect_iface)"
   cur="$(bandwidth_current)"
+  foreign="$(bandwidth_detected_qdisc "$iface")"
 
   echo
   info "Ограничение вешается на ИСХОДЯЩИЙ трафик WAN-интерфейса (${iface:-не определён})."
   info "Входящую скорость с самого сервера ограничить нельзя — трафик уже пришёл по каналу."
-  [[ -n "$cur" ]] && info "Сейчас установлено: ${cur} Мбит/с" || info "Сейчас ограничения нет."
+
+  # Тот же разбор, что и в bandwidth_status. При установке ноды это важнее
+  # всего: канал часто уже зажат чужим tbf/htb (провайдер, прошлый скрипт),
+  # и без этой проверки нода молча упиралась бы в потолок, которого никто не
+  # ставил, а «Сейчас ограничения нет» вводило бы в заблуждение.
+  if [[ -n "$cur" ]]; then
+    info "Сейчас установлено: ${cur} Мбит/с"
+  elif [[ -n "$foreign" ]]; then
+    warn "Своего ограничения нет, но на ${iface} УЖЕ висит шейпер (не наш):"
+    echo "${C_DIM}    $foreign${C_RESET}"
+    info "Если задать скорость здесь — этот qdisc будет заменён нашим."
+  else
+    info "Сейчас ограничения нет."
+  fi
   echo
 
   if [[ "$mode" == "install" ]]; then
@@ -6017,6 +6123,76 @@ stage_after_reboot() {
       echo
     fi
   fi
+}
+
+# Установка ТОЛЬКО ноды: Docker, транспорт (REALITY/TLS) и сам контейнер
+# Remnawave Node с конфигом. Без XanMod-ядра, sysctl-тюнинга, лимитов, THP/RPS,
+# LLMNR и без reboot.
+#
+# Зачем отдельный пункт: тюнинг из полного сценария либо уже сделан (нода
+# переустанавливается на настроенном сервере), либо неприменим/нежелателен —
+# LXC/OpenVZ с ядром хоста, арендованный сервер со своим ядром, площадка, где
+# reboot стоит дорого. Раньше в таких случаях приходилось идти полным
+# сценарием и вручную отказываться от каждого шага.
+install_node_only() {
+  need_root
+  print_banner
+  save_self
+  ensure_eclipse_command
+
+  mkdir -p "$STATE_DIR"
+  touch "$LOG_FILE"
+
+  NODE_ONLY=1
+
+  section "Установка ноды (только нода и конфиг)"
+  info "Ставим: базовые пакеты, Docker, транспорт (REALITY/TLS), контейнер ноды."
+  info "НЕ трогаем: ядро XanMod, сетевой тюнинг, лимиты, THP/RPS, LLMNR, reboot."
+  echo
+
+  local ans
+  ask ans "  Продолжить? [y/N]: "
+
+  case "${ans,,}" in
+    y|yes|д|да) ;;
+    *) NODE_ONLY=0; warn "Отменено пользователем."; return 0 ;;
+  esac
+
+  offer_cleanup_previous
+  ask_node_install_type
+
+  install_base_packages
+  install_docker
+  step_transport_setup
+  setup_remnanode
+
+  NODE_ONLY=0
+
+  echo
+  echo "${C_GREEN}${C_BOLD}╔══════════════════════════════════════════════════════════════╗"
+  echo "║                         ГОТОВО                               ║"
+  echo "╚══════════════════════════════════════════════════════════════╝${C_RESET}"
+  echo
+  echo "  Лог установки: $LOG_FILE"
+  echo
+  echo "  Remnawave Node:"
+  echo "    cd $REMNANODE_DIR"
+  echo "    docker compose ps"
+  echo "    docker compose logs -f --tail=100"
+  echo
+  echo "  Конфиг инбаундов для панели:"
+  echo "    $REMNANODE_DIR/panel-inbounds.json"
+  echo
+
+  if [[ "$NODE_INSTALL_TYPE" == "reality" && "$HYSTERIA2_ENABLED" -eq 1 && "$CERT_OK" -eq 1 ]]; then
+    echo "  Конфиг инбаунда Hysteria2 для панели:"
+    echo "    $REMNANODE_DIR/panel-inbound-hysteria2.json"
+    echo
+  fi
+
+  info "Тюнинг не выполнялся. Полный сценарий (BBR3 + XanMod) — пункт 1 меню."
+  echo "  Менеджер снова открыть командой: ${C_BOLD}eclipse${C_RESET}"
+  echo
 }
 
 print_manual_mode() {
@@ -6535,6 +6711,7 @@ main_menu() {
     echo "${C_BOLD}Главное меню:${C_RESET}"
     echo
     echo "  ${C_GREEN}1${C_RESET}) Автоматическая установка BBR3 + Remnawave Node"
+    echo "  ${C_GREEN}12${C_RESET}) Установка ноды ${C_DIM}(только нода и конфиг, без тюнингов)${C_RESET}"
     echo "  ${C_CYAN}2${C_RESET}) Продолжить установку после reboot"
     echo "  ${C_CYAN}3${C_RESET}) Ручная установка: показать README/команды"
     echo "  ${C_CYAN}4${C_RESET}) Настройка WARP"
@@ -6548,7 +6725,7 @@ main_menu() {
     echo "  ${C_YELLOW}0${C_RESET}) Выход"
     echo
 
-    ask choice "  Выбор [1..11/0]: " || choice="0"
+    ask choice "  Выбор [1..12/0]: " || choice="0"
 
     case "${choice:-}" in
       1)
@@ -6593,6 +6770,10 @@ main_menu() {
         manage_bandwidth
         pause_menu
         ;;
+      12)
+        install_node_only
+        pause_menu
+        ;;
       0|q|Q|exit|quit)
         echo "Выход."
         exit 0
@@ -6611,6 +6792,9 @@ case "${1:-}" in
     ;;
   --auto|--install|install)
     stage_before_reboot
+    ;;
+  --node-only|--node|node-only)
+    install_node_only
     ;;
   --manual|manual)
     print_manual_mode
@@ -6674,6 +6858,7 @@ case "${1:-}" in
   $0 --menu             открыть главное меню
   $0 --auto             автоматическая установка
   $0 --install          алиас для --auto
+  $0 --node-only        установить только ноду и конфиг, без тюнингов
   $0 --continue         продолжить после reboot
   $0 --manual           показать ручной режим
   $0 --warp             запустить настройку WARP
