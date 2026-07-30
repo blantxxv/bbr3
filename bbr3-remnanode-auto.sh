@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.7.4"
+SCRIPT_VERSION="3.7.5"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -2086,6 +2086,129 @@ install_docker_engine() {
   die "Docker установить не удалось ни одним способом (get.docker.com, официальный репозиторий, docker.io)."
 }
 
+TARGET_RLIMIT=1048576
+
+# PID работающего демона docker (пусто, если не запущен). pgrep есть не везде,
+# поэтому есть запасной путь через pidof.
+dockerd_pid() {
+  local pid
+
+  pid="$(pgrep -x dockerd 2>/dev/null | head -n1 || true)"
+  [[ -n "$pid" ]] || pid="$(pidof dockerd 2>/dev/null | awk '{print $1}' || true)"
+
+  [[ -n "$pid" ]] || return 1
+  printf '%s' "$pid"
+}
+
+# Жёсткий rlimit процесса из /proc/<pid>/limits.
+# $1 = pid, $2 = имя лимита ("Max open files" / "Max processes").
+# Печатает число, "unlimited" или ничего (если прочитать не удалось).
+proc_hard_limit() {
+  local pid="$1" name="$2" line rest
+
+  [[ -r "/proc/$pid/limits" ]] || return 1
+
+  line="$(grep -m1 "^${name}[[:space:]]" "/proc/$pid/limits" 2>/dev/null || true)"
+  [[ -n "$line" ]] || return 1
+
+  # После имени лимита идут: soft, hard, [units]. Имя содержит пробелы, поэтому
+  # отрезаем его как префикс, а не считаем поля с начала строки.
+  rest="${line#"$name"}"
+  # shellcheck disable=SC2086
+  set -- $rest
+
+  [[ -n "${2:-}" ]] || return 1
+  printf '%s' "$2"
+}
+
+# Потолок rlimit, который runc РЕАЛЬНО сможет выставить контейнеру.
+# $1 = nofile | nproc.
+#
+# Зачем: runc не может поднять лимит выше жёсткого лимита процесса-родителя, а
+# родитель здесь — демон docker (его наследуют containerd-shim и runc). Если
+# в docker-compose.yml написать больше, контейнер не стартует вовсе:
+#   error setting rlimit type 7: operation not permitted   (7 = RLIMIT_NOFILE)
+# Смотреть `ulimit -Hn` текущей оболочки для этого бессмысленно — у демона свои
+# лимиты из его systemd-юнита. Плюс для NOFILE есть жёсткий потолок ядра
+# fs.nr_open, выше которого setrlimit не пройдёт ни у кого.
+container_rlimit_ceiling() {
+  local kind="$1"
+  local best="$TARGET_RLIMIT"
+  local name shell_cap pid val nr_open
+
+  case "$kind" in
+    nofile) name="Max open files"; shell_cap="$(ulimit -Hn 2>/dev/null || true)" ;;
+    nproc)  name="Max processes";  shell_cap="$(ulimit -Hu 2>/dev/null || true)" ;;
+    *) echo "$best"; return 0 ;;
+  esac
+
+  val=""
+  pid="$(dockerd_pid || true)"
+  [[ -n "$pid" ]] && val="$(proc_hard_limit "$pid" "$name" || true)"
+
+  # Демон не найден, или его /proc/<pid>/limits не разобрался (иной PID-namespace,
+  # урезанный /proc) — падаем на лимит текущей оболочки: она тоже потомок systemd
+  # с теми же DefaultLimit*. Без этого мы бы молча оставили целевые 1048576 на
+  # хосте, где реальный потолок втрое ниже, — то есть ровно тот EPERM, ради
+  # которого вся эта функция и написана. "unlimited" сюда тоже попадает и
+  # корректно не проходит числовую проверку ниже.
+  [[ "$val" =~ ^[0-9]+$ ]] || val="$shell_cap"
+
+  [[ "$val" =~ ^[0-9]+$ ]] && (( val < best )) && best="$val"
+
+  if [[ "$kind" == "nofile" ]]; then
+    nr_open="$(sysctl -n fs.nr_open 2>/dev/null || true)"
+    [[ "$nr_open" =~ ^[0-9]+$ ]] && (( nr_open < best )) && best="$nr_open"
+  fi
+
+  echo "$best"
+}
+
+# Поднимает лимиты САМОГО демона docker через drop-in его юнита. Без этого
+# потолок демона (а значит и всех контейнеров) остаётся тем, что дал дистрибутив
+# — а пакет docker.io из репозитория Ubuntu приезжает с куда более скромными
+# значениями, чем docker-ce. Особенно важно в режиме «только нода»: там
+# apply_system_limits не выполняется, и поднять DefaultLimit* systemd больше некому.
+#
+# LimitNOFILE пишем ЧИСЛОМ, равным fs.nr_open, а не `infinity`. `infinity`
+# безопасен только на systemd >= 240, который сам приводит его к fs.nr_open;
+# на более старом (Ubuntu 18.04 — systemd 237) значение уходит в setrlimit как
+# есть, ядро отвечает EPERM, и docker.service перестаёт стартовать вообще.
+# Если fs.nr_open прочитать не удалось — LimitNOFILE не трогаем совсем.
+DOCKER_LIMITS_DROPIN="/etc/systemd/system/docker.service.d/99-eclipse-limits.conf"
+
+raise_docker_service_limits() {
+  local nr_open nofile_line=""
+
+  nr_open="$(sysctl -n fs.nr_open 2>/dev/null || true)"
+  [[ "$nr_open" =~ ^[0-9]+$ ]] && nofile_line="LimitNOFILE=$nr_open"
+
+  mkdir -p "$(dirname "$DOCKER_LIMITS_DROPIN")"
+
+  cat >"$DOCKER_LIMITS_DROPIN" <<EOF_DOCKERLIM
+[Service]
+$nofile_line
+LimitNPROC=infinity
+EOF_DOCKERLIM
+
+  systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
+}
+
+# Перезапуск docker после установки drop-in. Если юнит из-за него не поднялся,
+# drop-in снимаем и поднимаем docker обратно: остаться без docker хуже, чем
+# остаться с дистрибутивными лимитами (их всё равно учтёт container_rlimit_ceiling).
+restart_docker_with_limits() {
+  if run_cmd "Перезапускаю Docker (новые лимиты юнита)" systemctl restart docker; then
+    return 0
+  fi
+
+  warn "Docker не стартовал с поднятыми лимитами — откатываю drop-in $DOCKER_LIMITS_DROPIN."
+  rm -f "$DOCKER_LIMITS_DROPIN"
+  systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
+
+  run_cmd "Перезапускаю Docker (без drop-in)" systemctl restart docker
+}
+
 install_docker() {
   section "7/12 · Docker"
 
@@ -2097,26 +2220,19 @@ install_docker() {
 
   mkdir -p /etc/docker
 
-  # Целевой лимит — 1048576 (как в node-accelerator). На bare metal/VM ставим
-  # его жёстко: apply_system_limits уже подняла системный потолок, поэтому даже
-  # если ТЕКУЩАЯ сессия скрипта ещё видит старый ulimit -Hn, демон docker после
-  # рестарта стартует с новым DefaultLimit* systemd и 1048576 применится.
-  # В LXC-контейнере runc не может поднять rlimit контейнера выше потолка
-  # родителя — фиксированные 1048576 дали бы "operation not permitted" при
-  # старте любого контейнера. Поэтому внутри контейнера берём реально
-  # достижимый потолок этого окружения.
-  local docker_nofile_limit docker_nproc_limit
-  if is_container_env; then
-    docker_nofile_limit="$(ulimit -Hn 2>/dev/null || true)"
-    [[ "$docker_nofile_limit" =~ ^[0-9]+$ ]] || docker_nofile_limit=1048576
-    (( docker_nofile_limit > 1048576 )) && docker_nofile_limit=1048576
+  # Порядок здесь важен. Сначала поднимаем лимиты САМОГО демона и
+  # перезапускаем его — иначе потолок пришлось бы считать по старому процессу
+  # dockerd и мы записали бы в daemon.json заниженные значения.
+  raise_docker_service_limits
+  run_cmd "Включаю Docker" systemctl enable docker
+  restart_docker_with_limits
 
-    docker_nproc_limit="$(ulimit -Hu 2>/dev/null || true)"
-    [[ "$docker_nproc_limit" =~ ^[0-9]+$ ]] || docker_nproc_limit=1048576
-    (( docker_nproc_limit > 1048576 )) && docker_nproc_limit=1048576
-  else
-    docker_nofile_limit=1048576
-    docker_nproc_limit=1048576
+  local docker_nofile_limit docker_nproc_limit
+  docker_nofile_limit="$(container_rlimit_ceiling nofile)"
+  docker_nproc_limit="$(container_rlimit_ceiling nproc)"
+
+  if (( docker_nofile_limit < TARGET_RLIMIT || docker_nproc_limit < TARGET_RLIMIT )); then
+    info "Потолок этого окружения ниже целевого ($TARGET_RLIMIT): nofile=$docker_nofile_limit, nproc=$docker_nproc_limit. Беру достижимое — выше runc всё равно не даст."
   fi
 
   cat >/etc/docker/daemon.json <<EOF_DOCKER
@@ -2145,8 +2261,7 @@ install_docker() {
 }
 EOF_DOCKER
 
-  run_cmd "Включаю Docker" systemctl enable docker
-  run_cmd "Перезапускаю Docker" systemctl restart docker
+  run_cmd "Перезапускаю Docker (default-ulimits)" systemctl restart docker
 
   local docker_v compose_v
   docker_v="$(docker --version 2>/dev/null || true)"
@@ -4145,7 +4260,7 @@ generate_tls_panel_config() {
   cat > "$config_path" <<EOF_PANEL
 {
   "log": {
-    "loglevel": "warning",
+    "loglevel": "info",
     "access": "/var/log/remnanode/access.log",
     "error": "/var/log/remnanode/error.log"
   },
@@ -4591,7 +4706,7 @@ generate_reality_panel_config() {
   cat > "$config_path" <<EOF_REALITY
 {
   "log": {
-    "loglevel": "warning",
+    "loglevel": "info",
     "access": "/var/log/remnanode/access.log",
     "error": "/var/log/remnanode/error.log"
   },
@@ -4772,6 +4887,78 @@ wait_for_port() {
   return 1
 }
 
+# Строка монтирования /etc/letsencrypt для TLS-установок (пусто = не нужно).
+# Глобальная, потому что её использует write_node_compose, который вызывается
+# из setup_remnanode в двух местах (обычная запись и аварийный откат).
+NODE_CERT_VOLUME_LINE=""
+
+# Упал ли последний запуск контейнера на setrlimit.
+#
+# Подстановка процесса, а не `tail | grep -q`: под `set -o pipefail` grep -q
+# выходит по первому совпадению и закрывает канал, tail получает SIGPIPE (141),
+# и статус ВСЕГО пайпа становится 141 — то есть «совпадения нет» ровно тогда,
+# когда оно есть. Здесь пайпа нет, и статус берётся только от grep.
+log_has_rlimit_error() {
+  grep -q 'setting rlimit' < <(tail -n 80 "$LOG_FILE" 2>/dev/null)
+}
+
+# Человекочитаемый потолок демона docker — для строки в выводе установки.
+docker_rlimit_report() {
+  local pid nofile nproc
+
+  pid="$(dockerd_pid || true)"
+  if [[ -z "$pid" ]]; then
+    echo "демон не найден, считаю по текущей оболочке"
+    return 0
+  fi
+
+  nofile="$(proc_hard_limit "$pid" "Max open files" || echo '?')"
+  nproc="$(proc_hard_limit "$pid" "Max processes" || echo '?')"
+  echo "nofile=$nofile, nproc=$nproc"
+}
+
+# Пишет docker-compose.yml ноды. $1/$2 — лимиты nofile/nproc. Если аргументов
+# нет, блок ulimits не пишется вовсе — это аварийный откат, когда ядро не даёт
+# выставить даже расчётный потолок.
+write_node_compose() {
+  local nofile="${1:-}" nproc="${2:-}" ulimits_block=""
+
+  if [[ -n "$nofile" && -n "$nproc" ]]; then
+    ulimits_block="    ulimits:
+      nofile:
+        soft: $nofile
+        hard: $nofile
+      nproc:
+        soft: $nproc
+        hard: $nproc"
+  fi
+
+  cat > "$REMNANODE_DIR/docker-compose.yml" <<EOF_COMPOSE
+name: $COMPOSE_PROJECT_NAME
+
+services:
+  remnanode:
+    container_name: $CONTAINER_NAME
+    hostname: $CONTAINER_NAME
+    image: remnawave/node:latest
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./geosite.dat:/usr/local/share/xray/geosite.dat:ro
+      - ./geoip.dat:/usr/local/share/xray/geoip.dat:ro
+      - ./geosite_2.dat:/usr/local/share/xray/geosite_2.dat:ro
+      - ./geoip_2.dat:/usr/local/share/xray/geoip_2.dat:ro
+      - ./logs:/var/log/remnanode
+${NODE_CERT_VOLUME_LINE}
+${XRAY_VOLUME_LINE}
+${ulimits_block}
+    env_file:
+      - .env
+EOF_COMPOSE
+}
+
 setup_remnanode() {
   section "12/12 · Remnawave Node"
 
@@ -4827,10 +5014,23 @@ setup_remnanode() {
     -o geoip_2.dat \
     "$RU_GEOIP_URL"
 
+  # Каталог логов создаём и наполняем ДО первого старта контейнера: compose
+  # монтирует ./logs в /var/log/remnanode, и если каталога нет, docker создаст
+  # его сам — но уже как пустой том, а xray в конфиге пишет туда с loglevel
+  # info, поэтому файлы должны существовать с самого начала.
+  mkdir -p "$REMNANODE_LOG_DIR"
+  chmod 755 "$REMNANODE_LOG_DIR"
   touch "$REMNANODE_LOG_DIR/access.log" "$REMNANODE_LOG_DIR/error.log"
+  chmod 644 "$REMNANODE_LOG_DIR/access.log" "$REMNANODE_LOG_DIR/error.log"
+  ok "Каталог логов ноды: $REMNANODE_LOG_DIR (access.log, error.log)"
 
-  # Ротация сразу: конфиг ноды включает access.log, он будет расти.
-  install_log_rotation || warn "Ротация логов не настроена — следи за размером access.log."
+  # Ротация сразу: конфиг ноды идёт с loglevel info и включённым access.log —
+  # без ротации он на нагруженной ноде съест диск.
+  if install_log_rotation; then
+    ok "Суточная ротация логов ноды настроена (7 суток, copytruncate)."
+  else
+    warn "Ротация логов не настроена — следи за размером access.log."
+  fi
 
   cat > "$REMNANODE_DIR/.env" <<EOF_ENV
 NODE_PORT=$NODE_PORT
@@ -4847,73 +5047,46 @@ EOF_ENV
     cert_volume_line="      - /etc/letsencrypt:/etc/letsencrypt:ro"
   fi
 
-  # runc не может поднять rlimit контейнера выше жёсткого потолка своего
-  # родительского процесса ("operation not permitted", errno EPERM для
-  # setrlimit). На bare metal/полноценной VM ставим целевые 1048576 (как в
-  # node-accelerator) — apply_system_limits и DefaultLimit* systemd для docker
-  # это уже разрешают. В LXC-контейнере потолок (ulimit -Hn) обычно ниже, тогда
-  # берём то, что реально достижимо в этом окружении.
+  NODE_CERT_VOLUME_LINE="$cert_volume_line"
+
+  # Лимиты берём не «целевые», а достижимые: runc не может поднять rlimit
+  # контейнера выше жёсткого лимита демона docker, и при превышении контейнер
+  # не стартует вообще (error setting rlimit type 7: operation not permitted).
   local nofile_limit nproc_limit
-  if is_container_env; then
-    nofile_limit="$(ulimit -Hn 2>/dev/null || true)"
-    if [[ -z "$nofile_limit" || "$nofile_limit" == "unlimited" ]] || ! [[ "$nofile_limit" =~ ^[0-9]+$ ]]; then
-      nofile_limit=1048576
-    fi
-    (( nofile_limit > 1048576 )) && nofile_limit=1048576
+  nofile_limit="$(container_rlimit_ceiling nofile)"
+  nproc_limit="$(container_rlimit_ceiling nproc)"
+  info "Лимиты контейнера ноды: nofile=$nofile_limit, nproc=$nproc_limit (потолок демона docker: $(docker_rlimit_report))"
 
-    nproc_limit="$(ulimit -Hu 2>/dev/null || true)"
-    if [[ -z "$nproc_limit" || "$nproc_limit" == "unlimited" ]] || ! [[ "$nproc_limit" =~ ^[0-9]+$ ]]; then
-      nproc_limit=1048576
-    fi
-    (( nproc_limit > 1048576 )) && nproc_limit=1048576
-  else
-    nofile_limit=1048576
-    nproc_limit=1048576
-  fi
-  info "Лимиты контейнера ноды: nofile=$nofile_limit, nproc=$nproc_limit (потолок окружения: $(ulimit -Hn 2>/dev/null || echo unknown))"
-
-  cat > "$REMNANODE_DIR/docker-compose.yml" <<EOF_COMPOSE
-name: $COMPOSE_PROJECT_NAME
-
-services:
-  remnanode:
-    container_name: $CONTAINER_NAME
-    hostname: $CONTAINER_NAME
-    image: remnawave/node:latest
-    network_mode: host
-    restart: always
-    cap_add:
-      - NET_ADMIN
-    volumes:
-      - ./geosite.dat:/usr/local/share/xray/geosite.dat:ro
-      - ./geoip.dat:/usr/local/share/xray/geoip.dat:ro
-      - ./geosite_2.dat:/usr/local/share/xray/geosite_2.dat:ro
-      - ./geoip_2.dat:/usr/local/share/xray/geoip_2.dat:ro
-      - ./logs:/var/log/remnanode
-${cert_volume_line}
-${XRAY_VOLUME_LINE}
-    ulimits:
-      nofile:
-        soft: $nofile_limit
-        hard: $nofile_limit
-      nproc:
-        soft: $nproc_limit
-        hard: $nproc_limit
-    env_file:
-      - .env
-EOF_COMPOSE
+  write_node_compose "$nofile_limit" "$nproc_limit"
 
   if ! pull_docker_image_with_fallback "remnawave/node:latest"; then
     warn "Образ remnawave/node:latest не удалось скачать заранее. docker compose up всё равно попробует сам."
   fi
 
-  local up_ok=0
-  local up_attempt
-  for up_attempt in 1 2 3; do
-    if run_cmd "Запускаю Remnawave Node (попытка $up_attempt/3)" docker_compose up -d; then
+  local up_ok=0 up_attempt=0 up_max=3 rlimit_fallback_done=0
+  while (( up_attempt < up_max )); do
+    up_attempt=$((up_attempt + 1))
+
+    if run_cmd "Запускаю Remnawave Node (попытка $up_attempt/$up_max)" docker_compose up -d; then
       up_ok=1
       break
     fi
+
+    # Страховка на случай, если расчётный потолок всё-таки оказался выше
+    # реального (нестандартный runc, вложенная виртуализация, seccomp-профиль):
+    # переписываем compose без блока ulimits и пробуем ещё раз. Нода с
+    # дефолтными лимитами docker рабочая — это лучше, чем не запустившаяся нода.
+    if [[ "$rlimit_fallback_done" -eq 0 ]] && log_has_rlimit_error; then
+      rlimit_fallback_done=1
+      warn "Контейнер не стартует из-за rlimit (ядро не даёт выставить запрошенные лимиты)."
+      warn "Убираю блок ulimits из docker-compose.yml и пробую снова — нода будет с дефолтными лимитами docker."
+      write_node_compose
+      # Откат не должен съедать попытку: иначе если rlimit всплыл на последней
+      # из трёх, исправленный compose так и не был бы запущен.
+      up_max=$((up_max + 1))
+      continue
+    fi
+
     warn "Не удалось запустить контейнер. Возможно, Docker Hub временно недоступен (403/лимит). Повтор через 10 секунд..."
     sleep 10
   done
@@ -6711,7 +6884,6 @@ main_menu() {
     echo "${C_BOLD}Главное меню:${C_RESET}"
     echo
     echo "  ${C_GREEN}1${C_RESET}) Автоматическая установка BBR3 + Remnawave Node"
-    echo "  ${C_GREEN}12${C_RESET}) Установка ноды ${C_DIM}(только нода и конфиг, без тюнингов)${C_RESET}"
     echo "  ${C_CYAN}2${C_RESET}) Продолжить установку после reboot"
     echo "  ${C_CYAN}3${C_RESET}) Ручная установка: показать README/команды"
     echo "  ${C_CYAN}4${C_RESET}) Настройка WARP"
@@ -6722,6 +6894,7 @@ main_menu() {
     echo "  ${C_CYAN}9${C_RESET}) Настройка портов (UFW)"
     echo "  ${C_CYAN}10${C_RESET}) Eclipse Firewall (nftables): порт ноды для панели + защита"
     echo "  ${C_CYAN}11${C_RESET}) Ограничение канала ${C_DIM}(исходящая скорость, Мбит/с)${C_RESET}"
+    echo "  ${C_GREEN}12${C_RESET}) Установка ноды ${C_DIM}(только нода и конфиг, без тюнингов)${C_RESET}"
     echo "  ${C_YELLOW}0${C_RESET}) Выход"
     echo
 
