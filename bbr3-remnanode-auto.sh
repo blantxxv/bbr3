@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.7.8"
+SCRIPT_VERSION="3.7.9"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -909,7 +909,7 @@ download_self_latest() {
 }
 
 ensure_saved_script_is_latest() {
-  local current_src current_version current_hash remote_content remote_version remote_hash tmp
+  local current_src current_version current_hash remote_version remote_hash tmp
 
   current_src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
   mkdir -p "$(dirname "$SCRIPT_PATH")"
@@ -935,15 +935,18 @@ ensure_saved_script_is_latest() {
     ok "Системная копия скрипта сохранена из текущего файла: $SCRIPT_PATH"
   fi
 
-  remote_content="$(fetch_remote_script)"
-  [[ -n "$remote_content" ]] || {
+  cleanup_old_script_copies || true
+  tmp="$(mktemp "${SCRIPT_PATH}.tmp.XXXXXX")"
+
+  if ! fetch_remote_script_to "$tmp"; then
+    rm -f "$tmp"
     warn "GitHub недоступен. Для продолжения после reboot сохранена текущая локальная копия."
     [[ -s "$SCRIPT_PATH" ]] || die "Нет локальной копии скрипта для продолжения после reboot."
     return 0
-  }
+  fi
 
-  remote_version="$(extract_script_version "$remote_content" || true)"
-  remote_hash="$(sha256_text "$remote_content" 2>/dev/null || true)"
+  remote_version="$(extract_script_version_from_file "$tmp")"
+  remote_hash="$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}' || true)"
 
   current_version="$SCRIPT_VERSION"
   current_hash=""
@@ -952,16 +955,6 @@ ensure_saved_script_is_latest() {
   fi
 
   if [[ -n "$remote_version" ]] && version_gt "$remote_version" "$current_version"; then
-    cleanup_old_script_copies || true
-    tmp="$(mktemp "${SCRIPT_PATH}.tmp.XXXXXX")"
-    printf '%s\n' "$remote_content" > "$tmp"
-
-    if [[ ! -s "$tmp" ]]; then
-      rm -f "$tmp"
-      warn "Удалённый скрипт пустой. Оставляю текущую локальную копию."
-      return 0
-    fi
-
     if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
       rm -f "$tmp"
       warn "Удалённый скрипт новее, но не прошёл bash -n. Оставляю текущую локальную копию."
@@ -979,6 +972,8 @@ ensure_saved_script_is_latest() {
     ok "Системная копия обновлена с GitHub до версии $remote_version"
     return 0
   fi
+
+  rm -f "$tmp"
 
   if [[ -n "$current_hash" && -n "$remote_hash" && "$remote_hash" != "$current_hash" && "$remote_version" == "$current_version" ]]; then
     warn "На GitHub файл отличается при той же версии $current_version. Не перезаписываю локальную копию автоматически."
@@ -1003,15 +998,67 @@ version_gt() {
 
   [[ "$lower" == "$b" ]]
 }
-fetch_remote_script() {
-  curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
+# Скачивает актуальный скрипт с GitHub В ФАЙЛ. Возвращает 0 при успехе.
+#
+# Именно в файл, а НЕ в переменную через $(...). Если передача обрывается
+# (медленный канал + прежний --max-time 20 на 300-килобайтный файл), curl с
+# --retry повторяет запрос и пишет тело ЗАНОВО в тот же stdout. Подстановка
+# команды склеивает обрывок с новой копией — получается синтаксически битый
+# «скрипт» на 20 тысяч строк, который потом валится на bash -n:
+#   line 19692: syntax error near unexpected token `('
+# С `-o` curl усекает файл на каждой попытке, поэтому склейка невозможна.
+# Проверено: захват в переменную дал 276 КБ мусора, `-o` — чистый префикс.
+fetch_remote_script_to() {
+  local dest="$1"
+
+  curl -fsSL --connect-timeout 10 --max-time 180 \
+    --retry 3 --retry-delay 2 $CURL_RETRY_ALL_ERRORS_FLAG \
+    --speed-limit "$DL_STALL_BYTES" --speed-time "$DL_STALL_SECS" \
     -H 'Cache-Control: no-cache' \
     -H 'Pragma: no-cache' \
-    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)" 2>/dev/null || true
+    -o "$dest" \
+    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)" 2>>"$LOG_FILE" || return 1
+
+  # Дополнительная защита от «скачалось, но не то»: наш скрипт всегда
+  # начинается шебангом и содержит SCRIPT_VERSION. Обрывок или страница
+  # ошибки CDN эту проверку не проходят.
+  [[ -s "$dest" ]] || return 1
+  head -n1 "$dest" | grep -q '^#!/usr/bin/env bash' || return 1
+
+  # Ровно ОДНА строка `SCRIPT_VERSION=` в начале строки. Это ловит склейку
+  # копий: две конкатенированные копии скрипта синтаксически валидны, их не
+  # видит ни bash -n, ни проверка запуска — а вот второй SCRIPT_VERSION виден.
+  [[ "$(grep -c '^SCRIPT_VERSION=' "$dest")" == "1" ]] || return 1
+
+  # И главное — файл должен быть ПОЛНЫМ. Обрубок вполне может оказаться
+  # синтаксически валидным (проверено: первые 5 КБ проходят bash -n) и даже
+  # отработать `--help` с кодом 0, потому что до диспетчера аргументов дело
+  # просто не доходит. То есть огрызок проскочил бы и bash -n, и
+  # script_loads_ok и заменил рабочий скрипт. Последняя значимая строка нашего
+  # файла — `esac` того самого диспетчера в самом конце.
+  [[ "$(awk 'NF{last=$0} END{print last}' "$dest")" == "esac" ]] || return 1
+
+  return 0
 }
 
-extract_script_version() {
-  awk -F'"' '/^SCRIPT_VERSION=/{print $2; found=1; exit} END{if (!found) exit 0}' <<< "${1:-}"
+# Версия из ФАЙЛА со скриптом.
+extract_script_version_from_file() {
+  awk -F'"' '/^SCRIPT_VERSION=/{print $2; exit}' "${1:-/dev/null}" 2>/dev/null || true
+}
+
+# Дешёвая проверка версии на GitHub: тянем только первые 2 КБ через Range
+# вместо всех 300 КБ. Главное меню дёргает её на каждую перерисовку, и полная
+# загрузка добавляла секунды ожидания к каждому возврату в меню.
+fetch_remote_version() {
+  local head_bytes
+
+  head_bytes="$(curl -fsSL --connect-timeout 3 --max-time 8 -r 0-2047 \
+    -H 'Cache-Control: no-cache' \
+    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)" 2>/dev/null || true)"
+
+  [[ -n "$head_bytes" ]] || return 0
+
+  awk -F'"' '/^SCRIPT_VERSION=/{print $2; exit}' <<< "$head_bytes"
 }
 
 # Подчищает старые/временные копии скрипта, чтобы не было конфликта версий.
@@ -1045,10 +1092,6 @@ current_script_path() {
   return 1
 }
 
-sha256_text() {
-  printf '%s\n' "$1" | sha256sum | awk '{print $1}'
-}
-
 # Проверяет, что скрипт не только парсится, но и ЗАГРУЖАЕТСЯ: прогоняет его с
 # --help, то есть исполняет весь верхний уровень.
 #
@@ -1069,14 +1112,11 @@ short_hash() {
   [[ -n "$h" ]] && echo "${h:0:12}" || echo "unknown"
 }
 
+# $1 — путь к УЖЕ СКАЧАННОМУ файлу (не содержимое: см. fetch_remote_script_to).
 update_self_and_restart() {
-  local remote_content="$1"
-  local tmp
+  local tmp="$1"
 
   mkdir -p "$(dirname "$SCRIPT_PATH")"
-  cleanup_old_script_copies || true
-  tmp="$(mktemp "${SCRIPT_PATH}.tmp.XXXXXX")"
-  printf '%s\n' "$remote_content" > "$tmp"
 
   if [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"
@@ -1106,23 +1146,29 @@ update_self_and_restart() {
 check_for_updates() {
   section "Проверка обновлений"
 
-  local remote_content remote_version remote_hash current_src local_hash ans same_version
+  local tmp remote_version remote_hash current_src local_hash ans same_version
 
-  remote_content="$(fetch_remote_script)"
+  cleanup_old_script_copies || true
+  tmp="$(mktemp "${SCRIPT_PATH}.tmp.XXXXXX")"
 
-  if [[ -z "$remote_content" ]]; then
+  if ! fetch_remote_script_to "$tmp"; then
+    rm -f "$tmp"
     warn "Не удалось получить актуальную версию скрипта с GitHub. Проверь сеть и попробуй позже."
     return 1
   fi
 
-  remote_version="$(extract_script_version "$remote_content" || true)"
+  remote_version="$(extract_script_version_from_file "$tmp")"
 
   if [[ -z "$remote_version" ]]; then
+    rm -f "$tmp"
     warn "Не удалось определить версию в скачанном скрипте."
     return 1
   fi
 
-  remote_hash="$(sha256_text "$remote_content" 2>/dev/null || true)"
+  # Хеши считаем ФАЙЛ-К-ФАЙЛУ. Раньше удалённый хеш брался от содержимого,
+  # прогнанного через `printf '%s\n'`, а локальный — от файла на диске: любое
+  # расхождение в хвостовых переводах строки давало ложное «файл отличается».
+  remote_hash="$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}' || true)"
   current_src="$(current_script_path || true)"
   local_hash=""
 
@@ -1137,6 +1183,7 @@ check_for_updates() {
   info "GitHub SHA256: $(short_hash "$remote_hash")"
 
   if [[ -n "$local_hash" && -n "$remote_hash" && "$remote_hash" == "$local_hash" ]]; then
+    rm -f "$tmp"
     ok "Установлен актуальный файл скрипта."
     return 0
   fi
@@ -1161,45 +1208,49 @@ check_for_updates() {
 
   case "${ans,,}" in
     y|yes|д|да)
-      update_self_and_restart "$remote_content"
+      update_self_and_restart "$tmp"
       ;;
     *)
+      rm -f "$tmp"
       ok "Обновление отложено."
       ;;
   esac
 }
 
 # Тихая проверка обновлений для главного меню: не блокирует, не спрашивает,
-# просто подсказывает, что есть новая версия или отличается файл (пункт меню "5").
+# просто подсказывает, что есть новая версия (пункт меню "5").
+#
+# Две вещи, из-за которых меню «долго реагировало»:
+#   1) качался ВЕСЬ скрипт (300 КБ) — теперь через Range берём первые 2 КБ,
+#      этого хватает, чтобы прочитать SCRIPT_VERSION;
+#   2) сеть дёргалась на КАЖДУЮ перерисовку меню, то есть после каждого
+#      возврата из любого пункта — теперь результат кэшируется.
+UPDATE_CHECK_CACHE="$STATE_DIR/update_check"
+UPDATE_CHECK_TTL=1800   # 30 минут
+
 notify_if_update_available() {
-  local remote_content remote_version remote_hash current_src local_hash
+  local now cached_at cached_ver remote_version
 
-  remote_content="$(curl -fsSL --connect-timeout 2 --max-time 4 \
-    -H 'Cache-Control: no-cache' \
-    -H 'Pragma: no-cache' \
-    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)" 2>/dev/null || true)"
+  now="$(date +%s)"
+  remote_version=""
 
-  [[ -n "$remote_content" ]] || return 0
+  if [[ -r "$UPDATE_CHECK_CACHE" ]]; then
+    read -r cached_at cached_ver < "$UPDATE_CHECK_CACHE" 2>/dev/null || true
+    if [[ "${cached_at:-}" =~ ^[0-9]+$ ]] && (( now - cached_at < UPDATE_CHECK_TTL )); then
+      remote_version="${cached_ver:-}"
+    fi
+  fi
 
-  remote_version="$(extract_script_version "$remote_content" || true)"
-  [[ -n "$remote_version" ]] || return 0
+  if [[ -z "$remote_version" ]]; then
+    remote_version="$(fetch_remote_version || true)"
+    [[ -n "$remote_version" ]] || return 0
 
-  remote_hash="$(sha256_text "$remote_content" 2>/dev/null || true)"
-  current_src="$(current_script_path || true)"
-  local_hash=""
-
-  if [[ -n "$current_src" && -r "$current_src" ]]; then
-    local_hash="$(sha256sum "$current_src" 2>/dev/null | awk '{print $1}' || true)"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    printf '%s %s\n' "$now" "$remote_version" > "$UPDATE_CHECK_CACHE" 2>/dev/null || true
   fi
 
   if version_gt "$remote_version" "$SCRIPT_VERSION"; then
     echo "${C_YELLOW}  Доступна новая версия: $remote_version (у тебя $SCRIPT_VERSION). Пункт меню «5» — обновить.${C_RESET}"
-    echo
-    return 0
-  fi
-
-  if [[ -n "$local_hash" && -n "$remote_hash" && "$remote_version" == "$SCRIPT_VERSION" && "$remote_hash" != "$local_hash" ]]; then
-    echo "${C_YELLOW}  На GitHub отличается файл той же версии $SCRIPT_VERSION. Пункт меню «5» — проверить обновления.${C_RESET}"
     echo
   fi
 }
