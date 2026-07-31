@@ -14,7 +14,7 @@ PROFILE_HOOK="/etc/profile.d/bbr3-remnanode-continue.sh"
 
 SELF_DOWNLOAD_URL="https://raw.githubusercontent.com/blantxxv/bbr3/refs/heads/main/bbr3-remnanode-auto.sh"
 WARP_INSTALL_URL="https://raw.githubusercontent.com/blantxxv/warp/main/warp-auto-install.sh"
-TORRENT_BLOCKER_INSTALL_URL="https://raw.githubusercontent.com/mahmudali1337-lab/torrent-blocker/master/install.sh"
+TORRENT_BLOCKER_INSTALL_URL="https://raw.githubusercontent.com/blantxxv/banan/main/install.sh"
 TORRENT_BLOCKER_BIN="/usr/local/bin/torrent-blocker"
 
 CPU_LEVEL=""
