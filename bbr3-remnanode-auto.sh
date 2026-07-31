@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.7.9"
+SCRIPT_VERSION="3.8.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -3639,7 +3639,57 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 retry(){ local n=$1; shift; local i=1; until "$@"; do [ "$i" -ge "$n" ] && return 1; warn "retry $i/$n"; sleep $((i*3)); i=$((i+1)); done; }
 APT_NET_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=25 -o Acquire::https::Timeout=25"
 apt_install(){ retry 3 apt-get $APT_NET_OPTS -o DPkg::Lock::Timeout=300 -y -q install "$@" >>"$LOG" 2>&1; }
+
+# [eclipse] Секунды -> "4м12с". Для счётчика длительности шагов.
+fmt_dur(){ if [ "$1" -ge 60 ]; then echo "$(($1/60))м$(($1%60))с"; else echo "$1с"; fi; }
+
+# [eclipse] Долгий шаг с живым счётчиком времени.
+#
+# Сборка nDPI молчит по несколько минут: весь вывод make/git уходит в лог, и на
+# экране не происходит НИЧЕГО — выглядит как зависание. Здесь команда уходит в
+# фон, а в одной строке тикает крутилка с временем шага.
+#
+# Крутилка намеренно ASCII: скрипт запускается через `bash -lc` с любой локалью,
+# и посимвольная нарезка UTF-8 (брайль, как в основном меню) в локали C дала бы
+# мусор из отдельных байтов.
+step(){
+  local msg="$1"; shift
+  local t0 pid rc i=0
+  local frames='|/-\'
+
+  t0=$(date +%s)
+  ( "$@" ) >>"$LOG" 2>&1 &
+  pid=$!
+
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r   %s %s — %s   ' "${frames:i%4:1}" "$msg" "$(fmt_dur $(( $(date +%s) - t0 )))"
+    i=$((i+1))
+    sleep 1
+  done
+
+  wait "$pid"; rc=$?
+  printf '\r\033[K'
+
+  if [ "$rc" = 0 ]; then
+    ok "$msg — готово за $(fmt_dur $(( $(date +%s) - t0 )))"
+  else
+    warn "$msg — ошибка rc=$rc (через $(fmt_dur $(( $(date +%s) - t0 ))))"
+  fi
+  return "$rc"
+}
+
 ensure_repos(){
+  # [eclipse] ТОЛЬКО Ubuntu. 'universe' — компонент Ubuntu, в Debian его нет
+  # вовсе. Без этой проверки скрипт дописывал ` universe` в Components внутри
+  # /etc/apt/sources.list.d/debian.sources, после чего apt-get update ругался
+  # на несуществующий компонент — и дальше не ставились ни linux-headers, ни
+  # build-essential. В логе это выглядело как «universe enabled» на Debian 12
+  # и следом headers=0, а сборка nDPI молча уходила в никуда на много минут.
+  if [ "${ID:-}" != "ubuntu" ]; then
+    log "OS=${ID:-?} — компонент universe есть только в Ubuntu, репозитории не трогаю"
+    return 0
+  fi
+
   # nDPI/Suricata build deps (dkms, libpcap-dev, libxtables-dev, suricata, flex, bison...)
   # live in the 'universe' component. Minimal/cloud images sometimes ship without it,
   # which makes those packages "have no installation candidate". Enable it before deps.
@@ -3707,6 +3757,19 @@ base_deps(){
 }
 
 # ============================ L1: nDPI ======================================
+
+# [eclipse] Долгие стадии вынесены в функции, чтобы их можно было передать в
+# step() одним словом — иначе пришлось бы городить bash -c с экранированием.
+# step запускает их в подоболочке, поэтому cd наружу не протекает.
+_ndpi_clone(){ retry 2 git clone --depth 1 -b "$NDPI_BRANCH" "$NDPI_REPO" ndpi-build; }
+_ndpi_lib(){   cd /opt/ndpi-build && ./autogen.sh && ./configure && make -j"$(nproc)"; }
+_ndpi_mod(){   cd /opt/ndpi-build/ndpi-netfilter && make -j"$(nproc)" $KMAKE; }
+_ndpi_dkms(){
+  dkms add -m ndpi -v 1.0
+  dkms build -m ndpi -v 1.0
+  dkms install -m ndpi -v 1.0 --force
+}
+
 build_ndpi(){
   [ "$MODULES_OK" = 1 ] || { warn "L1 nDPI skipped (container)"; return 1; }
   # Re-run aware: was OUR nDPI already working before this run? If a rebuild
@@ -3722,19 +3785,22 @@ build_ndpi(){
     apt_install clang lld llvm || warn "clang/lld/llvm install failed"
     KMAKE="LLVM=1"
   fi
-  apt_install "linux-headers-$KREL" || true
+  step "Ставлю заголовки ядра linux-headers-$KREL" apt_install "linux-headers-$KREL" || true
   if [ ! -d "/lib/modules/$KREL/build" ]; then
     _da="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-    for _hp in linux-headers-generic "linux-headers-$_da" "linux-headers-cloud-$_da"; do apt_install "$_hp" && break; done
+    for _hp in linux-headers-generic "linux-headers-$_da" "linux-headers-cloud-$_da"; do
+      step "Пробую заголовки $_hp" apt_install "$_hp" && break
+    done
   fi
   [ -d "/lib/modules/$KREL/build" ] || { warn "no kernel headers for $KREL — L1 skipped"; return 1; }
-  apt_install build-essential git autoconf automake libtool pkg-config libpcap-dev libgcrypt20-dev flex bison libxtables-dev dkms || warn "some nDPI deps failed to install"
+  step "Ставлю зависимости сборки nDPI" apt_install build-essential git autoconf automake libtool pkg-config libpcap-dev libgcrypt20-dev flex bison libxtables-dev dkms \
+    || warn "some nDPI deps failed to install"
   _miss=""; for _b in gcc make dkms pkg-config git; do have "$_b" || _miss="$_miss $_b"; done
   [ -n "$_miss" ] && { warn "nDPI build tools missing:$_miss — L1 skipped (enable universe/base repos)"; return 1; }
   cd /opt || return 1; rm -rf ndpi-build
-  retry 2 git clone --depth 1 -b "$NDPI_BRANCH" "$NDPI_REPO" ndpi-build >>"$LOG" 2>&1 || { warn "git clone failed"; return 1; }
-  ( cd /opt/ndpi-build && ./autogen.sh && ./configure && make -j"$(nproc)" ) >>"$LOG" 2>&1 || { warn "libnDPI build failed"; return 1; }
-  ( cd /opt/ndpi-build/ndpi-netfilter && make -j"$(nproc)" $KMAKE ) >>"$LOG" 2>&1
+  step "Клонирую исходники nDPI" _ndpi_clone || { warn "git clone failed"; return 1; }
+  step "Собираю libnDPI (самый долгий шаг)" _ndpi_lib || { warn "libNDPI build failed"; return 1; }
+  step "Собираю модуль ядра xt_ndpi" _ndpi_mod || true
   local KO SO; KO=$(find /opt/ndpi-build -name xt_ndpi.ko|head -1); SO=$(find /opt/ndpi-build -name libxt_ndpi.so|head -1)
   if [ -z "$KO" ] || [ -z "$SO" ]; then
     if [ "$had_ndpi" = 1 ]; then warn "nDPI rebuild did not complete — keeping the existing working module"; ndpi_conf; return 0; fi
@@ -3752,7 +3818,7 @@ MAKE[0]="make -C ndpi-netfilter/src KERNEL_DIR=/lib/modules/\${kernelver}/build 
 CLEAN="make -C ndpi-netfilter/src KERNEL_DIR=/lib/modules/\${kernelver}/build clean"
 AUTOINSTALL="yes"
 DK
-  dkms add -m ndpi -v 1.0 >>"$LOG" 2>&1; dkms build -m ndpi -v 1.0 >>"$LOG" 2>&1; dkms install -m ndpi -v 1.0 --force >>"$LOG" 2>&1
+  step "Регистрирую модуль в DKMS (пересборка при обновлении ядра)" _ndpi_dkms || true
   modinfo xt_ndpi >/dev/null 2>&1 || { mkdir -p "/lib/modules/$KREL/updates/dkms"; cp "$KO" "/lib/modules/$KREL/updates/dkms/"; depmod -a; }
   local XTDIR; XTDIR="$(pkg-config --variable=xtlibdir xtables 2>/dev/null || echo /usr/lib/$(uname -m)-linux-gnu/xtables)"
   cp "$SO" "$XTDIR/libxt_ndpi.so" 2>/dev/null
@@ -3769,7 +3835,7 @@ ndpi_conf(){ echo 'options xt_ndpi bt_hash_size=32 bt_hash_timeout=1200' > /etc/
 setup_suricata(){
   [ "$NFQ_OK" = 1 ] || { warn "L2 Suricata skipped (no NFQUEUE)"; return 1; }
   log "--- L2: Suricata (NFQUEUE, UDP) ---"
-  have suricata || apt_install suricata || { warn "suricata install failed — L2 skipped"; return 1; }
+  have suricata || step "Ставлю Suricata" apt_install suricata || { warn "suricata install failed — L2 skipped"; return 1; }
   mkdir -p /etc/suricata/rules; write_ds_p2p_rules
   sed -i 's|^default-rule-path:.*|default-rule-path: /etc/suricata/rules|' /etc/suricata/suricata.yaml 2>/dev/null
   sed -i 's|^\([[:space:]]*\)- suricata.rules|\1- ds-p2p.rules|' /etc/suricata/suricata.yaml 2>/dev/null
