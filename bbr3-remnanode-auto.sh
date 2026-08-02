@@ -6007,10 +6007,14 @@ generate_tls_panel_config() {
   hy2_password="$(openssl rand -base64 32)"
   config_path="$REMNANODE_DIR/panel-inbounds.json"
 
+  # loglevel warning, а не info: info пишет в error.log каждое соединение и на
+  # нагруженной ноде даёт десятки МБ в сутки. access.log это не затрагивает —
+  # он управляется полем "access" (его читает слой B Torrent Guard по тегу
+  # TORRENT); выключает access.log только "none".
   cat > "$config_path" <<EOF_PANEL
 {
   "log": {
-    "loglevel": "info",
+    "loglevel": "warning",
     "access": "/var/log/remnanode/access.log",
     "error": "/var/log/remnanode/error.log"
   },
@@ -6168,23 +6172,33 @@ EOF_PANEL
   info "Скопируй JSON выше (или файл $config_path) в конфиг инбаундов ноды в панели Remnawave."
 }
 
-# Генерирует Hysteria2-инбаунд (JSON-фрагмент) для REALITY-установок.
-# Сам VLESS+REALITY inbound управляется отдельно (selfsteal.sh / вручную в
-# панели), поэтому здесь только объект инбаунда Hysteria2 — его нужно
-# добавить в массив "inbounds" существующего конфига ноды в панели, рядом
-# с REALITY-инбаундом. Порт Hysteria2 (UDP) может совпадать по номеру с
-# портом REALITY (TCP) — это разные протоколы, конфликта нет.
-generate_hysteria2_panel_config() {
-  section "Конфиг Hysteria2 для панели"
+# Печатает объект инбаунда Hysteria2 с заданным отступом ($1, по умолчанию
+# 4 пробела — уровень элемента массива "inbounds").
+#
+# Именно фрагмент, а не отдельный файл: панель Remnawave принимает ОДИН конфиг
+# xray на ноду, поэтому Hysteria2 должен лежать в том же массиве "inbounds",
+# что и основной инбаунд. Раньше REALITY-ветка писала его в отдельный
+# panel-inbound-hysteria2.json и просила слить руками — лишний шаг, на котором
+# инбаунд регулярно терялся. TLS-ветка всегда делала правильно (оба инбаунда в
+# одном файле), теперь так же и здесь.
+#
+# Порт Hysteria2 (UDP) может совпадать по номеру с портом основного инбаунда
+# (TCP) — это независимые пространства портов, конфликта нет.
+#
+# Пароль обфускации отдаётся наружу через HY2_OBFS_PASSWORD: он нужен в выводе,
+# а генерируется здесь.
+HY2_OBFS_PASSWORD=""
 
-  local hy2_tag hy2_password config_path suffix
+hysteria2_inbound_json() {
+  local indent="${1:-    }" suffix hy2_tag
 
   suffix="${TAG_SUFFIX:-$(gen_tag_suffix)}"
   hy2_tag="HYSTERIA2_SALAMANDER_${HY2_PORT}_${suffix}"
-  hy2_password="$(openssl rand -base64 32)"
-  config_path="$REMNANODE_DIR/panel-inbound-hysteria2.json"
+  HY2_OBFS_PASSWORD="$(openssl rand -base64 32)"
 
-  cat > "$config_path" <<EOF_HY2
+  # sed добавляет отступ каждой строке: фрагмент вставляется внутрь массива,
+  # и без этого JSON остался бы валидным, но нечитаемым.
+  sed "s/^/$indent/" <<EOF_HY2
 {
   "tag": "$hy2_tag",
   "port": $HY2_PORT,
@@ -6222,7 +6236,7 @@ generate_hysteria2_panel_config() {
     "hysteriaSettings": {
       "obfs": {
         "type": "salamander",
-        "password": "$hy2_password"
+        "password": "$HY2_OBFS_PASSWORD"
       },
       "version": 2,
       "udpIdleTimeout": 60
@@ -6230,25 +6244,6 @@ generate_hysteria2_panel_config() {
   }
 }
 EOF_HY2
-
-  chmod 600 "$config_path"
-
-  if command -v jq >/dev/null 2>&1; then
-    if jq empty "$config_path" >/dev/null 2>&1; then
-      ok "JSON инбаунда Hysteria2 валиден"
-    else
-      warn "JSON инбаунда Hysteria2 не прошёл проверку jq. Проверь файл вручную: $config_path"
-    fi
-  fi
-
-  ok "Готовый инбаунд Hysteria2 сохранён: $config_path"
-  echo
-  echo "${C_DIM}────────────────────────────────────────────────────────────${C_RESET}"
-  cat "$config_path"
-  echo "${C_DIM}────────────────────────────────────────────────────────────${C_RESET}"
-  echo
-  info "Добавь этот объект в массив \"inbounds\" конфига ноды в панели Remnawave — рядом с существующим VLESS+REALITY инбаундом."
-  info "Порт $HY2_PORT/UDP (Hysteria2) может совпадать по номеру с портом REALITY по TCP — это независимые протоколы."
 }
 
 # Спрашивает параметры REALITY-инбаунда. Логика зависит от того, поднимали ли
@@ -6423,7 +6418,7 @@ generate_reality_keys() {
 generate_reality_panel_config() {
   section "Конфиг REALITY для панели"
 
-  local short_id keys priv_key pub_key config_path suffix
+  local short_id keys priv_key pub_key config_path suffix hy2_block=""
 
   suffix="${TAG_SUFFIX:-$(gen_tag_suffix)}"
   short_id="$(openssl rand -hex 8)"
@@ -6451,12 +6446,23 @@ generate_reality_panel_config() {
     fi
   fi
 
+  # Hysteria2 идёт ВНУТРЬ этого же конфига, а не отдельным файлом: панель
+  # принимает один конфиг xray на ноду.
+  if [[ "$HYSTERIA2_ENABLED" -eq 1 && "$CERT_OK" -eq 1 ]]; then
+    hy2_block=",
+$(hysteria2_inbound_json '    ')"
+  fi
+
   config_path="$REMNANODE_DIR/panel-inbounds.json"
 
+  # loglevel warning, а не info: info пишет в error.log каждое соединение и на
+  # нагруженной ноде даёт десятки МБ в сутки на пустом месте. На access.log это
+  # не влияет — он управляется полем "access" и продолжает писаться (его читает
+  # слой B Torrent Guard по тегу TORRENT). Выключает access.log только "none".
   cat > "$config_path" <<EOF_REALITY
 {
   "log": {
-    "loglevel": "info",
+    "loglevel": "warning",
     "access": "/var/log/remnanode/access.log",
     "error": "/var/log/remnanode/error.log"
   },
@@ -6492,7 +6498,7 @@ generate_reality_panel_config() {
           ]
         }
       }
-    }
+    }${hy2_block}
   ],
   "outbounds": [
     {
@@ -6567,6 +6573,12 @@ EOF_REALITY
   echo
   echo "  ${C_BOLD}Публичный ключ (publicKey) для клиента/панели:${C_RESET} $pub_key"
   echo "  ${C_BOLD}shortId:${C_RESET} $short_id"
+  if [[ -n "$hy2_block" ]]; then
+    echo
+    echo "  ${C_BOLD}Hysteria2 включён и лежит в этом же конфиге:${C_RESET}"
+    echo "  ${C_BOLD}порт:${C_RESET} ${HY2_PORT}/UDP · ${C_BOLD}домен:${C_RESET} $DOMAIN"
+    echo "  ${C_BOLD}obfs (salamander) password:${C_RESET} ${HY2_OBFS_PASSWORD:-<не задан>}"
+  fi
   if [[ "$REALITY_ENCRYPTION_ENABLED" -eq 1 && -n "$REALITY_ENCRYPTION" ]]; then
     echo
     echo "  ${C_BOLD}VLESS Encryption включён (mlkem768x25519plus.${VLESS_ENC_MODE}):${C_RESET}"
@@ -6820,8 +6832,19 @@ EOF_ENV
   # Выбор ядра Xray до старта контейнера (может смонтировать своё ядро).
   setup_xray_core_for_install
 
+  # Условие — ФАКТ наличия сертификата, а не тип установки.
+  #
+  # Раньше здесь стояло `NODE_INSTALL_TYPE == tls`, и связка REALITY+Hysteria2
+  # ломалась молча: сертификат выпускался, в конфиг инбаунда прописывались пути
+  # /etc/letsencrypt/live/<домен>/{privkey,fullchain}.pem, но каталог в
+  # контейнер не монтировался — внутри его просто нет, и Hysteria2 не
+  # поднимался. REALITY при этом работал, поэтому со стороны выглядело как
+  # «Hysteria2 не заводится», а не как отсутствующий mount.
+  #
+  # CERT_OK=1 выставляется только там, где сертификат реально нужен и получен
+  # (TLS-инбаунд либо Hysteria2 поверх REALITY), так что этой проверки хватает.
   local cert_volume_line=""
-  if [[ "$NODE_INSTALL_TYPE" == "tls" && "$CERT_OK" -eq 1 ]]; then
+  if [[ "$CERT_OK" -eq 1 ]]; then
     cert_volume_line="      - /etc/letsencrypt:/etc/letsencrypt:ro"
   fi
 
@@ -6892,16 +6915,14 @@ EOF_ENV
       warn "Выпусти сертификат вручную и добавь TLS-инбаунды в панели самостоятельно."
     fi
   elif [[ "$NODE_INSTALL_TYPE" == "reality" ]]; then
-    generate_reality_panel_config
-
-    if [[ "$HYSTERIA2_ENABLED" -eq 1 ]]; then
-      if [[ "$CERT_OK" -eq 1 ]]; then
-        generate_hysteria2_panel_config
-      else
-        warn "Сертификат для Hysteria2 не был выпущен — пропускаю генерацию инбаунда."
-        warn "Выпусти сертификат вручную и добавь Hysteria2-инбаунд в панели самостоятельно."
-      fi
+    # Hysteria2 (если включён и сертификат есть) попадает в тот же
+    # panel-inbounds.json — отдельного файла больше нет.
+    if [[ "$HYSTERIA2_ENABLED" -eq 1 && "$CERT_OK" -ne 1 ]]; then
+      warn "Сертификат для Hysteria2 не был выпущен — инбаунд Hysteria2 в конфиг не попадёт."
+      warn "Выпусти сертификат вручную и добавь Hysteria2-инбаунд в панели самостоятельно."
     fi
+
+    generate_reality_panel_config
   fi
 
   # Если UFW уже активен — открываем порты этой ноды, чтобы не потерять связь.
@@ -8127,12 +8148,10 @@ stage_after_reboot() {
   elif [[ "$NODE_INSTALL_TYPE" == "reality" ]]; then
     echo "  Конфиг инбаундов для панели:"
     echo "    $REMNANODE_DIR/panel-inbounds.json"
-    echo
     if [[ "$HYSTERIA2_ENABLED" -eq 1 && "$CERT_OK" -eq 1 ]]; then
-      echo "  Конфиг инбаунда Hysteria2 для панели:"
-      echo "    $REMNANODE_DIR/panel-inbound-hysteria2.json"
-      echo
+      echo "    (REALITY + Hysteria2 — оба инбаунда в этом файле)"
     fi
+    echo
   fi
 }
 
@@ -8197,8 +8216,7 @@ install_node_only() {
   echo
 
   if [[ "$NODE_INSTALL_TYPE" == "reality" && "$HYSTERIA2_ENABLED" -eq 1 && "$CERT_OK" -eq 1 ]]; then
-    echo "  Конфиг инбаунда Hysteria2 для панели:"
-    echo "    $REMNANODE_DIR/panel-inbound-hysteria2.json"
+    echo "  Hysteria2 включён — его инбаунд уже внутри panel-inbounds.json."
     echo
   fi
 
