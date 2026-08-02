@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.8.0"
+SCRIPT_VERSION="3.8.1"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -2410,11 +2410,85 @@ EOF_DOCKERLIM
   systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
 }
 
+# Демон реально принимает запросы, а не просто «активен» по мнению systemd.
+# После restart сокет открывается не мгновенно, и следующий же docker pull
+# успевал упереться в «Cannot connect to the Docker daemon».
+docker_daemon_ready() {
+  local i
+  command -v docker >/dev/null 2>&1 || return 1
+
+  for i in $(seq 1 15); do
+    docker info >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+
+  return 1
+}
+
+# Перезапуск демона docker, устойчивый к рейт-лимиту systemd.
+#
+# У docker.service в апстрим-юните стоит StartLimitBurst=3 / StartLimitInterval=60s.
+# Установщик сам поднимает демон, дальше скрипт правит drop-in с лимитами и
+# daemon.json — и очередной `systemctl restart docker` за ту же минуту systemd
+# уже не выполняет: возвращает "start request repeated too quickly" мгновенно
+# (rc=1, меньше секунды), юнит уходит в failed, и docker остаётся лежать до
+# конца установки. Дальше валится всё: docker pull, compose up, ротация.
+# Откат конфига в этой ситуации не помогает — рейт-лимит не про конфиг, поэтому
+# «перезапуск со старым daemon.json» падал ровно так же.
+#
+# Отсюда: перед каждым стартом сбрасываем счётчик (reset-failed), а если всё
+# равно упёрлись — ждём окно рейт-лимита и повторяем.
+docker_restart_daemon() {
+  local msg="$1" attempt rc=1
+
+  for attempt in 1 2 3; do
+    systemctl reset-failed docker.service docker.socket >> "$LOG_FILE" 2>&1 || true
+
+    if run_cmd "$msg" systemctl restart docker; then
+      # CLI ещё нет (перезапуск в середине установки движка) — проверять нечем,
+      # верим systemd.
+      command -v docker >/dev/null 2>&1 || return 0
+
+      if docker_daemon_ready; then
+        return 0
+      fi
+      rc=1
+      log_line "docker: systemctl restart прошёл, но docker info не отвечает (попытка $attempt/3)"
+    else
+      rc="$?"
+    fi
+
+    (( attempt < 3 )) || break
+    warn "Docker не поднялся (попытка $attempt/3). Жду 25 с и пробую снова — обычно это лимит частоты запусков systemd."
+    sleep 25
+  done
+
+  return "$rc"
+}
+
+# Гарантия «демон жив» для шагов, которым он нужен (pull, compose up, ротация).
+# Без этого одна неудача перезапуска раньше по скрипту тянула за собой каскад
+# бессмысленных ошибок «Is the docker daemon running?».
+ensure_docker_alive() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker info >/dev/null 2>&1 && return 0
+
+  warn "Docker-демон не отвечает — пробую поднять его перед следующим шагом."
+
+  if docker_restart_daemon "Поднимаю Docker-демон"; then
+    ok "Docker-демон снова отвечает."
+    return 0
+  fi
+
+  fail "Docker-демон поднять не удалось. Диагностика: journalctl -u docker -n 50"
+  return 1
+}
+
 # Перезапуск docker после установки drop-in. Если юнит из-за него не поднялся,
 # drop-in снимаем и поднимаем docker обратно: остаться без docker хуже, чем
 # остаться с дистрибутивными лимитами (их всё равно учтёт container_rlimit_ceiling).
 restart_docker_with_limits() {
-  if run_cmd "Перезапускаю Docker (новые лимиты юнита)" systemctl restart docker; then
+  if docker_restart_daemon "Перезапускаю Docker (новые лимиты юнита)"; then
     return 0
   fi
 
@@ -2422,7 +2496,7 @@ restart_docker_with_limits() {
   rm -f "$DOCKER_LIMITS_DROPIN"
   systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
 
-  run_cmd "Перезапускаю Docker (без drop-in)" systemctl restart docker
+  docker_restart_daemon "Перезапускаю Docker (без drop-in)"
 }
 
 install_docker() {
@@ -2454,6 +2528,15 @@ install_docker() {
   # daemon.json больше НЕ переписывается целиком: раньше `cat >` затирал всё,
   # что туда положил хостер или админ (data-root, dns, proxies, insecure-registries).
   # Теперь свои ключи вливаем через jq, остальные сохраняются как есть.
+  #
+  # И лимиты контейнеров, и политика логов пишутся в ОДИН проход, после чего
+  # демон перезапускается ОДИН раз. Раньше это были два независимых шага с двумя
+  # перезапусками; вместе с перезапуском под drop-in лимитов они за пять секунд
+  # выбирали StartLimitBurst docker.service — systemd отказывал в старте, и
+  # демон лежал до конца установки (см. docker_restart_daemon).
+  local daemon_changed=0
+  DOCKER_DAEMON_BACKED_UP=0
+
   if ensure_jq; then
     local daemon_tmp
     [[ -f "$DOCKER_DAEMON_JSON" ]] || echo '{}' > "$DOCKER_DAEMON_JSON"
@@ -2470,18 +2553,12 @@ install_docker() {
               }
             | .["live-restore"] = true
           ' "$DOCKER_DAEMON_JSON" > "$daemon_tmp"; then
-        eclipse_backup_file "$DOCKER_DAEMON_JSON" > /dev/null || true
-        install -m 0644 "$daemon_tmp" "$DOCKER_DAEMON_JSON"
-        rm -f "$daemon_tmp"
-
-        if docker_daemon_validate "$DOCKER_DAEMON_JSON"; then
-          run_cmd "Перезапускаю Docker (default-ulimits)" systemctl restart docker \
-            || warn "Docker не перезапустился — смотри journalctl -u docker -n 50"
-        else
-          fail "daemon.json не прошёл валидацию — откатываю."
-          eclipse_restore_file "$DOCKER_DAEMON_JSON" \
-            && run_cmd "Перезапускаю Docker (прежний daemon.json)" systemctl restart docker
+        if [[ "$(jq -S . "$DOCKER_DAEMON_JSON")" != "$(jq -S . "$daemon_tmp")" ]]; then
+          docker_daemon_backup_once
+          install -m 0644 "$daemon_tmp" "$DOCKER_DAEMON_JSON"
+          daemon_changed=1
         fi
+        rm -f "$daemon_tmp"
       else
         rm -f "$daemon_tmp"
         warn "jq не смог обновить $DOCKER_DAEMON_JSON — оставляю как есть."
@@ -2493,8 +2570,18 @@ install_docker() {
     warn "jq не установлен — daemon.json не изменён (сливать его вслепую опасно)."
   fi
 
-  # Политика логов контейнеров: отдельным шагом, со своей валидацией и откатом.
-  docker_configure_logging || warn "Политика логов Docker не применена — см. выше."
+  # Политика логов контейнеров: тот же файл, без своего перезапуска.
+  if docker_configure_logging --defer-restart; then
+    if [[ "$DOCKER_LOG_CONFIG_CHANGED" -eq 1 ]]; then
+      daemon_changed=1
+    fi
+  else
+    warn "Политика логов Docker не применена — см. выше."
+  fi
+
+  if [[ "$daemon_changed" -eq 1 ]]; then
+    docker_apply_daemon_json || warn "daemon.json применить не удалось — Docker работает с прежней конфигурацией."
+  fi
 
   local docker_v compose_v
   docker_v="$(docker --version 2>/dev/null || true)"
@@ -2882,6 +2969,142 @@ EOF_AUTHHOOK
   fi
 }
 
+# ── Освобождение TCP:80 под HTTP-01 ─────────────────────────────────────────
+#
+# certbot --standalone поднимает собственный слушатель на :80. В сценарии
+# «REALITY + Hysteria2» к этому моменту уже отработал selfsteal.sh и на сервере
+# крутится Caddy-заглушка, которая держит :80 (и :443). Раньше здесь глушились
+# только nginx и apache2 — Caddy оставался, certbot получал "Could not bind to
+# port 80", и выпуск сертификата для Hysteria2 просто падал.
+#
+# Поэтому: перед выпуском гасим ВСЁ, что держит :80 (юниты и docker-контейнеры),
+# запоминаем что именно, а после выпуска поднимаем обратно. Заглушка недоступна
+# считанные секунды — REALITY при этом не страдает, он живёт на :443.
+
+PORT80_STOPPED_UNITS=()
+PORT80_STOPPED_CONTAINERS=()
+
+# Кто сейчас слушает TCP:80. Пусто — порт свободен.
+# Порт матчим по границе (начало строки или двоеточие), иначе :8080 и :180
+# считались бы занятым восьмидесятым.
+port80_listener() {
+  command -v ss >/dev/null 2>&1 || return 1
+
+  ss -lntp 2>/dev/null \
+    | awk '$4 ~ /(^|:)80$/ {
+             for (i = 1; i <= NF; i++)
+               if ($i ~ /^users:/) { print $i; found = 1 }
+             if (!found) print "неизвестный процесс"
+             exit
+           }' \
+    | sed 's/users:((//; s/))$//'
+}
+
+# Контейнеры docker, публикующие :80 наружу (selfsteal-Caddy — типичный случай).
+port80_containers() {
+  docker info >/dev/null 2>&1 || return 0
+  docker ps --filter publish=80 --format '{{.Names}}' 2>/dev/null || true
+}
+
+# Запасной поиск: при network_mode: host контейнер порт не «публикует», и
+# --filter publish=80 его не видит, хотя :80 он занимает. Ищем по имени/образу.
+port80_containers_by_name() {
+  docker info >/dev/null 2>&1 || return 0
+  docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null \
+    | grep -iE 'caddy|selfsteal|steal' \
+    | awk '{print $1}' | sort -u || true
+}
+
+# Останавливает контейнер и запоминает его для обратного запуска.
+port80_stop_container() {
+  local ctr="$1" known
+
+  for known in "${PORT80_STOPPED_CONTAINERS[@]:-}"; do
+    [[ "$known" == "$ctr" ]] && return 0
+  done
+
+  if docker stop "$ctr" >> "$LOG_FILE" 2>&1; then
+    PORT80_STOPPED_CONTAINERS+=("$ctr")
+  else
+    warn "Не удалось остановить контейнер $ctr, занимающий порт 80."
+  fi
+
+  return 0
+}
+
+free_port80_for_http01() {
+  local unit ctr holder
+
+  PORT80_STOPPED_UNITS=()
+  PORT80_STOPPED_CONTAINERS=()
+
+  for unit in nginx apache2 caddy; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      systemctl stop "$unit" >> "$LOG_FILE" 2>&1 || true
+      PORT80_STOPPED_UNITS+=("$unit")
+    fi
+  done
+
+  if command -v docker >/dev/null 2>&1; then
+    while read -r ctr; do
+      [[ -n "$ctr" ]] || continue
+      port80_stop_container "$ctr"
+    done < <(port80_containers)
+
+    # Порт всё ещё занят — добираем host-network заглушки по имени образа.
+    if [[ -n "$(port80_listener || true)" ]]; then
+      while read -r ctr; do
+        [[ -n "$ctr" ]] || continue
+        port80_stop_container "$ctr"
+      done < <(port80_containers_by_name)
+    fi
+  fi
+
+  if [[ ${#PORT80_STOPPED_UNITS[@]} -gt 0 || ${#PORT80_STOPPED_CONTAINERS[@]} -gt 0 ]]; then
+    info "Останавливаю на время выпуска: ${PORT80_STOPPED_UNITS[*]:-} ${PORT80_STOPPED_CONTAINERS[*]:-}"
+    info "Подниму обратно сразу после certbot."
+  fi
+
+  # Сокет освобождается не мгновенно после остановки процесса — даём ему пару
+  # секунд, иначе certbot стартует в аккурат в этот зазор.
+  local i
+  for i in 1 2 3 4 5; do
+    holder="$(port80_listener || true)"
+    [[ -n "$holder" ]] || break
+    sleep 1
+  done
+
+  # Кто-то всё ещё держит порт — сообщаем ДО certbot, иначе непонятная ошибка
+  # "Could not bind to port 80" всплывёт уже из его вывода.
+  if [[ -n "$holder" ]]; then
+    warn "Порт 80 всё ещё занят: $holder"
+    warn "certbot --standalone может не подняться. Останови этот процесс вручную либо выпусти сертификат через DNS-01 (несколько A-записей у домена)."
+  else
+    ok "Порт 80 свободен."
+  fi
+}
+
+restore_port80_after_http01() {
+  local unit ctr
+
+  for unit in "${PORT80_STOPPED_UNITS[@]:-}"; do
+    [[ -n "$unit" ]] || continue
+    systemctl start "$unit" >> "$LOG_FILE" 2>&1 \
+      && ok "Сервис $unit поднят обратно." \
+      || warn "Не удалось поднять $unit обратно — проверь: systemctl status $unit"
+  done
+
+  for ctr in "${PORT80_STOPPED_CONTAINERS[@]:-}"; do
+    [[ -n "$ctr" ]] || continue
+    docker start "$ctr" >> "$LOG_FILE" 2>&1 \
+      && ok "Контейнер $ctr запущен обратно." \
+      || warn "Не удалось запустить контейнер $ctr обратно — проверь: docker start $ctr"
+  done
+
+  PORT80_STOPPED_UNITS=()
+  PORT80_STOPPED_CONTAINERS=()
+}
+
 issue_tls_certificate() {
   section "11/12 · TLS сертификат"
 
@@ -2994,8 +3217,9 @@ issue_tls_certificate() {
       info "HTTP-01 (порт 80) при этом не проходит — переключаюсь на DNS-01 (TXT-запись)."
       issue_cert_dns01_manual "$DOMAIN"
     else
-      run_shell "Освобождаю порт 80 (если занят nginx/apache)" \
-        "systemctl stop nginx >/dev/null 2>&1 || true; systemctl stop apache2 >/dev/null 2>&1 || true; true"
+      # Порт освобождаем и возвращаем ВСЕГДА — в том числе когда certbot упал:
+      # иначе после неудачной попытки Caddy-заглушка так и осталась бы лежать.
+      free_port80_for_http01
 
       if run_cmd "Выпускаю сертификат Let's Encrypt (HTTP-01) для $DOMAIN" \
         certbot certonly --standalone --non-interactive --agree-tos \
@@ -3007,6 +3231,8 @@ issue_tls_certificate() {
           CERT_OK=1
         fi
       fi
+
+      restore_port80_after_http01
     fi
 
     if [[ "$CERT_OK" -eq 1 ]]; then
@@ -3060,14 +3286,23 @@ ask_enable_hysteria2() {
 step_transport_setup() {
   if [[ "$NODE_INSTALL_TYPE" == "tls" ]]; then
     issue_tls_certificate
-  else
-    optional_selfsteal
-    ask_enable_hysteria2
-
-    if [[ "$HYSTERIA2_ENABLED" -eq 1 ]]; then
-      issue_tls_certificate
-    fi
+    return
   fi
+
+  # Порядок здесь не косметический. selfsteal.sh поднимает Caddy-заглушку,
+  # которая занимает :80, а сертификат для Hysteria2 выпускается по HTTP-01 —
+  # то есть тоже через :80. Пока selfsteal шёл первым, выпуск падал на
+  # "Could not bind to port 80". Поэтому сначала спрашиваем про Hysteria2 и
+  # выпускаем сертификат на свободном порту, и только потом ставим заглушку.
+  # (Если Caddy уже стоит с прошлой установки, его на время выпуска гасит
+  # free_port80_for_http01 — одно другому не мешает.)
+  ask_enable_hysteria2
+
+  if [[ "$HYSTERIA2_ENABLED" -eq 1 ]]; then
+    issue_tls_certificate
+  fi
+
+  optional_selfsteal
 }
 
 run_warp_setup() {
@@ -3768,7 +4003,69 @@ resolve_node_log_driver() {
   echo "$NODE_LOG_DRIVER"
 }
 
+# daemon.json за один проход правят два шага (лимиты контейнеров и политика
+# логов). Точка отката должна быть ОДНА — состояние файла до первой правки,
+# иначе откат вернул бы промежуточный вариант, а на повторном запуске (когда
+# первый шаг ничего не менял) — вообще копию из прошлой установки.
+DOCKER_DAEMON_BACKED_UP=0
+
+docker_daemon_backup_once() {
+  local backup
+
+  [[ "$DOCKER_DAEMON_BACKED_UP" -eq 1 ]] && return 0
+
+  backup="$(eclipse_backup_file "$DOCKER_DAEMON_JSON" || true)"
+  DOCKER_DAEMON_BACKED_UP=1
+  [[ -n "$backup" ]] && info "Резервная копия: $backup"
+
+  return 0
+}
+
+# Валидирует /etc/docker/daemon.json и перезапускает демон ОДИН раз.
+# Если демон не поднялся — откатывает файл на резервную копию и поднимает docker
+# обратно. Единая точка: и install_docker, и пункт меню ходят сюда.
+docker_apply_daemon_json() {
+  [[ -f "$DOCKER_DAEMON_JSON" ]] || return 0
+
+  # Валидатор отверг конфиг — демон ещё работает со старым, трогать его нечего:
+  # просто возвращаем файл на место.
+  if ! docker_daemon_validate "$DOCKER_DAEMON_JSON"; then
+    fail "daemon.json не прошёл валидацию — откатываю, демон не перезапускаю."
+    eclipse_restore_file "$DOCKER_DAEMON_JSON" \
+      && warn "daemon.json восстановлен из резервной копии."
+    return 1
+  fi
+
+  if docker_restart_daemon "Перезапускаю Docker (новый daemon.json)"; then
+    return 0
+  fi
+
+  fail "Docker не перезапустился с новым daemon.json — откатываю."
+  if eclipse_restore_file "$DOCKER_DAEMON_JSON"; then
+    docker_restart_daemon "Перезапускаю Docker со старым daemon.json" \
+      || fail "Docker не поднялся и со старым конфигом. Смотри: journalctl -u docker -n 50"
+  fi
+
+  return 1
+}
+
+# Ставится в 1, если docker_configure_logging реально изменил daemon.json.
+# Нужно вызывающему в режиме --defer-restart: решить, нужен ли перезапуск.
+DOCKER_LOG_CONFIG_CHANGED=0
+
+# docker_configure_logging [--defer-restart]
+#   --defer-restart — только записать ключи логов в daemon.json; валидацию,
+#   перезапуск и откат берёт на себя вызывающий (install_docker делает это
+#   один раз на все правки конфига сразу).
 docker_configure_logging() {
+  local defer=0
+  [[ "${1:-}" == "--defer-restart" ]] && defer=1
+
+  DOCKER_LOG_CONFIG_CHANGED=0
+  # Отдельный вызов (пункт меню) — точка отката своя; в defer-режиме её уже
+  # поставил install_docker до правки лимитов.
+  [[ "$defer" -eq 1 ]] || DOCKER_DAEMON_BACKED_UP=0
+
   section "Docker: политика логов контейнеров"
 
   if ! command -v docker >/dev/null 2>&1; then
@@ -3783,7 +4080,7 @@ docker_configure_logging() {
 
   ensure_log_budget
 
-  local driver tmp backup old_driver
+  local driver tmp old_driver
   driver="$(resolve_node_log_driver)"
 
   mkdir -p /etc/docker
@@ -3820,18 +4117,11 @@ docker_configure_logging() {
     return 0
   fi
 
-  backup="$(eclipse_backup_file "$DOCKER_DAEMON_JSON")"
-  [[ -n "$backup" ]] && info "Резервная копия: $backup"
+  docker_daemon_backup_once
 
   install -m 0644 "$tmp" "$DOCKER_DAEMON_JSON"
   rm -f "$tmp"
-
-  if ! docker_daemon_validate "$DOCKER_DAEMON_JSON"; then
-    if eclipse_restore_file "$DOCKER_DAEMON_JSON"; then
-      warn "daemon.json восстановлен из резервной копии."
-    fi
-    return 1
-  fi
+  DOCKER_LOG_CONFIG_CHANGED=1
 
   ok "daemon.json: log-driver $old_driver → $driver, max-size $LB_DOCKER_MAXSIZE, max-file $LB_DOCKER_MAXFILE, compress."
   info "Профиль $LB_DOCKER_TIER (ФС /var/lib/docker ${LB_DOCKER_GB} ГБ)."
@@ -3840,12 +4130,9 @@ docker_configure_logging() {
   # live-restore: true в этом конфиге уже стоит, поэтому перезапуск демона
   # не роняет контейнеры. Но новая политика применяется только к НОВЫМ или
   # пересозданным контейнерам — существующие продолжают писать по старой.
-  if ! run_cmd "Перезапускаю Docker (новая политика логов)" systemctl restart docker; then
-    fail "Docker не перезапустился с новым daemon.json — откатываю."
-    if eclipse_restore_file "$DOCKER_DAEMON_JSON"; then
-      run_cmd "Перезапускаю Docker со старым daemon.json" systemctl restart docker \
-        || fail "Docker не поднялся и со старым конфигом. Смотри: journalctl -u docker -n 50"
-    fi
+  if [[ "$defer" -eq 1 ]]; then
+    info "Перезапуск Docker отложен — применю вместе с остальными правками daemon.json."
+  elif ! docker_apply_daemon_json; then
     return 1
   fi
 
@@ -4699,7 +4986,7 @@ eclipse_logs_rollback() {
 
   if [[ -f "$DOCKER_DAEMON_JSON" ]] && command -v docker >/dev/null 2>&1; then
     if docker_daemon_validate "$DOCKER_DAEMON_JSON"; then
-      run_cmd "Перезапускаю Docker (восстановленный daemon.json)" systemctl restart docker \
+      docker_restart_daemon "Перезапускаю Docker (восстановленный daemon.json)" \
         || { fail "Docker не перезапустился. Смотри: journalctl -u docker -n 50"; rc=1; }
     else
       fail "Восстановленный daemon.json не проходит валидацию — Docker не перезапускаю."
@@ -6625,6 +6912,13 @@ pull_docker_image_with_fallback() {
   local image="$1"
   local attempt mirror mirror_image
 
+  # Три попытки и обход по зеркалам не имеют смысла, если лежит сам демон:
+  # каждая вернёт одно и то же «Cannot connect to the Docker daemon».
+  if ! ensure_docker_alive; then
+    fail "Docker-демон не работает — скачать образ $image невозможно."
+    return 1
+  fi
+
   for attempt in 1 2 3; do
     if docker_pull_timed "Скачиваю образ $image (попытка $attempt/3)" "$image"; then
       return 0
@@ -6890,6 +7184,7 @@ EOF_ENV
 
     warn "Не удалось запустить контейнер. Возможно, Docker Hub временно недоступен (403/лимит). Повтор через 10 секунд..."
     sleep 10
+    ensure_docker_alive || true
   done
 
   if [[ "$up_ok" -ne 1 ]]; then
@@ -7651,10 +7946,77 @@ done
 EOF_HOOK
 
   chmod +x "$hook"
+
+  install_cert_port80_hooks
+
   systemctl enable --now certbot.timer >/dev/null 2>&1 || true
 
   ok "Deploy-hook автопродления сертификата установлен: $hook"
   info "После каждого обновления сертификата нода перезапустится автоматически."
+}
+
+# pre/post-хуки, освобождающие :80 на время автопродления.
+#
+# Сертификат выпускается через HTTP-01 (--standalone), а на сервере обычно
+# живёт Caddy-заглушка selfsteal, занимающая :80. При выпуске мы её гасим
+# вручную, но `certbot renew` через 60-90 дней приходит сам и без этих хуков
+# молча упирается в занятый порт — нода отваливается по истёкшему сертификату.
+#
+# pre-хук гасит держателей :80 и записывает их в файл состояния, post-хук
+# поднимает обратно. post-хук certbot выполняет всегда, включая неудачное
+# продление, поэтому заглушка не остаётся лежать.
+install_cert_port80_hooks() {
+  local pre_dir="/etc/letsencrypt/renewal-hooks/pre"
+  local post_dir="/etc/letsencrypt/renewal-hooks/post"
+  local pre="$pre_dir/eclipse-free-port80.sh"
+  local post="$post_dir/eclipse-restore-port80.sh"
+
+  mkdir -p "$pre_dir" "$post_dir"
+
+  cat > "$pre" <<'EOF_PRE80'
+#!/usr/bin/env bash
+# Освобождает TCP:80 на время продления сертификата (HTTP-01/standalone).
+# Что остановили — пишем в файл состояния, его читает post-хук.
+STATE=/run/eclipse-port80-restore
+: > "$STATE"
+
+for u in nginx apache2 caddy; do
+  systemctl is-active --quiet "$u" 2>/dev/null || continue
+  systemctl stop "$u" >/dev/null 2>&1 && echo "unit $u" >> "$STATE"
+done
+
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  docker ps --filter publish=80 --format '{{.Names}}' 2>/dev/null | while read -r c; do
+    [ -n "$c" ] || continue
+    docker stop "$c" >/dev/null 2>&1 && echo "container $c" >> "$STATE"
+  done
+fi
+
+exit 0
+EOF_PRE80
+
+  cat > "$post" <<'EOF_POST80'
+#!/usr/bin/env bash
+# Поднимает обратно всё, что pre-хук остановил ради порта 80.
+STATE=/run/eclipse-port80-restore
+[ -f "$STATE" ] || exit 0
+
+while read -r kind name; do
+  [ -n "$name" ] || continue
+  case "$kind" in
+    unit)      systemctl start "$name" >/dev/null 2>&1 || true ;;
+    container) docker start "$name" >/dev/null 2>&1 || true ;;
+  esac
+done < "$STATE"
+
+rm -f "$STATE"
+exit 0
+EOF_POST80
+
+  chmod +x "$pre" "$post"
+
+  ok "Хуки автопродления для порта 80 установлены: $pre, $post"
+  info "На время продления certbot сам освободит :80 (Caddy/nginx/контейнеры) и вернёт их обратно."
 }
 
 # ── Ограничение исходящего канала (shaping через tc) ────────────────────────
