@@ -14,7 +14,7 @@ PROFILE_HOOK="/etc/profile.d/bbr3-remnanode-continue.sh"
 
 SELF_DOWNLOAD_URL="https://raw.githubusercontent.com/blantxxv/bbr3/refs/heads/main/bbr3-remnanode-auto.sh"
 WARP_INSTALL_URL="https://raw.githubusercontent.com/blantxxv/warp/main/warp-auto-install.sh"
-TORRENT_BLOCKER_INSTALL_URL="https://raw.githubusercontent.com/blantxxv/banan/main/install.sh"
+TORRENT_BLOCKER_INSTALL_URL="https://raw.githubusercontent.com/mahmudali1337-lab/torrent-blocker/master/install.sh"
 TORRENT_BLOCKER_BIN="/usr/local/bin/torrent-blocker"
 
 CPU_LEVEL=""
@@ -2451,33 +2451,50 @@ install_docker() {
     info "Потолок этого окружения ниже целевого ($TARGET_RLIMIT): nofile=$docker_nofile_limit, nproc=$docker_nproc_limit. Беру достижимое — выше runc всё равно не даст."
   fi
 
-  cat >/etc/docker/daemon.json <<EOF_DOCKER
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "100m",
-    "max-file": "5"
-  },
-  "registry-mirrors": [
-    "https://mirror.gcr.io"
-  ],
-  "default-ulimits": {
-    "nofile": {
-      "Name": "nofile",
-      "Hard": $docker_nofile_limit,
-      "Soft": $docker_nofile_limit
-    },
-    "nproc": {
-      "Name": "nproc",
-      "Hard": $docker_nproc_limit,
-      "Soft": $docker_nproc_limit
-    }
-  },
-  "live-restore": true
-}
-EOF_DOCKER
+  # daemon.json больше НЕ переписывается целиком: раньше `cat >` затирал всё,
+  # что туда положил хостер или админ (data-root, dns, proxies, insecure-registries).
+  # Теперь свои ключи вливаем через jq, остальные сохраняются как есть.
+  if ensure_jq; then
+    local daemon_tmp
+    [[ -f "$DOCKER_DAEMON_JSON" ]] || echo '{}' > "$DOCKER_DAEMON_JSON"
 
-  run_cmd "Перезапускаю Docker (default-ulimits)" systemctl restart docker
+    if jq -e . "$DOCKER_DAEMON_JSON" >/dev/null 2>&1; then
+      daemon_tmp="$(mktemp)"
+      if jq --argjson nofile "$docker_nofile_limit" --argjson nproc "$docker_nproc_limit" '
+            .["registry-mirrors"] = (
+              ((.["registry-mirrors"] // []) + ["https://mirror.gcr.io"]) | unique
+            )
+            | .["default-ulimits"] = {
+                "nofile": { "Name": "nofile", "Hard": $nofile, "Soft": $nofile },
+                "nproc":  { "Name": "nproc",  "Hard": $nproc,  "Soft": $nproc }
+              }
+            | .["live-restore"] = true
+          ' "$DOCKER_DAEMON_JSON" > "$daemon_tmp"; then
+        eclipse_backup_file "$DOCKER_DAEMON_JSON" > /dev/null || true
+        install -m 0644 "$daemon_tmp" "$DOCKER_DAEMON_JSON"
+        rm -f "$daemon_tmp"
+
+        if docker_daemon_validate "$DOCKER_DAEMON_JSON"; then
+          run_cmd "Перезапускаю Docker (default-ulimits)" systemctl restart docker \
+            || warn "Docker не перезапустился — смотри journalctl -u docker -n 50"
+        else
+          fail "daemon.json не прошёл валидацию — откатываю."
+          eclipse_restore_file "$DOCKER_DAEMON_JSON" \
+            && run_cmd "Перезапускаю Docker (прежний daemon.json)" systemctl restart docker
+        fi
+      else
+        rm -f "$daemon_tmp"
+        warn "jq не смог обновить $DOCKER_DAEMON_JSON — оставляю как есть."
+      fi
+    else
+      warn "$DOCKER_DAEMON_JSON — битый JSON. Не трогаю его, почини вручную."
+    fi
+  else
+    warn "jq не установлен — daemon.json не изменён (сливать его вслепую опасно)."
+  fi
+
+  # Политика логов контейнеров: отдельным шагом, со своей валидацией и откатом.
+  docker_configure_logging || warn "Политика логов Docker не применена — см. выше."
 
   local docker_v compose_v
   docker_v="$(docker --version 2>/dev/null || true)"
@@ -3218,9 +3235,414 @@ CFG
 
 ECLIPSE_LOGROTATE="/etc/logrotate.d/eclipse-node"
 
+# ── Лимиты логов и защита диска ─────────────────────────────────────────────
+#
+# Системный раздел у нод небольшой (порядок 18 ГБ), а источников роста три:
+#   1) xray access.log/error.log ноды — host bind-mount ./logs;
+#   2) docker json-логи контейнера (stdout/stderr) — /var/lib/docker/containers;
+#   3) /var/log/suricata/eve.json от слоя A Torrent Guard — растёт быстрее всех,
+#      на реальной ноде доходил до 8.3 ГБ и забивал раздел целиком.
+# Плюс journald, который по умолчанию берёт до 10% раздела.
+#
+# Цель — не «минимальные логи любой ценой», а предсказуемый потолок с запасом
+# истории для диагностики. Suricata при этом остаётся ФУНКЦИОНАЛЬНОЙ частью
+# Torrent Guard: она работает инлайн через NFQUEUE и дропает пакеты вердиктом
+# правила, а не по логам, поэтому ограничивать можно только объём записи.
+
+REMNANODE_LOGROTATE="/etc/logrotate.d/remnanode"
+SURICATA_LOGROTATE="/etc/logrotate.d/suricata"
+SURICATA_YAML="/etc/suricata/suricata.yaml"
+SURICATA_ROTATE_SERVICE="/etc/systemd/system/suricata-logrotate.service"
+SURICATA_ROTATE_TIMER="/etc/systemd/system/suricata-logrotate.timer"
+JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
+JOURNALD_DROPIN="$JOURNALD_DROPIN_DIR/limits.conf"
+DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+DISK_GUARD_BIN="/usr/local/sbin/eclipse-disk-guard.sh"
+DISK_GUARD_CONF="/etc/eclipse-disk-guard.conf"
+DISK_GUARD_LOCAL_CONF="/etc/eclipse-disk-guard.local.conf"
+DISK_GUARD_SERVICE="/etc/systemd/system/eclipse-disk-guard.service"
+DISK_GUARD_TIMER="/etc/systemd/system/eclipse-disk-guard.timer"
+ECLIPSE_BACKUP_DIR="/var/backups/eclipse-logs"
+
+# Драйвер логов docker для ноды. Пустое значение — «ещё не определяли»,
+# resolve_node_log_driver проверит поддержку `local` и запомнит результат.
+NODE_LOG_DRIVER=""
+
+# Минимизация типов событий eve.json — ТОЛЬКО по явному согласию оператора
+# (ECLIPSE_EVE_MINIMAL=1). По умолчанию состав событий не трогаем: см. разбор
+# зависимостей в suricata_eve_report.
+ECLIPSE_EVE_MINIMAL="${ECLIPSE_EVE_MINIMAL:-0}"
+
+# Лимиты логов считаются от размера дисков (eclipse_compute_log_budget).
+# Пустой LB_LOG_TIER = «ещё не считали»; ensure_log_budget посчитает по месту.
+LB_LOG_TIER=""
+
+# Одна точка резервных копий на все конфиги, которые правит менеджер.
+# Путь «сплющивается» (/ → _), рядом кладётся симлинк .last — по нему работает
+# откат. Печатает путь копии; отсутствие исходника не ошибка (нечего копировать).
+eclipse_backup_file() {
+  local src="$1" flat stamp dst
+
+  [[ -e "$src" ]] || return 0
+  mkdir -p "$ECLIPSE_BACKUP_DIR"
+  chmod 700 "$ECLIPSE_BACKUP_DIR"
+
+  flat="${src#/}"
+  flat="${flat//\//_}"
+  stamp="$(date '+%Y%m%d-%H%M%S')"
+  dst="$ECLIPSE_BACKUP_DIR/$flat.$stamp.bak"
+
+  cp -a "$src" "$dst" || return 1
+  ln -sfn "$dst" "$ECLIPSE_BACKUP_DIR/$flat.last"
+  log_line "BACKUP: $src -> $dst"
+  echo "$dst"
+}
+
+# Восстанавливает файл из последней резервной копии. Возвращает 1, если копии
+# нет — вызывающий сам решает, что делать (обычно: удалить свой новый файл).
+eclipse_restore_file() {
+  local dst="$1" flat link src
+
+  flat="${dst#/}"
+  flat="${flat//\//_}"
+  link="$ECLIPSE_BACKUP_DIR/$flat.last"
+
+  [[ -L "$link" ]] || return 1
+  src="$(readlink -f "$link")" || return 1
+  [[ -e "$src" ]] || return 1
+
+  cp -a "$src" "$dst" || return 1
+  log_line "RESTORE: $src -> $dst"
+}
+
 ensure_logrotate() {
   command -v logrotate >/dev/null 2>&1 && return 0
   run_cmd "Устанавливаю logrotate" env DEBIAN_FRONTEND=noninteractive apt-get install -y logrotate
+}
+
+ensure_jq() {
+  command -v jq >/dev/null 2>&1 && return 0
+  run_cmd "Устанавливаю jq" env DEBIAN_FRONTEND=noninteractive apt-get install -y jq
+}
+
+# ── Бюджет логов по фактическому размеру диска ──────────────────────────────
+#
+# Ноды живут на очень разном железе: от 18 ГБ системного раздела до 1 ТБ.
+# Одни и те же цифры для них бессмысленны — на 18 ГБ 4 ГБ логов это четверть
+# диска, на 1 ТБ это меньше процента и истории не остаётся вообще.
+#
+# Поэтому лимиты не константы, а функция от размера ФС. Правило одно:
+# теоретический потолок ВСЕХ логов держим в районе 12-17% раздела, а реально
+# после gzip выходит примерно втрое меньше. Размер берём отдельно для каждой
+# цели: /var/log, /var/lib/docker и каталог ноды могут лежать на разных ФС.
+
+# Размер ФС, на которой лежит путь, в ГиБ. Если путь ещё не создан — поднимаемся
+# к существующему родителю. При неудаче разбора возвращаем 1 (самый жёсткий
+# профиль): лучше недобрать истории, чем забить неизвестно какой диск.
+fs_size_gb() {
+  local path="$1" kb gb
+
+  while [[ -n "$path" && "$path" != "/" && ! -e "$path" ]]; do
+    path="$(dirname "$path")"
+  done
+  [[ -e "$path" ]] || path="/"
+
+  kb="$(df -P -k "$path" 2>/dev/null | awk 'NR == 2 { print $2 }')"
+  case "$kb" in
+    ''|*[!0-9]*) echo 1; return 0 ;;
+  esac
+
+  gb=$(( kb / 1024 / 1024 ))
+  (( gb < 1 )) && gb=1
+  echo "$gb"
+}
+
+# Профиль по размеру ФС. Границы подобраны под реальные площадки:
+# xs — маленький системный раздел VPS, xl — выделенный сервер с большим диском.
+log_tier() {
+  local gb="$1"
+
+  if   (( gb <  30 )); then echo xs
+  elif (( gb <  80 )); then echo s
+  elif (( gb < 250 )); then echo m
+  elif (( gb < 600 )); then echo l
+  else                      echo xl
+  fi
+}
+
+# Заполняет все LB_* по профилям. Вызывается перед любой записью конфигов.
+# Идемпотентна: считает заново от текущего состояния дисков, поэтому после
+# расширения раздела достаточно перезапустить настройку.
+eclipse_compute_log_budget() {
+  local node_dir docker_root
+
+  node_dir="$(find_node_dir 2>/dev/null || true)"
+  [[ -n "$node_dir" ]] || node_dir="/opt"
+
+  docker_root="/var/lib/docker"
+
+  LB_LOG_GB="$(fs_size_gb /var/log)"
+  LB_DOCKER_GB="$(fs_size_gb "$docker_root")"
+  LB_NODE_GB="$(fs_size_gb "$node_dir")"
+
+  LB_LOG_TIER="$(log_tier "$LB_LOG_GB")"
+  LB_DOCKER_TIER="$(log_tier "$LB_DOCKER_GB")"
+  LB_NODE_TIER="$(log_tier "$LB_NODE_GB")"
+
+  # Suricata, логи менеджера и journald — по ФС с /var/log.
+  case "$LB_LOG_TIER" in
+    xs) LB_EVE_MAXSIZE=300M; LB_EVE_ROTATE=5;  LB_SURI_MAXSIZE=50M;   LB_SURI_ROTATE=5
+        LB_MGR_MAXSIZE=20M;  LB_MGR_ROTATE=7
+        LB_JOURNAL_MAX=300M; LB_JOURNAL_KEEPFREE=1G;  LB_JOURNAL_FILEMAX=50M;  LB_JOURNAL_RETENTION=14day ;;
+    s)  LB_EVE_MAXSIZE=500M; LB_EVE_ROTATE=5;  LB_SURI_MAXSIZE=100M;  LB_SURI_ROTATE=5
+        LB_MGR_MAXSIZE=50M;  LB_MGR_ROTATE=7
+        LB_JOURNAL_MAX=500M; LB_JOURNAL_KEEPFREE=2G;  LB_JOURNAL_FILEMAX=100M; LB_JOURNAL_RETENTION=14day ;;
+    m)  LB_EVE_MAXSIZE=1G;   LB_EVE_ROTATE=7;  LB_SURI_MAXSIZE=200M;  LB_SURI_ROTATE=7
+        LB_MGR_MAXSIZE=100M; LB_MGR_ROTATE=14
+        LB_JOURNAL_MAX=1G;   LB_JOURNAL_KEEPFREE=3G;  LB_JOURNAL_FILEMAX=200M; LB_JOURNAL_RETENTION=30day ;;
+    l)  LB_EVE_MAXSIZE=2G;   LB_EVE_ROTATE=7;  LB_SURI_MAXSIZE=500M;  LB_SURI_ROTATE=7
+        LB_MGR_MAXSIZE=200M; LB_MGR_ROTATE=14
+        LB_JOURNAL_MAX=2G;   LB_JOURNAL_KEEPFREE=5G;  LB_JOURNAL_FILEMAX=500M; LB_JOURNAL_RETENTION=30day ;;
+    *)  LB_EVE_MAXSIZE=4G;   LB_EVE_ROTATE=10; LB_SURI_MAXSIZE=1G;    LB_SURI_ROTATE=7
+        LB_MGR_MAXSIZE=500M; LB_MGR_ROTATE=14
+        LB_JOURNAL_MAX=4G;   LB_JOURNAL_KEEPFREE=10G; LB_JOURNAL_FILEMAX=1G;   LB_JOURNAL_RETENTION=60day ;;
+  esac
+
+  # Логи ноды — по ФС с каталогом ноды.
+  case "$LB_NODE_TIER" in
+    xs) LB_NODE_MAXSIZE=50M;  LB_NODE_ROTATE=7  ;;
+    s)  LB_NODE_MAXSIZE=100M; LB_NODE_ROTATE=10 ;;
+    m)  LB_NODE_MAXSIZE=200M; LB_NODE_ROTATE=14 ;;
+    l)  LB_NODE_MAXSIZE=500M; LB_NODE_ROTATE=14 ;;
+    *)  LB_NODE_MAXSIZE=1G;   LB_NODE_ROTATE=14 ;;
+  esac
+
+  # Docker — по ФС с /var/lib/docker. Суффикс строчный: демон ждёт "100m"/"1g".
+  case "$LB_DOCKER_TIER" in
+    xs) LB_DOCKER_MAXSIZE=50m;  LB_DOCKER_MAXFILE=3 ;;
+    s)  LB_DOCKER_MAXSIZE=100m; LB_DOCKER_MAXFILE=4 ;;
+    m)  LB_DOCKER_MAXSIZE=200m; LB_DOCKER_MAXFILE=5 ;;
+    l)  LB_DOCKER_MAXSIZE=500m; LB_DOCKER_MAXFILE=5 ;;
+    *)  LB_DOCKER_MAXSIZE=1g;   LB_DOCKER_MAXFILE=5 ;;
+  esac
+
+  # Пороги disk guard привязаны к тем же цифрам, а не заданы отдельно:
+  # eve.json «пухнет» = он вырос вдвое сверх точки ротации, «критично» =
+  # вчетверо, то есть ротация точно не отрабатывает.
+  local eve_bytes
+  eve_bytes="$(size_to_bytes "$LB_EVE_MAXSIZE")"
+  LB_EVE_WARN_BYTES=$(( eve_bytes * 2 ))
+  LB_EVE_CRIT_BYTES=$(( eve_bytes * 4 ))
+
+  # Абсолютный пол по свободному месту — процентов мало: 95% от 1 ТБ это ещё
+  # 50 ГБ свободных, а 95% от 18 ГБ — меньше гигабайта.
+  LB_FREE_CRIT_MB=$(( LB_LOG_GB * 1024 * 3 / 100 ))
+  (( LB_FREE_CRIT_MB < 1024  )) && LB_FREE_CRIT_MB=1024
+  (( LB_FREE_CRIT_MB > 10240 )) && LB_FREE_CRIT_MB=10240
+  LB_FREE_WARN_MB=$(( LB_FREE_CRIT_MB * 2 ))
+
+  LB_DISK_WARN_PCT=85
+  LB_DISK_CRIT_PCT=95
+
+  log_line "log budget: /var/log=${LB_LOG_GB}G($LB_LOG_TIER) docker=${LB_DOCKER_GB}G($LB_DOCKER_TIER) node=${LB_NODE_GB}G($LB_NODE_TIER)"
+}
+
+# "300M" / "2G" / "512" -> байты. Нужна и для порогов, и для отчёта о потолке.
+size_to_bytes() {
+  local s="${1:-0}" num unit
+
+  num="${s%[KkMmGgTt]}"
+  unit="${s#$num}"
+  case "$num" in
+    ''|*[!0-9]*) echo 0; return 0 ;;
+  esac
+
+  case "$unit" in
+    K|k) echo $(( num * 1024 )) ;;
+    M|m) echo $(( num * 1024 * 1024 )) ;;
+    G|g) echo $(( num * 1024 * 1024 * 1024 )) ;;
+    T|t) echo $(( num * 1024 * 1024 * 1024 * 1024 )) ;;
+    *)   echo "$num" ;;
+  esac
+}
+
+# Считаем бюджет один раз за запуск, но по требованию: любая функция записи
+# конфигов может быть вызвана напрямую из меню или CLI, минуя оркестратор.
+ensure_log_budget() {
+  [[ -n "$LB_LOG_TIER" ]] || eclipse_compute_log_budget
+}
+
+# Человекочитаемый отчёт: какой профиль выбран и какой потолок он даёт.
+log_budget_report() {
+  local eve suri node mgr docker journal total
+
+  eve=$(( $(size_to_bytes "$LB_EVE_MAXSIZE") * (LB_EVE_ROTATE + 1) ))
+  suri=$(( $(size_to_bytes "$LB_SURI_MAXSIZE") * (LB_SURI_ROTATE + 1) * 3 ))
+  node=$(( $(size_to_bytes "$LB_NODE_MAXSIZE") * (LB_NODE_ROTATE + 1) * 2 ))
+  mgr=$(( $(size_to_bytes "$LB_MGR_MAXSIZE") * (LB_MGR_ROTATE + 1) * 3 ))
+  docker=$(( $(size_to_bytes "$LB_DOCKER_MAXSIZE") * LB_DOCKER_MAXFILE ))
+  journal="$(size_to_bytes "$LB_JOURNAL_MAX")"
+  total=$(( eve + suri + node + mgr + docker + journal ))
+
+  echo
+  info "Профиль логов по размеру дисков:"
+  info "  /var/log        ${LB_LOG_GB} ГБ → профиль $LB_LOG_TIER"
+  info "  /var/lib/docker ${LB_DOCKER_GB} ГБ → профиль $LB_DOCKER_TIER"
+  info "  каталог ноды    ${LB_NODE_GB} ГБ → профиль $LB_NODE_TIER"
+  info "  eve.json ${LB_EVE_MAXSIZE} × $LB_EVE_ROTATE · прочее Suricata ${LB_SURI_MAXSIZE} × $LB_SURI_ROTATE"
+  info "  логи ноды ${LB_NODE_MAXSIZE} × $LB_NODE_ROTATE · docker ${LB_DOCKER_MAXSIZE} × $LB_DOCKER_MAXFILE на контейнер"
+  info "  journald ${LB_JOURNAL_MAX} (свободного не меньше $LB_JOURNAL_KEEPFREE, хранение $LB_JOURNAL_RETENTION)"
+  info "  Теоретический потолок всех логов: ~$(numfmt --to=iec --suffix=B "$total" 2>/dev/null || echo "$total B"); после сжатия обычно втрое меньше."
+  info "  Пороги: диск ${LB_DISK_WARN_PCT}% / ${LB_DISK_CRIT_PCT}%, свободно < ${LB_FREE_WARN_MB}M / ${LB_FREE_CRIT_MB}M, eve.json > $(numfmt --to=iec --suffix=B "$LB_EVE_WARN_BYTES" 2>/dev/null) / $(numfmt --to=iec --suffix=B "$LB_EVE_CRIT_BYTES" 2>/dev/null)"
+}
+
+# Показывает занятость корневого раздела. Вызывается до и после настройки,
+# чтобы эффект был виден прямо в выводе установщика.
+disk_usage_report() {
+  local when="${1:-}"
+
+  echo
+  info "Диск ${when}:"
+  df -h / | sed 's/^/    /'
+
+  if command -v journalctl >/dev/null 2>&1; then
+    info "journald: $(journalctl --disk-usage 2>/dev/null | sed 's/^Archived and active journals take up //' || echo '?')"
+  fi
+  if [[ -f /var/log/suricata/eve.json ]]; then
+    info "eve.json: $(du -h /var/log/suricata/eve.json 2>/dev/null | cut -f1)"
+  fi
+}
+
+ensure_logrotate_timer() {
+  # На Debian/Ubuntu ротацию запускает системный таймер logrotate.timer
+  # (или cron.daily на старых релизах) — свой таймер для суточных правил не
+  # нужен, только убедимся, что штатный включён. Глобальный таймер НЕ трогаем:
+  # переводить его на hourly ради одного eve.json — лишняя нагрузка на всё
+  # остальное, для Suricata поднимается отдельный таймер.
+  if systemctl list-unit-files 2>/dev/null | grep -q '^logrotate.timer'; then
+    systemctl enable --now logrotate.timer >> "$LOG_FILE" 2>&1 \
+      || warn "Не удалось включить logrotate.timer — проверь: systemctl status logrotate.timer"
+    info "Запуск суточной ротации: logrotate.timer ($(systemctl is-active logrotate.timer 2>/dev/null || echo inactive))"
+  elif [[ -d /etc/cron.daily ]]; then
+    info "Запуск суточной ротации: /etc/cron.daily/logrotate"
+  else
+    warn "Не нашёл ни logrotate.timer, ни /etc/cron.daily — ротацию нужно запускать самому."
+  fi
+}
+
+# Проверяет один файл logrotate и откатывает его при ошибке синтаксиса.
+# $1 — путь к конфигу. Возвращает 1, если конфиг невалиден.
+logrotate_check_or_restore() {
+  local conf="$1"
+
+  if logrotate -d "$conf" >> "$LOG_FILE" 2>&1; then
+    ok "logrotate -d $conf — синтаксис в порядке."
+    return 0
+  fi
+
+  fail "logrotate -d $conf вернул ошибку. Откатываю."
+  if eclipse_restore_file "$conf"; then
+    warn "Восстановлена предыдущая версия $conf."
+  else
+    rm -f "$conf"
+    warn "Резервной копии не было — новый файл $conf удалён."
+  fi
+  warn "Подробности: $LOG_FILE"
+  return 1
+}
+
+# Пути логов ноды НА ХОСТЕ. Реальный каталог берём из state (find_node_dir),
+# остальные — штатные варианты размещения из ask_node_location. /var/log/remnanode
+# в списке нет намеренно: это путь ВНУТРИ контейнера, на хосте ./logs монтируется
+# в него, а не наоборот.
+remnanode_log_globs() {
+  local d pat covered=0
+  local static=(
+    "/opt/remnanode/logs/*.log"
+    "/root/remnanode/logs/*.log"
+    "/home/*/remnanode/logs/*.log"
+    "/opt/*-Node/logs/*.log"
+  )
+
+  printf '%s\n' "${static[@]}"
+
+  # Нестандартный каталог из state добавляем ТОЛЬКО если он не покрыт
+  # шаблонами выше. Иначе один и тот же файл попал бы в конфиг дважды
+  # (например /opt/eclipse-Node/logs/*.log и /opt/*-Node/logs/*.log), а
+  # дубликат пути — ошибка logrotate «duplicate log entry», после которой он
+  # бросает весь конфиг и не ротирует НИЧЕГО.
+  d="$(find_node_dir 2>/dev/null || true)"
+  [[ -n "$d" ]] || return 0
+
+  for pat in "${static[@]}"; do
+    # RHS без кавычек — сравнение по шаблону, а не буквальное.
+    [[ "$d/logs/probe.log" == $pat ]] && { covered=1; break; }
+  done
+
+  [[ "$covered" -eq 0 ]] && printf '%s\n' "$d/logs/*.log"
+  return 0
+}
+
+# Отдельный суточный конфиг для логов ноды. Раньше эти пути жили в
+# eclipse-node; если оставить их и там, logrotate ругнётся на дубль и
+# пропустит ОБА файла — поэтому install_log_rotation ниже их оттуда убирает.
+install_remnanode_logrotate() {
+  section "Ротация логов RemnaNode (раз в сутки)"
+
+  if ! ensure_logrotate; then
+    warn "logrotate не установлен — ротация ноды не настроена."
+    return 1
+  fi
+
+  ensure_log_budget
+
+  local globs
+  globs="$(remnanode_log_globs)"
+
+  eclipse_backup_file "$REMNANODE_LOGROTATE" > /dev/null || true
+
+  {
+    cat <<'HEAD'
+# Логи Remnawave Node (access.log / error.log от xray) на хосте.
+# Файл создаётся менеджером Eclipse (bbr3-remnanode-auto.sh), правки затрутся.
+#
+# copytruncate — обязателен. Xray держит файл открытым и НЕ переоткрывает его
+# по сигналу: при обычной ротации он продолжил бы писать в переименованный
+# inode, новый access.log остался бы пустым, и слой B Torrent Guard
+# (torrent-blocker читает именно access.log) ослеп бы после первой ротации.
+#
+# maxsize, а не size: `size` ОТМЕНЯЕТ суточный критерий, и файл ротировался бы
+# только по объёму. maxsize даёт «раз в сутки ИЛИ раньше, если перерос порог» —
+# то есть гарантированную ежедневную ротацию плюс потолок между запусками.
+#
+# Цифры ниже подобраны под размер ФС каталога ноды, а не заданы константой.
+HEAD
+    printf '%s\n' "$globs"
+    cat <<TAIL
+{
+    daily
+    rotate $LB_NODE_ROTATE
+    maxsize $LB_NODE_MAXSIZE
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    dateext
+    su root root
+}
+TAIL
+  } > "$REMNANODE_LOGROTATE"
+
+  chmod 644 "$REMNANODE_LOGROTATE"
+  ok "Конфигурация записана: $REMNANODE_LOGROTATE"
+  # Кавычки обязательны: без них шаблоны раскрылись бы по существующим файлам.
+  info "Пути: $(printf '%s' "$globs" | paste -sd' ' -)"
+
+  logrotate_check_or_restore "$REMNANODE_LOGROTATE" || return 1
+
+  ensure_logrotate_timer
+  info "Профиль $LB_NODE_TIER (ФС каталога ноды ${LB_NODE_GB} ГБ): ротация ежедневно или при превышении $LB_NODE_MAXSIZE, хранится $LB_NODE_ROTATE архивов."
 }
 
 install_log_rotation() {
@@ -3231,36 +3653,23 @@ install_log_rotation() {
     return 1
   fi
 
-  # Пути нод перечислены шаблонами: одна конфигурация покрывает все варианты
-  # размещения (/opt/remnanode, /root/remnanode, /home/<user>/remnanode, ...).
-  cat > "$ECLIPSE_LOGROTATE" <<'ROTATE'
-# Логи Remnawave Node (access.log / error.log от xray).
-# copytruncate — xray держит файл открытым и не переоткрывает его по сигналу.
-/opt/remnanode/logs/*.log
-/root/remnanode/logs/*.log
-/home/*/remnanode/logs/*.log
-/opt/*-Node/logs/*.log
-{
-    daily
-    rotate 7
-    maxsize 200M
-    missingok
-    notifempty
-    compress
-    delaycompress
-    copytruncate
-    dateext
-    su root root
-}
+  ensure_log_budget
+  eclipse_backup_file "$ECLIPSE_LOGROTATE" > /dev/null || true
 
-# Логи самого менеджера и анти-торрент слоя A.
+  # ВАЖНО: логи ноды отсюда убраны и вынесены в $REMNANODE_LOGROTATE.
+  # Держать одни и те же пути в двух конфигах нельзя — logrotate считает это
+  # ошибкой «duplicate log entry» и молча перестаёт ротировать их вообще.
+  cat > "$ECLIPSE_LOGROTATE" <<ROTATE
+# Логи самого менеджера и установщика анти-торрент слоя A.
+# Логи ноды вынесены в /etc/logrotate.d/remnanode — не добавляй их сюда,
+# дубликат пути ломает ротацию обоих файлов.
 /var/log/bbr3-remnanode-install.log
 /var/log/ds-guard-install.log
 /var/log/warp-auto-install.log
 {
     daily
-    rotate 14
-    maxsize 50M
+    rotate $LB_MGR_ROTATE
+    maxsize $LB_MGR_MAXSIZE
     missingok
     notifempty
     compress
@@ -3273,29 +3682,1075 @@ ROTATE
   chmod 644 "$ECLIPSE_LOGROTATE"
   ok "Конфигурация ротации записана: $ECLIPSE_LOGROTATE"
 
-  # Проверяем синтаксис в режиме отладки (ничего не ротируя).
-  if logrotate --debug "$ECLIPSE_LOGROTATE" >> "$LOG_FILE" 2>&1; then
-    ok "Конфигурация logrotate прошла проверку (--debug)."
-  else
-    warn "logrotate --debug вернул ошибку. Подробности: $LOG_FILE"
+  logrotate_check_or_restore "$ECLIPSE_LOGROTATE" || return 1
+
+  # Логи ноды — свой файл, свои лимиты.
+  install_remnanode_logrotate || warn "Ротация логов ноды не настроена."
+
+  ensure_logrotate_timer
+
+  echo
+  info "Логи менеджера: профиль $LB_LOG_TIER, $LB_MGR_ROTATE архивов по $LB_MGR_MAXSIZE, сжатие включено."
+  info "Проверить вручную, ничего не меняя: logrotate -d $ECLIPSE_LOGROTATE"
+  info "Прогнать принудительно: logrotate --force $ECLIPSE_LOGROTATE"
+}
+
+# ── Docker logging ──────────────────────────────────────────────────────────
+#
+# Раньше daemon.json переписывался целиком (cat > ...), затирая всё, что туда
+# положил хостер или сам админ. Теперь конфиг сливается через jq: меняются
+# только log-driver и log-opts, остальные ключи (registry-mirrors,
+# default-ulimits, live-restore, data-root, dns, ...) сохраняются как есть.
+#
+# log-opts заменяется целиком, а не сливается: у драйверов разный набор опций
+# (json-file понимает labels/env/tag, local — нет), и остаток от предыдущего
+# драйвера уронил бы dockerd при старте.
+
+docker_has_validate() {
+  command -v dockerd >/dev/null 2>&1 || return 1
+  dockerd --help 2>&1 | grep -q -- '--validate'
+}
+
+# Проверяет daemon.json штатным валидатором демона. Если сборка dockerd старая
+# и --validate не поддерживает, ограничиваемся проверкой JSON через jq.
+docker_daemon_validate() {
+  local conf="${1:-$DOCKER_DAEMON_JSON}"
+
+  if ! jq -e . "$conf" >/dev/null 2>&1; then
+    fail "Файл $conf не является корректным JSON."
+    return 1
   fi
 
-  # На Debian/Ubuntu ротацию запускает системный таймер logrotate.timer
-  # (или cron.daily на старых релизах) — свой таймер не нужен, только убедимся,
-  # что штатный включён.
-  if systemctl list-unit-files 2>/dev/null | grep -q '^logrotate.timer'; then
-    systemctl enable --now logrotate.timer >> "$LOG_FILE" 2>&1 || true
-    info "Запуск ротации: logrotate.timer ($(systemctl is-active logrotate.timer 2>/dev/null || echo inactive))"
-  elif [[ -d /etc/cron.daily ]]; then
-    info "Запуск ротации: /etc/cron.daily/logrotate"
+  if ! docker_has_validate; then
+    warn "dockerd --validate недоступен в этой сборке — проверен только синтаксис JSON."
+    return 0
+  fi
+
+  if dockerd --validate --config-file="$conf" >> "$LOG_FILE" 2>&1; then
+    return 0
+  fi
+
+  fail "dockerd --validate отверг $conf. Подробности: $LOG_FILE"
+  return 1
+}
+
+# Драйвер `local` предпочтителен: он пишет сжатый бинарный лог и по умолчанию
+# ограничен, но существует не во всех сборках. Проверяем не по версии, а
+# фактическим валидатором на временном конфиге.
+docker_log_driver_supported() {
+  local drv="$1" tmp rc
+
+  docker_has_validate || return 1
+
+  tmp="$(mktemp)" || return 1
+  printf '{"log-driver":"%s"}\n' "$drv" > "$tmp"
+  dockerd --validate --config-file="$tmp" >> "$LOG_FILE" 2>&1
+  rc=$?
+  rm -f "$tmp"
+
+  return "$rc"
+}
+
+resolve_node_log_driver() {
+  if [[ -z "$NODE_LOG_DRIVER" ]]; then
+    if docker_log_driver_supported local; then
+      NODE_LOG_DRIVER="local"
+    elif docker_has_validate; then
+      NODE_LOG_DRIVER="json-file"
+      log_line "docker: драйвер local не принят валидатором, беру json-file"
+    else
+      # Валидатора нет — драйвер local есть в docker начиная с 18.09,
+      # в любой актуальной сборке он доступен.
+      NODE_LOG_DRIVER="local"
+    fi
+  fi
+
+  echo "$NODE_LOG_DRIVER"
+}
+
+docker_configure_logging() {
+  section "Docker: политика логов контейнеров"
+
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Docker не установлен — политику логов настрою при его установке."
+    return 1
+  fi
+
+  if ! ensure_jq; then
+    warn "jq не установлен — безопасно слить daemon.json нельзя, файл не трогаю."
+    return 1
+  fi
+
+  ensure_log_budget
+
+  local driver tmp backup old_driver
+  driver="$(resolve_node_log_driver)"
+
+  mkdir -p /etc/docker
+  [[ -f "$DOCKER_DAEMON_JSON" ]] || echo '{}' > "$DOCKER_DAEMON_JSON"
+
+  if ! jq -e . "$DOCKER_DAEMON_JSON" >/dev/null 2>&1; then
+    fail "$DOCKER_DAEMON_JSON — битый JSON. Не трогаю его, почини вручную."
+    return 1
+  fi
+
+  old_driver="$(jq -r '.["log-driver"] // "json-file (по умолчанию)"' "$DOCKER_DAEMON_JSON")"
+
+  tmp="$(mktemp)" || return 1
+  if ! jq --arg drv "$driver" \
+          --arg maxsize "$LB_DOCKER_MAXSIZE" \
+          --arg maxfile "$LB_DOCKER_MAXFILE" '
+        .["log-driver"] = $drv
+        | .["log-opts"] = {
+            "max-size": $maxsize,
+            "max-file": $maxfile,
+            "compress": "true"
+          }
+      ' "$DOCKER_DAEMON_JSON" > "$tmp"; then
+    rm -f "$tmp"
+    fail "jq не смог собрать новый daemon.json."
+    return 1
+  fi
+
+  # Идемпотентность: сравниваем нормализованный JSON, а не байты — иначе любое
+  # переформатирование выглядело бы как изменение и дёргало docker впустую.
+  if [[ "$(jq -S . "$DOCKER_DAEMON_JSON")" == "$(jq -S . "$tmp")" ]]; then
+    rm -f "$tmp"
+    ok "Docker уже настроен: $driver, $LB_DOCKER_MAXSIZE × $LB_DOCKER_MAXFILE, compress."
+    return 0
+  fi
+
+  backup="$(eclipse_backup_file "$DOCKER_DAEMON_JSON")"
+  [[ -n "$backup" ]] && info "Резервная копия: $backup"
+
+  install -m 0644 "$tmp" "$DOCKER_DAEMON_JSON"
+  rm -f "$tmp"
+
+  if ! docker_daemon_validate "$DOCKER_DAEMON_JSON"; then
+    if eclipse_restore_file "$DOCKER_DAEMON_JSON"; then
+      warn "daemon.json восстановлен из резервной копии."
+    fi
+    return 1
+  fi
+
+  ok "daemon.json: log-driver $old_driver → $driver, max-size $LB_DOCKER_MAXSIZE, max-file $LB_DOCKER_MAXFILE, compress."
+  info "Профиль $LB_DOCKER_TIER (ФС /var/lib/docker ${LB_DOCKER_GB} ГБ)."
+  info "Прочие параметры Docker (registry-mirrors, default-ulimits, live-restore) сохранены."
+
+  # live-restore: true в этом конфиге уже стоит, поэтому перезапуск демона
+  # не роняет контейнеры. Но новая политика применяется только к НОВЫМ или
+  # пересозданным контейнерам — существующие продолжают писать по старой.
+  if ! run_cmd "Перезапускаю Docker (новая политика логов)" systemctl restart docker; then
+    fail "Docker не перезапустился с новым daemon.json — откатываю."
+    if eclipse_restore_file "$DOCKER_DAEMON_JSON"; then
+      run_cmd "Перезапускаю Docker со старым daemon.json" systemctl restart docker \
+        || fail "Docker не поднялся и со старым конфигом. Смотри: journalctl -u docker -n 50"
+    fi
+    return 1
+  fi
+
+  warn "Новые лимиты действуют для новых/пересозданных контейнеров."
+  warn "Существующие контейнеры не пересоздаю. Когда будет удобно: cd <каталог ноды> && docker compose up -d --force-recreate"
+  info "Потолок на контейнер: $LB_DOCKER_MAXFILE × $LB_DOCKER_MAXSIZE до сжатия."
+}
+
+# Прописывает logging прямо в docker-compose.yml ноды. Так политика переживает
+# любые изменения daemon.json и гарантированно применяется к контейнеру ноды
+# при следующем `docker compose up -d`.
+remnanode_apply_compose_logging() {
+  section "RemnaNode: логи контейнера (docker-compose.yml)"
+
+  ensure_log_budget
+
+  local dir compose driver tmp backup
+  dir="$(find_node_dir 2>/dev/null || true)"
+
+  if [[ -z "$dir" || ! -f "$dir/docker-compose.yml" ]]; then
+    info "docker-compose.yml ноды не найден — пропускаю (при установке ноды блок пишется сразу)."
+    return 0
+  fi
+
+  compose="$dir/docker-compose.yml"
+  driver="$(resolve_node_log_driver)"
+
+  if grep -qE '^[[:space:]]+logging:' "$compose"; then
+    ok "Блок logging в $compose уже есть — не трогаю."
+    info "Проверить: grep -A6 'logging:' $compose"
+    return 0
+  fi
+
+  if ! grep -qE '^[[:space:]]*image:[[:space:]]*remnawave/node' "$compose"; then
+    warn "В $compose нет строки image: remnawave/node — не рискую править файл."
+    return 1
+  fi
+
+  backup="$(eclipse_backup_file "$compose")"
+  [[ -n "$backup" ]] && info "Резервная копия: $backup"
+
+  tmp="$(mktemp)" || return 1
+  awk -v drv="$driver" -v maxsize="$LB_DOCKER_MAXSIZE" -v maxfile="$LB_DOCKER_MAXFILE" '
+    { print }
+    !inserted && /^[[:space:]]*image:[[:space:]]*remnawave\/node/ {
+      match($0, /^[[:space:]]*/)
+      ind = substr($0, 1, RLENGTH)
+      print ind "logging:"
+      print ind "  driver: \"" drv "\""
+      print ind "  options:"
+      print ind "    max-size: \"" maxsize "\""
+      print ind "    max-file: \"" maxfile "\""
+      print ind "    compress: \"true\""
+      inserted = 1
+    }
+  ' "$compose" > "$tmp" || { rm -f "$tmp"; fail "awk не смог обработать $compose"; return 1; }
+
+  install -m 0644 "$tmp" "$compose"
+  rm -f "$tmp"
+
+  if ( cd "$dir" && docker_compose config -q >> "$LOG_FILE" 2>&1 ); then
+    ok "logging добавлен в $compose (driver $driver, $LB_DOCKER_MAXSIZE × $LB_DOCKER_MAXFILE, compress)."
   else
-    warn "Не нашёл ни logrotate.timer, ни /etc/cron.daily — ротацию нужно запускать самому."
+    fail "docker compose config отверг изменённый файл — откатываю."
+    eclipse_restore_file "$compose" || warn "Не удалось восстановить $compose из копии."
+    return 1
+  fi
+
+  warn "Контейнер НЕ пересоздаю. Чтобы применить: cd $dir && docker compose up -d"
+}
+
+# ── journald ────────────────────────────────────────────────────────────────
+#
+# По умолчанию journald берёт до 10% раздела — на 18 ГБ это ~1.8 ГБ, и это
+# отдельный источник роста поверх логов Suricata и ноды. Основной
+# /etc/systemd/journald.conf не трогаем: настройка идёт drop-in'ом, его проще
+# и откатить, и увидеть в systemd-analyze cat-config.
+configure_journald_limits() {
+  section "journald: ограничение объёма журнала"
+
+  ensure_log_budget
+
+  local tmp backup
+
+  mkdir -p "$JOURNALD_DROPIN_DIR"
+
+  tmp="$(mktemp)" || return 1
+  cat > "$tmp" <<JRN
+# Управляется менеджером Eclipse (bbr3-remnanode-auto.sh).
+# Основной /etc/systemd/journald.conf намеренно не изменяется.
+# Значения рассчитаны по размеру ФС с /var/log (${LB_LOG_GB} ГБ, профиль $LB_LOG_TIER).
+[Journal]
+SystemMaxUse=$LB_JOURNAL_MAX
+SystemKeepFree=$LB_JOURNAL_KEEPFREE
+SystemMaxFileSize=$LB_JOURNAL_FILEMAX
+MaxRetentionSec=$LB_JOURNAL_RETENTION
+JRN
+
+  if [[ -f "$JOURNALD_DROPIN" ]] && cmp -s "$tmp" "$JOURNALD_DROPIN"; then
+    rm -f "$tmp"
+    ok "journald уже настроен: $JOURNALD_DROPIN"
+    info "Сейчас занято: $(journalctl --disk-usage 2>/dev/null || echo '?')"
+    return 0
+  fi
+
+  backup="$(eclipse_backup_file "$JOURNALD_DROPIN")"
+  [[ -n "$backup" ]] && info "Резервная копия: $backup"
+
+  install -m 0644 "$tmp" "$JOURNALD_DROPIN"
+  rm -f "$tmp"
+
+  if ! run_cmd "Перезапускаю systemd-journald" systemctl restart systemd-journald; then
+    fail "systemd-journald не перезапустился — откатываю drop-in."
+    if eclipse_restore_file "$JOURNALD_DROPIN"; then
+      warn "Восстановлена предыдущая версия $JOURNALD_DROPIN."
+    else
+      rm -f "$JOURNALD_DROPIN"
+      warn "Резервной копии не было — drop-in удалён."
+    fi
+    run_cmd "Перезапускаю systemd-journald (исходная конфигурация)" systemctl restart systemd-journald \
+      || fail "journald не поднялся. Смотри: systemctl status systemd-journald"
+    return 1
+  fi
+
+  ok "journald: SystemMaxUse=$LB_JOURNAL_MAX, SystemKeepFree=$LB_JOURNAL_KEEPFREE, файл ≤$LB_JOURNAL_FILEMAX, хранение $LB_JOURNAL_RETENTION."
+
+  # Ужимаем то, что уже накопилось. Именно vacuum-size, а не --rotate --vacuum-time=1s:
+  # журналы не удаляются целиком, остаётся история в пределах лимита.
+  if run_cmd "Ужимаю накопленный журнал до $LB_JOURNAL_MAX" journalctl --vacuum-size="$LB_JOURNAL_MAX"; then
+    info "Сейчас занято: $(journalctl --disk-usage 2>/dev/null || echo '?')"
+  else
+    warn "journalctl --vacuum-size вернул ошибку — журнал оставлен как есть."
+  fi
+}
+
+# ── Suricata ────────────────────────────────────────────────────────────────
+
+suricata_installed() {
+  command -v suricata >/dev/null 2>&1 && [[ -f "$SURICATA_YAML" ]]
+}
+
+# Проверяет suricata.yaml штатным тестом конфигурации и откатывает при ошибке.
+suricata_check_or_restore() {
+  if suricata -T -c "$SURICATA_YAML" >> "$LOG_FILE" 2>&1; then
+    ok "suricata -T -c $SURICATA_YAML — конфигурация валидна."
+    return 0
+  fi
+
+  fail "suricata -T отверг конфигурацию — откатываю $SURICATA_YAML."
+  if eclipse_restore_file "$SURICATA_YAML"; then
+    warn "Восстановлена предыдущая версия $SURICATA_YAML."
+  else
+    warn "Резервной копии нет — конфигурацию придётся чинить вручную."
+  fi
+  warn "Подробности: $LOG_FILE"
+  return 1
+}
+
+# default-log-level влияет ТОЛЬКО на служебные сообщения самой Suricata
+# (/var/log/suricata/suricata.log: загрузка правил, состояние потоков, ошибки).
+# Объём eve.json это НЕ ограничивает — там сетевые события, они управляются
+# составом eve-log types, а не уровнем логирования движка.
+suricata_set_log_level() {
+  local level="${1:-warning}" tmp current
+
+  suricata_installed || { info "Suricata не установлена — пропускаю."; return 0; }
+
+  if ! grep -qE '^[[:space:]]*default-log-level:' "$SURICATA_YAML"; then
+    warn "В $SURICATA_YAML нет ключа default-log-level — не добавляю его вслепую"
+    warn "(второй блок logging: сломал бы конфигурацию). Выставь вручную при необходимости."
+    return 1
+  fi
+
+  current="$(grep -m1 -E '^[[:space:]]*default-log-level:' "$SURICATA_YAML" | awk '{print $2}')"
+  if [[ "$current" == "$level" ]]; then
+    ok "Suricata: default-log-level уже $level."
+    return 0
+  fi
+
+  tmp="$(mktemp)" || return 1
+  # Меняем ТОЛЬКО первое вхождение и сохраняем исходный отступ — второй блок
+  # logging: не создаётся, структура YAML не трогается.
+  awk -v lvl="$level" '
+    !done && /^[[:space:]]*default-log-level:/ {
+      match($0, /^[[:space:]]*/)
+      print substr($0, 1, RLENGTH) "default-log-level: " lvl
+      done = 1
+      next
+    }
+    { print }
+  ' "$SURICATA_YAML" > "$tmp" || { rm -f "$tmp"; return 1; }
+
+  eclipse_backup_file "$SURICATA_YAML" > /dev/null || true
+  install -m 0644 "$tmp" "$SURICATA_YAML"
+  rm -f "$tmp"
+
+  suricata_check_or_restore || return 1
+
+  ok "Suricata: default-log-level $current → $level (служебный лог движка)."
+  info "На объём eve.json это НЕ влияет — там сетевые события, см. eve-log types."
+}
+
+# Печатает, какие типы событий сейчас пишутся в eve.json, и напоминает, что
+# именно из них потребляет Torrent Guard. Ничего не меняет.
+suricata_eve_report() {
+  suricata_installed || return 0
+
+  # Разбор по отступам, а не по «первой строке без дефиса»: у типов бывают
+  # вложенные параметры (`- alert:` + `payload: yes`), и наивный разбор
+  # обрывался бы на первом же из них.
+  local types
+  types="$(awk '
+    /^[[:space:]]*-[[:space:]]*eve-log:/ { in_eve = 1; next }
+    in_eve && !in_types && /^[[:space:]]*types:/ {
+      match($0, /^[[:space:]]*/); tind = RLENGTH; in_types = 1; next
+    }
+    in_types {
+      if ($0 ~ /^[[:space:]]*$/) next
+      match($0, /^[[:space:]]*/); ind = RLENGTH
+      is_item = ($0 ~ /^[[:space:]]*-[[:space:]]*[a-z]/)
+      if (ind < tind || (ind == tind && !is_item)) exit
+      if (!itemind && is_item) itemind = ind
+      if (is_item && ind == itemind) {
+        line = $0
+        sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+        sub(/:.*$/, "", line)
+        printf "%s ", line
+      }
+    }
+  ' "$SURICATA_YAML" 2>/dev/null)"
+
+  echo
+  info "eve.json, включённые типы событий: ${types:-<не разобрал, смотри $SURICATA_YAML>}"
+  info "Torrent Guard блокирует ИНЛАЙН: правила ds-p2p.rules имеют action drop, вердикт"
+  info "отдаётся ядру через NFQUEUE. Ни ds-guard, ни torrent-blocker eve.json не читают."
+  info "Меню «Torrent Guard → логи» читает только /var/log/suricata/fast.log — его не отключать."
+  info "Объём eve.json гонят flow/netflow/dns/tls/http/anomaly, а не alert/drop."
+}
+
+# ОПЦИОНАЛЬНО и только по явному согласию: оставить в eve.json alert и drop.
+# Включается ECLIPSE_EVE_MINIMAL=1. По умолчанию состав событий не меняется —
+# уменьшение объёма не стоит риска сломать диагностику вслепую.
+suricata_set_eve_types_minimal() {
+  suricata_installed || return 0
+
+  if [[ "$ECLIPSE_EVE_MINIMAL" != "1" ]]; then
+    info "Состав типов eve.json не меняю (ECLIPSE_EVE_MINIMAL=0)."
+    info "Свести к alert+drop: ECLIPSE_EVE_MINIMAL=1 $0 --log-limits"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)" || return 1
+
+  # Отступ новых элементов берём у первого существующего, а не «tind + 2»:
+  # YAML допускает список и на одном уровне с ключом, и жёсткое +2 в таком
+  # конфиге дало бы структурно неверный файл.
+  awk '
+    state == 0 && /^[[:space:]]*-[[:space:]]*eve-log:/ { state = 1; print; next }
+    state == 1 && /^[[:space:]]*types:[[:space:]]*$/ {
+      match($0, /^[[:space:]]*/); tind = RLENGTH
+      print
+      state = 2
+      next
+    }
+    state == 2 {
+      if ($0 ~ /^[[:space:]]*$/) next
+      match($0, /^[[:space:]]*/); ind = RLENGTH
+      is_item = ($0 ~ /^[[:space:]]*-[[:space:]]*[a-z]/)
+      if (!itemind && is_item) itemind = ind
+      if (ind > tind || (ind == tind && is_item)) next
+      state = 3
+      if (!itemind) itemind = tind + 2
+      printf "%*s- alert\n", itemind, ""
+      printf "%*s- drop\n",  itemind, ""
+    }
+    { print }
+    END {
+      # types: оказался последним блоком файла — элементы всё равно нужны.
+      if (state == 2) {
+        if (!itemind) itemind = tind + 2
+        printf "%*s- alert\n", itemind, ""
+        printf "%*s- drop\n",  itemind, ""
+      }
+    }
+  ' "$SURICATA_YAML" > "$tmp" || { rm -f "$tmp"; return 1; }
+
+  if cmp -s "$tmp" "$SURICATA_YAML"; then
+    rm -f "$tmp"
+    ok "eve-log types уже минимальны (alert, drop)."
+    return 0
+  fi
+
+  eclipse_backup_file "$SURICATA_YAML" > /dev/null || true
+  install -m 0644 "$tmp" "$SURICATA_YAML"
+  rm -f "$tmp"
+
+  suricata_check_or_restore || return 1
+
+  ok "eve.json сведён к типам alert и drop."
+  warn "Инлайн-блокировка от этого не зависит, но flow/dns/tls/http для разбора инцидентов больше не пишутся."
+}
+
+suricata_configure_logging() {
+  section "Suricata: уровень служебных логов и состав событий"
+
+  if ! suricata_installed; then
+    info "Suricata не установлена (слой A Torrent Guard не ставился) — пропускаю."
+    return 0
+  fi
+
+  local rc=0
+  suricata_set_log_level warning || rc=1
+  suricata_eve_report
+  suricata_set_eve_types_minimal || rc=1
+
+  # Suricata перечитывает конфигурацию только при рестарте. Делаем это, лишь
+  # если конфиг действительно изменился и он валиден — иначе оставляем как есть,
+  # чтобы не ронять инлайн-фильтрацию на ровном месте.
+  if [[ "$rc" -eq 0 ]] && systemctl is-active --quiet suricata 2>/dev/null; then
+    if run_cmd "Перезапускаю Suricata (новая конфигурация логирования)" systemctl restart suricata; then
+      sleep 2
+      if systemctl is-active --quiet suricata; then
+        ok "Suricata активна — инлайн-фильтрация NFQUEUE работает."
+      else
+        fail "Suricata не поднялась после рестарта. Смотри: journalctl -u suricata -n 50"
+        rc=1
+      fi
+    else
+      rc=1
+    fi
+  fi
+
+  return "$rc"
+}
+
+# ── logrotate для Suricata ──────────────────────────────────────────────────
+#
+# Пакет suricata ставит свой /etc/logrotate.d/suricata с шаблонами
+# /var/log/suricata/*.log и *.json — то есть он УЖЕ покрывает eve.json.
+# Свой конфиг мы поэтому не добавляем рядом (это был бы дубль пути и logrotate
+# перестал бы ротировать оба), а ЗАМЕНЯЕМ дистрибутивный, сохранив его копию.
+#
+# copytruncate вместо postrotate + SIGHUP: HUP заставляет Suricata переоткрыть
+# логи, но при -D и двух очередях NFQUEUE это лишний сигнал в горячий процесс.
+# copytruncate обрезает файл на месте, дескриптор остаётся валидным, движок
+# ничего не замечает. Цена — теряется то, что записалось между копией и
+# обрезкой (единицы строк), и на время копии нужно место под сам файл.
+install_suricata_logrotate() {
+  section "Ротация логов Suricata"
+
+  if ! suricata_installed; then
+    info "Suricata не установлена — ротацию для неё не настраиваю."
+    return 0
+  fi
+
+  if ! ensure_logrotate; then
+    warn "logrotate не установлен — ротация Suricata не настроена."
+    return 1
+  fi
+
+  ensure_log_budget
+
+  local tmp
+  tmp="$(mktemp)" || return 1
+
+  cat > "$tmp" <<SURI
+# Управляется менеджером Eclipse (bbr3-remnanode-auto.sh).
+# ЗАМЕНЯЕТ конфиг из пакета suricata (его копия — в /var/backups/eclipse-logs).
+# Не создавай второе правило на эти же пути: дубликат ломает ротацию обоих.
+#
+# maxsize, а не size: директива size отменяет суточный критерий и файл
+# ротировался бы ТОЛЬКО по объёму. maxsize = «раз в сутки ИЛИ раньше,
+# если перерос порог».
+#
+# copytruncate: suricata держит eve.json открытым; переименование оставило бы
+# её писать в старый inode.
+#
+# Цифры подобраны по размеру ФС с /var/log, а не заданы константой.
+
+# eve.json — основной поток сетевых событий, именно он дорастал до 8.3 ГБ.
+/var/log/suricata/eve.json
+{
+    daily
+    maxsize $LB_EVE_MAXSIZE
+    rotate $LB_EVE_ROTATE
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
+
+# Остальные логи: fast.log (его читает меню «Torrent Guard → логи»),
+# suricata.log, stats.log.
+#
+# Шаблона *.json здесь НЕТ намеренно: он матчил бы eve.json из блока выше, а
+# один и тот же файл в двух правилах — ошибка «duplicate log entry», после
+# которой logrotate бросает ВЕСЬ этот конфиг и не ротирует ничего. Если
+# добавишь свои eve-*.json выходы, заведи для них отдельный блок с явными
+# именами, не с маской.
+/var/log/suricata/*.log
+{
+    daily
+    maxsize $LB_SURI_MAXSIZE
+    rotate $LB_SURI_ROTATE
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
+SURI
+
+  if [[ -f "$SURICATA_LOGROTATE" ]] && cmp -s "$tmp" "$SURICATA_LOGROTATE"; then
+    rm -f "$tmp"
+    ok "Конфигурация ротации Suricata уже актуальна."
+  else
+    local backup
+    backup="$(eclipse_backup_file "$SURICATA_LOGROTATE")"
+    [[ -n "$backup" ]] && info "Резервная копия дистрибутивного конфига: $backup"
+
+    install -m 0644 "$tmp" "$SURICATA_LOGROTATE"
+    rm -f "$tmp"
+    ok "Конфигурация записана: $SURICATA_LOGROTATE"
+
+    logrotate_check_or_restore "$SURICATA_LOGROTATE" || return 1
+  fi
+
+  # Второе правило на eve.json где-нибудь ещё сделало бы ротацию мёртвой —
+  # проверяем явно и говорим прямо, а не молча.
+  local dupes
+  dupes="$(grep -rlE '/var/log/suricata/(\*|eve)' /etc/logrotate.d/ 2>/dev/null \
+    | grep -v "^$SURICATA_LOGROTATE$" || true)"
+  if [[ -n "$dupes" ]]; then
+    warn "Другие конфиги logrotate тоже ссылаются на /var/log/suricata:"
+    printf '%s\n' "$dupes" | sed 's/^/      /'
+    warn "Дубликат пути — ошибка «duplicate log entry», ротация обоих правил встаёт. Убери лишнее."
+  fi
+
+  info "Профиль $LB_LOG_TIER (ФС /var/log ${LB_LOG_GB} ГБ): eve.json $LB_EVE_MAXSIZE × $LB_EVE_ROTATE, прочие логи $LB_SURI_MAXSIZE × $LB_SURI_ROTATE."
+}
+
+# Отдельный таймер только для Suricata: суточной проверки мало, eve.json
+# способен набрать гигабайты за часы. Глобальный logrotate.timer при этом
+# остаётся суточным — переводить всю систему на hourly ради одного файла незачем.
+# Таймер запускает ОБЫЧНЫЙ logrotate (без --force): он сработает, только если
+# сработал критерий maxsize, и пользуется общим state-файлом
+# /var/lib/logrotate/status, поэтому с суточным запуском не конфликтует.
+install_suricata_logrotate_timer() {
+  section "Таймер проверки логов Suricata (каждые 6 часов)"
+
+  if ! suricata_installed; then
+    info "Suricata не установлена — таймер не нужен."
+    return 0
+  fi
+
+  cat > "$SURICATA_ROTATE_SERVICE" <<UNIT
+[Unit]
+Description=Eclipse: проверка размера логов Suricata (logrotate)
+Documentation=man:logrotate(8)
+ConditionPathExists=$SURICATA_LOGROTATE
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate $SURICATA_LOGROTATE
+Nice=10
+IOSchedulingClass=idle
+UNIT
+
+  cat > "$SURICATA_ROTATE_TIMER" <<'UNIT'
+[Unit]
+Description=Eclipse: проверять логи Suricata каждые 6 часов
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+  chmod 644 "$SURICATA_ROTATE_SERVICE" "$SURICATA_ROTATE_TIMER"
+
+  if ! run_shell "Включаю suricata-logrotate.timer" \
+    "systemctl daemon-reload && systemctl enable --now suricata-logrotate.timer"; then
+    warn "Таймер suricata-logrotate не включился. Смотри: systemctl status suricata-logrotate.timer"
+    return 1
+  fi
+
+  ok "Таймер активен: $(systemctl is-active suricata-logrotate.timer 2>/dev/null || echo inactive)"
+  info "Запускает только: /usr/sbin/logrotate $SURICATA_LOGROTATE (без --force)."
+}
+
+# ── Защита от заполнения диска ──────────────────────────────────────────────
+#
+# Лёгкая проверка раз в 30 минут. При предупреждении — только диагностика,
+# ничего не удаляется. При критическом пороге — ОБЫЧНЫЙ прогон logrotate и
+# ужатие журнала до 500 МБ. Никакого truncate живых логов, rm eve.json,
+# docker system prune и остановки сервисов: заполненный диск чинится
+# ротацией, а не потерей защиты от торрентов.
+install_disk_guard() {
+  section "Защита от заполнения диска (проверка каждые 30 минут)"
+
+  ensure_log_budget
+
+  # Генерируемый файл перезаписываем всегда: пороги считаются от размера диска,
+  # и после расширения раздела они должны обновиться. Ручные правки живут в
+  # отдельном .local-файле, который подключается ПОСЛЕ и потому имеет приоритет.
+  cat > "$DISK_GUARD_CONF" <<DGCONF
+# Пороги eclipse-disk-guard — ГЕНЕРИРУЕМЫЙ ФАЙЛ, правки будут затёрты.
+# Рассчитано по: ФС /var/log ${LB_LOG_GB} ГБ (профиль $LB_LOG_TIER).
+# Свои значения клади в $DISK_GUARD_LOCAL_CONF — он читается после этого файла.
+DISK_WARN=$LB_DISK_WARN_PCT
+DISK_CRIT=$LB_DISK_CRIT_PCT
+FREE_WARN_MB=$LB_FREE_WARN_MB
+FREE_CRIT_MB=$LB_FREE_CRIT_MB
+EVE_WARN_BYTES=$LB_EVE_WARN_BYTES
+EVE_CRIT_BYTES=$LB_EVE_CRIT_BYTES
+JOURNAL_KEEP=$LB_JOURNAL_MAX
+DGCONF
+  chmod 644 "$DISK_GUARD_CONF"
+  ok "Пороги пересчитаны: $DISK_GUARD_CONF"
+
+  if [[ ! -f "$DISK_GUARD_LOCAL_CONF" ]]; then
+    cat > "$DISK_GUARD_LOCAL_CONF" <<'DGLOCAL'
+# Локальные переопределения порогов eclipse-disk-guard.
+# Читается ПОСЛЕ сгенерированного конфига, поэтому здешние значения побеждают.
+# Менеджер этот файл не перезаписывает. Пример:
+#   DISK_WARN=90
+#   EVE_CRIT_BYTES=8589934592
+DGLOCAL
+    chmod 644 "$DISK_GUARD_LOCAL_CONF"
+    info "Файл для своих порогов: $DISK_GUARD_LOCAL_CONF"
+  else
+    info "Локальные переопределения: $DISK_GUARD_LOCAL_CONF (не трогаю)."
+  fi
+
+  {
+    cat <<DGHEAD
+#!/usr/bin/env bash
+# eclipse-disk-guard — следит за корневым разделом и объёмом логов.
+# Генерируется bbr3-remnanode-auto.sh, ручные правки затрутся.
+set -u
+
+CONF="$DISK_GUARD_CONF"
+LOCAL_CONF="$DISK_GUARD_LOCAL_CONF"
+SURICATA_LOGROTATE="$SURICATA_LOGROTATE"
+REMNANODE_LOGROTATE="$REMNANODE_LOGROTATE"
+ECLIPSE_LOGROTATE="$ECLIPSE_LOGROTATE"
+NODE_DIR_FILE="$NODE_DIR_FILE"
+DGHEAD
+
+    cat <<'DGBODY'
+EVE=/var/log/suricata/eve.json
+
+# Значения по умолчанию на случай, если конфигов нет вовсе.
+DISK_WARN=85
+DISK_CRIT=95
+FREE_WARN_MB=2048
+FREE_CRIT_MB=1024
+EVE_WARN_BYTES=1073741824
+EVE_CRIT_BYTES=2147483648
+JOURNAL_KEEP=500M
+
+# Порядок важен: сгенерированный конфиг, затем локальные переопределения.
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+# shellcheck disable=SC1090
+[ -r "$LOCAL_CONF" ] && . "$LOCAL_CONF"
+
+rc_total=0
+
+hum() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
+# df -P гарантирует POSIX-формат в одну строку: capacity — пятое поле,
+# доступные килобайты — четвёртое.
+disk_pct() { df -P / | awk 'NR == 2 { gsub(/%/, "", $5); print $5 }'; }
+disk_free_mb() { df -P -k / | awk 'NR == 2 { print int($4 / 1024) }'; }
+fsize() { [ -f "$1" ] && stat -c %s "$1" 2>/dev/null || echo 0; }
+
+# Крупнейшие файлы в /var/log. -xdev — не уходим на другие ФС.
+biggest_var_log() {
+  echo "  Крупнейшие файлы в /var/log:"
+  find /var/log -xdev -type f -printf '%s %p\n' 2>/dev/null \
+    | sort -rn | head -n 10 \
+    | while read -r sz path; do echo "    $(hum "$sz")  $path"; done
+}
+
+# Логи ноды на хосте, если они существуют обычными файлами.
+biggest_node_logs() {
+  local d found=0
+  for d in $(cat "$NODE_DIR_FILE" 2>/dev/null) /opt/remnanode /root/remnanode /home/*/remnanode /opt/*-Node; do
+    [ -d "$d/logs" ] || continue
+    found=1
+    find "$d/logs" -maxdepth 1 -type f -name '*.log' -printf '%s %p\n' 2>/dev/null
+  done | sort -rn | head -n 5 | while read -r sz path; do echo "    $(hum "$sz")  $path"; done
+  [ "$found" = 1 ] || echo "    (логи ноды обычными файлами на хосте не найдены)"
+}
+
+# Обычный прогон logrotate по конкретному конфигу: без --force, поэтому
+# ротация случится, только если сработал критерий maxsize.
+run_rotate() {
+  local conf="$1" rc
+  if [ ! -f "$conf" ]; then
+    echo "  logrotate: $conf отсутствует, пропускаю"
+    return 0
+  fi
+  /usr/sbin/logrotate "$conf"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "  logrotate $conf — выполнено"
+  else
+    echo "  ОШИБКА: logrotate $conf вернул rc=$rc"
+  fi
+  return "$rc"
+}
+
+pct="$(disk_pct)"
+free_mb="$(disk_free_mb)"
+eve_sz="$(fsize "$EVE")"
+
+# Если df вернул что-то неожиданное — говорим об этом, а не сравниваем мусор
+# с порогами (иначе проверка тихо «не срабатывала бы никогда»).
+case "${pct}|${free_mb}" in
+  *[!0-9|]*|'|'*|*'|')
+    echo "ОШИБКА: не удалось разобрать вывод df (занято='${pct}', свободно='${free_mb}')"
+    exit 1
+    ;;
+esac
+
+# Занятость больше 100% — не переполненный диск, а сдвинувшиеся колонки df.
+# Без этой проверки мусорное значение навсегда держало бы критический уровень.
+if [ "$pct" -gt 100 ]; then
+  echo "ОШИБКА: df вернул занятость ${pct}% — вывод не разобран, проверка пропущена"
+  exit 1
+fi
+
+echo "проверка: / занято ${pct}%, свободно ${free_mb} МБ, eve.json $(hum "$eve_sz")"
+
+# Процент и абсолютное свободное место — независимые триггеры. На 18 ГБ
+# показателен процент, на 1 ТБ он срабатывает задолго до реальной проблемы,
+# зато осмысленны оставшиеся гигабайты. Проверяем оба.
+level=ok
+if [ "$pct" -ge "$DISK_WARN" ] || [ "$free_mb" -lt "$FREE_WARN_MB" ] || [ "$eve_sz" -ge "$EVE_WARN_BYTES" ]; then
+  level=warn
+fi
+if [ "$pct" -ge "$DISK_CRIT" ] || [ "$free_mb" -lt "$FREE_CRIT_MB" ] || [ "$eve_sz" -ge "$EVE_CRIT_BYTES" ]; then
+  level=crit
+fi
+
+[ "$level" = ok ] && exit 0
+
+echo "  Логи ноды:"
+biggest_node_logs
+biggest_var_log
+
+if [ "$level" = warn ]; then
+  echo "ПРЕДУПРЕЖДЕНИЕ: занято ${pct}% (порог ${DISK_WARN}%), свободно ${free_mb} МБ (порог ${FREE_WARN_MB} МБ), eve.json $(hum "$eve_sz") (порог $(hum "$EVE_WARN_BYTES"))."
+  echo "  Ничего не удаляю: это только сигнал. Критические пороги — ${DISK_CRIT}% / ${FREE_CRIT_MB} МБ / $(hum "$EVE_CRIT_BYTES")."
+  exit 0
+fi
+
+echo "КРИТИЧНО: занято ${pct}% (порог ${DISK_CRIT}%), свободно ${free_mb} МБ (порог ${FREE_CRIT_MB} МБ), eve.json $(hum "$eve_sz") (порог $(hum "$EVE_CRIT_BYTES"))."
+echo "  Запускаю обычную ротацию и ужимаю журнал. Логи и контейнеры не трогаю."
+
+run_rotate "$SURICATA_LOGROTATE" || rc_total=$((rc_total + 1))
+run_rotate "$REMNANODE_LOGROTATE" || rc_total=$((rc_total + 1))
+run_rotate "$ECLIPSE_LOGROTATE" || rc_total=$((rc_total + 1))
+
+if journalctl --vacuum-size="$JOURNAL_KEEP" >/dev/null 2>&1; then
+  echo "  journalctl --vacuum-size=$JOURNAL_KEEP — выполнено"
+else
+  echo "  ОШИБКА: journalctl --vacuum-size=$JOURNAL_KEEP не выполнен"
+  rc_total=$((rc_total + 1))
+fi
+
+pct_after="$(disk_pct)"
+free_after="$(disk_free_mb)"
+eve_after="$(fsize "$EVE")"
+echo "РЕЗУЛЬТАТ: занято ${pct}% -> ${pct_after}%, свободно ${free_mb} -> ${free_after} МБ, eve.json $(hum "$eve_sz") -> $(hum "$eve_after")"
+
+if [ "$pct_after" -ge "$DISK_CRIT" ] || [ "$free_after" -lt "$FREE_CRIT_MB" ]; then
+  echo "ВНИМАНИЕ: диск всё ещё за критическим порогом (${pct_after}%, свободно ${free_after} МБ)."
+  echo "  Автоматика дальше не идёт намеренно: удаление живых логов, томов Docker"
+  echo "  и остановка Suricata/RemnaNode сломали бы защиту. Разбирайся вручную:"
+  echo "    du -xh --max-depth=2 / 2>/dev/null | sort -rh | head -20"
+  rc_total=$((rc_total + 1))
+fi
+
+exit "$rc_total"
+DGBODY
+  } > "$DISK_GUARD_BIN"
+
+  chmod 750 "$DISK_GUARD_BIN"
+  ok "Скрипт записан: $DISK_GUARD_BIN"
+
+  cat > "$DISK_GUARD_SERVICE" <<UNIT
+[Unit]
+Description=Eclipse: контроль заполнения диска и объёма логов
+
+[Service]
+Type=oneshot
+ExecStart=$DISK_GUARD_BIN
+SyslogIdentifier=eclipse-disk-guard
+Nice=10
+IOSchedulingClass=idle
+UNIT
+
+  cat > "$DISK_GUARD_TIMER" <<'UNIT'
+[Unit]
+Description=Eclipse: проверять диск и логи каждые 30 минут
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+  chmod 644 "$DISK_GUARD_SERVICE" "$DISK_GUARD_TIMER"
+
+  if ! run_shell "Включаю eclipse-disk-guard.timer" \
+    "systemctl daemon-reload && systemctl enable --now eclipse-disk-guard.timer"; then
+    warn "Таймер eclipse-disk-guard не включился. Смотри: systemctl status eclipse-disk-guard.timer"
+    return 1
+  fi
+
+  ok "Таймер активен: $(systemctl is-active eclipse-disk-guard.timer 2>/dev/null || echo inactive)"
+  info "Пороги: диск ${LB_DISK_WARN_PCT}% / ${LB_DISK_CRIT_PCT}%, свободно < ${LB_FREE_WARN_MB} / ${LB_FREE_CRIT_MB} МБ, eve.json > $(numfmt --to=iec --suffix=B "$LB_EVE_WARN_BYTES" 2>/dev/null) / $(numfmt --to=iec --suffix=B "$LB_EVE_CRIT_BYTES" 2>/dev/null)"
+  info "Смотреть отчёты: journalctl -t eclipse-disk-guard -n 50 --no-pager"
+}
+
+# ── Проверка итогового состояния ────────────────────────────────────────────
+eclipse_logs_validate() {
+  section "Проверка настроек логирования"
+
+  local rc=0
+
+  if command -v docker >/dev/null 2>&1; then
+    info "Драйвер логов Docker: $(docker info --format '{{.LoggingDriver}}' 2>/dev/null || echo '?')"
+    docker ps -q >/dev/null 2>&1 && docker inspect \
+      -f '{{.Name}} {{.HostConfig.LogConfig.Type}} {{json .HostConfig.LogConfig.Config}}' \
+      $(docker ps -q) 2>/dev/null | sed 's/^/      /' || true
+  fi
+
+  local f
+  for f in "$REMNANODE_LOGROTATE" "$ECLIPSE_LOGROTATE" "$SURICATA_LOGROTATE"; do
+    [[ -f "$f" ]] || continue
+    if logrotate -d "$f" >> "$LOG_FILE" 2>&1; then
+      ok "logrotate -d $f"
+    else
+      fail "logrotate -d $f — ошибка (подробности: $LOG_FILE)"
+      rc=1
+    fi
+  done
+
+  # Проверка по отдельным файлам не видит дубликатов МЕЖДУ ними. Единственный
+  # надёжный детектор «duplicate log entry» — прогон всей конфигурации разом.
+  if command -v logrotate >/dev/null 2>&1 && [[ -f /etc/logrotate.conf ]]; then
+    local dup
+    dup="$(logrotate -d /etc/logrotate.conf 2>&1 | grep -i 'duplicate log entry' || true)"
+    if [[ -n "$dup" ]]; then
+      fail "Найдены дубликаты путей в /etc/logrotate.d — эти правила НЕ работают:"
+      printf '%s\n' "$dup" | sed 's/^/      /'
+      rc=1
+    else
+      ok "logrotate -d /etc/logrotate.conf — дубликатов путей нет."
+    fi
+  fi
+
+  if suricata_installed; then
+    if suricata -T -c "$SURICATA_YAML" >> "$LOG_FILE" 2>&1; then
+      ok "suricata -T -c $SURICATA_YAML"
+    else
+      fail "suricata -T — конфигурация невалидна (подробности: $LOG_FILE)"
+      rc=1
+    fi
+    info "Suricata: $(systemctl is-active suricata 2>/dev/null || echo inactive)"
+  fi
+
+  local t
+  for t in logrotate.timer suricata-logrotate.timer eclipse-disk-guard.timer; do
+    systemctl list-unit-files 2>/dev/null | grep -q "^$t" || continue
+    info "$t: $(systemctl is-active "$t" 2>/dev/null || echo inactive) / $(systemctl is-enabled "$t" 2>/dev/null || echo disabled)"
+  done
+
+  [[ -f "$JOURNALD_DROPIN" ]] && ok "journald drop-in: $JOURNALD_DROPIN"
+
+  ensure_log_budget
+  log_budget_report
+
+  return "$rc"
+}
+
+# ── Откат всех изменений логирования ────────────────────────────────────────
+#
+# Восстанавливает из /var/backups/eclipse-logs всё, что менял менеджер, и
+# снимает добавленные юниты. Ничего не удаляет из логов и не трогает
+# контейнеры: откат конфигурации, а не очистка.
+eclipse_logs_rollback() {
+  section "Откат настроек логирования"
+
+  local f rc=0 restored=0
+
+  for f in "$DOCKER_DAEMON_JSON" "$SURICATA_LOGROTATE" "$REMNANODE_LOGROTATE" \
+           "$ECLIPSE_LOGROTATE" "$JOURNALD_DROPIN" "$SURICATA_YAML"; do
+    if eclipse_restore_file "$f"; then
+      ok "Восстановлен: $f"
+      restored=$((restored + 1))
+    else
+      info "Копии для $f нет — оставляю как есть."
+    fi
+  done
+
+  # docker-compose.yml ноды — путь зависит от установки.
+  local dir
+  dir="$(find_node_dir 2>/dev/null || true)"
+  if [[ -n "$dir" && -f "$dir/docker-compose.yml" ]]; then
+    if eclipse_restore_file "$dir/docker-compose.yml"; then
+      ok "Восстановлен: $dir/docker-compose.yml"
+      restored=$((restored + 1))
+      warn "Чтобы контейнер вернулся к прежней политике логов: cd $dir && docker compose up -d"
+    else
+      info "Копии docker-compose.yml нет — оставляю как есть."
+    fi
+  fi
+
+  # Юниты, которых до нас не было, — просто снимаем.
+  local u
+  for u in suricata-logrotate.timer suricata-logrotate.service \
+           eclipse-disk-guard.timer eclipse-disk-guard.service; do
+    systemctl disable --now "$u" >> "$LOG_FILE" 2>&1 || true
+  done
+  rm -f "$SURICATA_ROTATE_TIMER" "$SURICATA_ROTATE_SERVICE" \
+        "$DISK_GUARD_TIMER" "$DISK_GUARD_SERVICE" "$DISK_GUARD_BIN"
+  ok "Сняты таймеры suricata-logrotate и eclipse-disk-guard."
+  info "Пороги $DISK_GUARD_CONF и $DISK_GUARD_LOCAL_CONF оставлены (не мешают, удали вручную при желании)."
+
+  if ! run_shell "Перечитываю systemd и перезапускаю journald" \
+    "systemctl daemon-reload && systemctl restart systemd-journald"; then
+    warn "systemd-journald не перезапустился — проверь systemctl status systemd-journald"
+    rc=1
+  fi
+
+  if [[ -f "$DOCKER_DAEMON_JSON" ]] && command -v docker >/dev/null 2>&1; then
+    if docker_daemon_validate "$DOCKER_DAEMON_JSON"; then
+      run_cmd "Перезапускаю Docker (восстановленный daemon.json)" systemctl restart docker \
+        || { fail "Docker не перезапустился. Смотри: journalctl -u docker -n 50"; rc=1; }
+    else
+      fail "Восстановленный daemon.json не проходит валидацию — Docker не перезапускаю."
+      rc=1
+    fi
+  fi
+
+  if suricata_installed && systemctl is-active --quiet suricata 2>/dev/null; then
+    run_cmd "Перезапускаю Suricata (восстановленная конфигурация)" systemctl restart suricata \
+      || { fail "Suricata не поднялась. Смотри: journalctl -u suricata -n 50"; rc=1; }
   fi
 
   echo
-  info "Хранится: логи ноды 7 суток, логи менеджера 14 суток, сжатие включено."
-  info "Проверить вручную, ничего не меняя: logrotate --debug $ECLIPSE_LOGROTATE"
-  info "Прогнать принудительно: logrotate --force $ECLIPSE_LOGROTATE"
+  info "Восстановлено файлов: $restored. Копии остались в $ECLIPSE_BACKUP_DIR."
+  return "$rc"
+}
+
+# ── Единая точка входа ──────────────────────────────────────────────────────
+install_log_limits_all() {
+  section "Логи и диск: лимиты, ротация, защита"
+
+  local rc=0
+
+  disk_usage_report "до настройки"
+
+  # Считаем бюджет один раз здесь: дальше все шаги берут готовые LB_*.
+  eclipse_compute_log_budget
+  log_budget_report
+
+  docker_configure_logging            || rc=1
+  remnanode_apply_compose_logging     || rc=1
+  install_log_rotation                || rc=1
+  configure_journald_limits           || rc=1
+  suricata_configure_logging          || rc=1
+  install_suricata_logrotate          || rc=1
+  install_suricata_logrotate_timer    || rc=1
+  install_disk_guard                  || rc=1
+
+  eclipse_logs_validate || rc=1
+
+  disk_usage_report "после настройки"
+
+  echo
+  if [[ "$rc" -eq 0 ]]; then
+    ok "Лимиты логов настроены. Откат при необходимости: $0 --rollback-logs"
+  else
+    warn "Часть шагов завершилась с ошибкой — подробности выше и в $LOG_FILE."
+    warn "Откат: $0 --rollback-logs"
+  fi
+
+  return "$rc"
 }
 
 # ── Слой B: путь к логу, белый список, свой systemd-юнит ────────────────────
@@ -4055,6 +5510,14 @@ install_torrent_guard_layer() {
     warn "Слой A завершился с ошибкой. Лог: $TG_LOG"
     return 1
   fi
+
+  # Suricata только что появилась (или обновилась) — сразу ставим ей потолок.
+  # Без этого eve.json растёт неограниченно: на реальной ноде он доходил до
+  # 8.3 ГБ и забивал системный раздел целиком.
+  suricata_configure_logging       || warn "Логирование Suricata настроено не полностью."
+  install_suricata_logrotate       || warn "Ротация логов Suricata не настроена."
+  install_suricata_logrotate_timer || warn "Таймер ротации Suricata не настроен."
+  install_disk_guard               || warn "Защита от заполнения диска не настроена."
 }
 
 # Слой B: Go-блокер, который банит клиента по логам xray.
@@ -5232,6 +6695,15 @@ docker_rlimit_report() {
 # выставить даже расчётный потолок.
 write_node_compose() {
   local nofile="${1:-}" nproc="${2:-}" ulimits_block=""
+  local log_driver
+
+  # Политику логов пишем прямо в compose, а не полагаемся только на
+  # /etc/docker/daemon.json: значение из compose переживает любые правки
+  # daemon.json и гарантированно применяется к контейнеру ноды при
+  # `docker compose up -d`. Без него нода писала бы stdout/stderr по
+  # дефолту docker — json-file без потолка на старых установках.
+  ensure_log_budget
+  log_driver="$(resolve_node_log_driver)"
 
   if [[ -n "$nofile" && -n "$nproc" ]]; then
     ulimits_block="    ulimits:
@@ -5253,6 +6725,12 @@ services:
     image: remnawave/node:latest
     network_mode: host
     restart: always
+    logging:
+      driver: "$log_driver"
+      options:
+        max-size: "$LB_DOCKER_MAXSIZE"
+        max-file: "$LB_DOCKER_MAXFILE"
+        compress: "true"
     cap_add:
       - NET_ADMIN
     volumes:
@@ -6622,6 +8100,9 @@ stage_after_reboot() {
   optional_speedtest
   step_transport_setup
   setup_remnanode
+  # Лимиты логов и защита диска — после ноды: к этому моменту существуют и
+  # docker-compose.yml, и каталог логов, поэтому настраивается всё разом.
+  install_log_limits_all || warn "Лимиты логов настроены не полностью — см. выше."
   cleanup_continue_hook
 
   echo
@@ -6695,6 +8176,7 @@ install_node_only() {
   install_docker
   step_transport_setup
   setup_remnanode
+  install_log_limits_all || warn "Лимиты логов настроены не полностью — см. выше."
 
   NODE_ONLY=0
 
@@ -7235,6 +8717,56 @@ eclipse_firewall_menu() {
   done
 }
 
+logs_and_disk_menu() {
+  local choice
+
+  while true; do
+    clear_screen
+    print_banner
+
+    echo "${C_BOLD}Логи и диск:${C_RESET}"
+    echo
+    echo "  ${C_GREEN}1${C_RESET}) Настроить всё ${C_DIM}(docker, нода, journald, Suricata, ротация, disk guard)${C_RESET}"
+    echo "  ${C_CYAN}2${C_RESET}) Показать текущее состояние и проверки"
+    echo "  ${C_CYAN}3${C_RESET}) Только ротация логов ноды и менеджера"
+    echo "  ${C_CYAN}4${C_RESET}) Только Suricata: уровень логов, ротация, таймер 6ч"
+    echo "  ${C_CYAN}5${C_RESET}) Только защита от заполнения диска (таймер 30 мин)"
+    echo "  ${C_CYAN}6${C_RESET}) Прогнать проверку диска прямо сейчас"
+    echo "  ${C_YELLOW}9${C_RESET}) Откатить изменения логирования из резервных копий"
+    echo "  ${C_YELLOW}0${C_RESET}) Назад"
+    echo
+
+    ask choice "  Выбор [1..6/9/0]: " || choice="0"
+
+    case "${choice:-}" in
+      1) clear_screen; install_log_limits_all; pause_menu ;;
+      2) clear_screen; eclipse_logs_validate; disk_usage_report "сейчас"; pause_menu ;;
+      3) clear_screen; install_log_rotation; pause_menu ;;
+      4)
+        clear_screen
+        suricata_configure_logging
+        install_suricata_logrotate
+        install_suricata_logrotate_timer
+        pause_menu
+        ;;
+      5) clear_screen; install_disk_guard; pause_menu ;;
+      6)
+        clear_screen
+        section "Проверка диска (разовый запуск)"
+        if [[ -x "$DISK_GUARD_BIN" ]]; then
+          "$DISK_GUARD_BIN" | sed 's/^/    /' || warn "Проверка вернула ненулевой код — смотри вывод выше."
+        else
+          warn "Disk guard не установлен — пункт 5 или 1."
+        fi
+        pause_menu
+        ;;
+      9) clear_screen; eclipse_logs_rollback; pause_menu ;;
+      0|q|Q) return 0 ;;
+      *) warn "Неверный выбор: ${choice:-empty}"; sleep 1 ;;
+    esac
+  done
+}
+
 main_menu() {
   need_root
   ensure_eclipse_command
@@ -7257,16 +8789,17 @@ main_menu() {
     echo "  ${C_CYAN}10${C_RESET}) Eclipse Firewall (nftables): порт ноды для панели + защита"
     echo "  ${C_CYAN}11${C_RESET}) Ограничение канала ${C_DIM}(исходящая скорость, Мбит/с)${C_RESET}"
     echo "  ${C_GREEN}12${C_RESET}) Установка ноды ${C_DIM}(только нода и конфиг, без тюнингов)${C_RESET}"
+    echo "  ${C_CYAN}13${C_RESET}) Логи и диск ${C_DIM}(лимиты docker/journald/Suricata, ротация, защита диска)${C_RESET}"
     echo "  ${C_YELLOW}0${C_RESET}) Выход"
     echo
 
-    ask choice "  Выбор [1..12/0]: " || choice="0"
+    ask choice "  Выбор [1..13/0]: " || choice="0"
 
     # Перед выполнением пункта чистим экран, чтобы на нём остался только вывод
     # этого пункта. Неверный выбор сюда не попадает — его предупреждение должно
     # быть видно на фоне меню.
     case "${choice:-}" in
-      [1-9]|1[0-2]) clear_screen ;;
+      [1-9]|1[0-3]) clear_screen ;;
     esac
 
     case "${choice:-}" in
@@ -7315,6 +8848,9 @@ main_menu() {
       12)
         install_node_only
         pause_menu
+        ;;
+      13)
+        logs_and_disk_menu
         ;;
       0|q|Q|exit|quit)
         echo "Выход."
@@ -7369,6 +8905,23 @@ case "${1:-}" in
     need_root
     install_log_rotation
     ;;
+  --log-limits|log-limits|--logs|logs)
+    need_root
+    install_log_limits_all
+    ;;
+  --rollback-logs|rollback-logs)
+    need_root
+    eclipse_logs_rollback
+    ;;
+  --disk-guard|disk-guard)
+    need_root
+    install_disk_guard
+    ;;
+  --logs-check|logs-check)
+    need_root
+    eclipse_logs_validate
+    disk_usage_report "сейчас"
+    ;;
   --bandwidth|--limit|bandwidth|limit)
     need_root
     manage_bandwidth
@@ -7410,6 +8963,10 @@ case "${1:-}" in
   $0 --torrent-blocker  установить/обновить оба слоя Torrent Guard
   $0 --torrent-status   статус анти-торрент защиты
   $0 --logrotate        настроить суточную ротацию логов ноды и менеджера
+  $0 --log-limits       лимиты логов целиком: docker, ноду, journald, Suricata, disk guard
+  $0 --logs-check       проверить текущие настройки логирования и занятость диска
+  $0 --disk-guard       только защита от заполнения диска (таймер каждые 30 мин)
+  $0 --rollback-logs    откатить все изменения логирования из резервных копий
   $0 --bandwidth        ограничение исходящей скорости (Мбит/с)
   $0 --xray-core        обновить ядро Xray в контейнере ноды
   $0 --firewall         настройка портов (UFW)
