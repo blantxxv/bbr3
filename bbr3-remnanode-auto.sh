@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGS=("$@")
 
-SCRIPT_VERSION="3.8.1"
+SCRIPT_VERSION="3.9.0"
 
 STATE_DIR="/var/lib/bbr3-remnanode"
 STATE_FILE="$STATE_DIR/state"
@@ -107,6 +107,24 @@ TAG_SUFFIX=""
 # встроенное в образ remnawave/node). Заполняется, если при установке выбрали
 # конкретную версию ядра.
 XRAY_VOLUME_LINE=""
+
+# ── Версия образа ноды ──────────────────────────────────────────────────────
+#
+# remnawave/node 3.x ломает совместимость со старыми клиентами: внутри едет
+# новый Xray, и REALITY начинает отбраковывать клиентов по версии. Поэтому тег
+# образа больше не зашит как `latest`, а спрашивается при установке:
+#   • стабильная ветка 2.x — работает со старыми клиентами как раньше;
+#   • актуальная 3.x — в realitySettings дополнительно пишется
+#     "minClientVer": "0.0.0", чтобы старые клиенты не отваливались.
+#
+# minClientVer относится ТОЛЬКО к REALITY: в TLS-инбаунде такого поля нет.
+NODE_IMAGE_REPO="remnawave/node"
+DEFAULT_NODE_IMAGE_STABLE="2.8.0"
+NODE_IMAGE_TAG=""
+NODE_IMAGE_TAG_FILE="$STATE_DIR/node_image_tag"
+
+# Значение minClientVer для realitySettings (пусто = поле не пишем вовсе).
+REALITY_MIN_CLIENT_VER=""
 
 # Тип установки: "reality" (TCP+REALITY, как раньше) или "tls" (TCP+TLS со своим доменом)
 NODE_INSTALL_TYPE=""
@@ -6650,9 +6668,9 @@ generate_vless_encryption() {
   #   "encryption": "mlkem768x25519plus.native.0rtt...."
   # Берём первую (X25519) — короче и достаточно (обмен ключами всё равно
   # пост-квантовый). Пробуем оба способа вызова xray в образе.
-  out="$(docker run --rm --entrypoint xray remnawave/node:latest vlessenc 2>/dev/null || true)"
+  out="$(docker run --rm --entrypoint xray "$(node_image)" vlessenc 2>/dev/null || true)"
   if [[ -z "$out" ]]; then
-    out="$(docker run --rm remnawave/node:latest xray vlessenc 2>/dev/null || true)"
+    out="$(docker run --rm "$(node_image)" xray vlessenc 2>/dev/null || true)"
   fi
 
   [[ -n "$out" ]] || return 1
@@ -6679,10 +6697,10 @@ generate_vless_encryption() {
 generate_reality_keys() {
   local out priv pub
 
-  out="$(docker run --rm --entrypoint xray remnawave/node:latest x25519 2>/dev/null || true)"
+  out="$(docker run --rm --entrypoint xray "$(node_image)" x25519 2>/dev/null || true)"
 
   if [[ -z "$out" ]]; then
-    out="$(docker run --rm remnawave/node:latest xray x25519 2>/dev/null || true)"
+    out="$(docker run --rm "$(node_image)" xray x25519 2>/dev/null || true)"
   fi
 
   [[ -n "$out" ]] || return 1
@@ -6706,6 +6724,11 @@ generate_reality_panel_config() {
   section "Конфиг REALITY для панели"
 
   local short_id keys priv_key pub_key config_path suffix hy2_block=""
+
+  # Тег образа нужен ДО генерации ключей: ключи и vlessenc считаются запуском
+  # xray из этого же образа.
+  [[ -n "$NODE_IMAGE_TAG" ]] || load_node_image_tag
+  resolve_min_client_ver
 
   suffix="${TAG_SUFFIX:-$(gen_tag_suffix)}"
   short_id="$(openssl rand -hex 8)"
@@ -6742,6 +6765,18 @@ $(hysteria2_inbound_json '    ')"
 
   config_path="$REMNANODE_DIR/panel-inbounds.json"
 
+  # minClientVer нужен на образах 3.x: там едет новый Xray, который сам по себе
+  # отсекает клиентов на старых версиях. "0.0.0" снимает это ограничение и
+  # возвращает поведение 2.x. На 2.x поле не пишем вовсе — конфиг остаётся
+  # таким же, как раньше. Поле относится ТОЛЬКО к REALITY: в TLS-инбаунде
+  # (generate_tls_panel_config) его нет и быть не должно.
+  local min_client_line=""
+
+  if [[ -n "$REALITY_MIN_CLIENT_VER" ]]; then
+    min_client_line="
+          \"minClientVer\": \"$REALITY_MIN_CLIENT_VER\","
+  fi
+
   # loglevel warning, а не info: info пишет в error.log каждое соединение и на
   # нагруженной ноде даёт десятки МБ в сутки на пустом месте. На access.log это
   # не влияет — он управляется полем "access" и продолжает писаться (его читает
@@ -6775,7 +6810,7 @@ $(hysteria2_inbound_json '    ')"
         "network": "raw",
         "security": "reality",
         "realitySettings": {
-          "target": "$REALITY_TARGET",
+          "target": "$REALITY_TARGET",${min_client_line}
           "shortIds": [
             "$short_id"
           ],
@@ -6860,6 +6895,10 @@ EOF_REALITY
   echo
   echo "  ${C_BOLD}Публичный ключ (publicKey) для клиента/панели:${C_RESET} $pub_key"
   echo "  ${C_BOLD}shortId:${C_RESET} $short_id"
+  echo "  ${C_BOLD}Образ ноды:${C_RESET} $(node_image)"
+  if [[ -n "$REALITY_MIN_CLIENT_VER" ]]; then
+    echo "  ${C_BOLD}minClientVer:${C_RESET} $REALITY_MIN_CLIENT_VER ${C_DIM}(образ 3.x — без этого поля старые клиенты отваливаются)${C_RESET}"
+  fi
   if [[ -n "$hy2_block" ]]; then
     echo
     echo "  ${C_BOLD}Hysteria2 включён и лежит в этом же конфиге:${C_RESET}"
@@ -6996,6 +7035,132 @@ docker_rlimit_report() {
   echo "nofile=$nofile, nproc=$nproc"
 }
 
+# ── Выбор версии образа remnawave/node ──────────────────────────────────────
+
+# Полное имя образа с выбранным тегом. Везде, где раньше стояло
+# remnawave/node:latest, теперь вызывается эта функция.
+node_image() {
+  echo "${NODE_IMAGE_REPO}:${NODE_IMAGE_TAG:-latest}"
+}
+
+save_node_image_tag() {
+  mkdir -p "$STATE_DIR"
+  echo "${NODE_IMAGE_TAG:-latest}" > "$NODE_IMAGE_TAG_FILE"
+}
+
+load_node_image_tag() {
+  if [[ -z "$NODE_IMAGE_TAG" && -f "$NODE_IMAGE_TAG_FILE" ]]; then
+    NODE_IMAGE_TAG="$(tr -d '[:space:]' < "$NODE_IMAGE_TAG_FILE" 2>/dev/null || true)"
+  fi
+  [[ -n "$NODE_IMAGE_TAG" ]] || NODE_IMAGE_TAG="latest"
+}
+
+# Список тегов образа с Docker Hub (по одному в строке). Пусто — сеть/API
+# недоступны; вызывающий обязан пережить это и предложить дефолты.
+node_image_tags() {
+  local json
+
+  json="$(curl -fsSL --connect-timeout 5 --max-time 20 \
+    "https://hub.docker.com/v2/repositories/${NODE_IMAGE_REPO}/tags/?page_size=100&ordering=last_updated" \
+    2>/dev/null || true)"
+
+  [[ -n "$json" ]] || return 1
+
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json" | jq -r '.results[]?.name' 2>/dev/null
+  else
+    printf '%s' "$json" | grep -oE '"name":[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/'
+  fi
+}
+
+# Самый свежий тег вида x.y.z из списка $1. $2 — мажорная версия ("2"), пусто —
+# любая. sort -V, а не порядок выдачи API: Docker Hub сортирует по времени
+# пуша, и пересобранный старый тег оказался бы «самым свежим».
+node_tag_pick() {
+  local list="${1:-}" major="${2:-}" filtered
+
+  filtered="$(printf '%s\n' "$list" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+  [[ -n "$major" ]] && filtered="$(printf '%s\n' "$filtered" | grep -E "^${major}\." || true)"
+
+  printf '%s\n' "$filtered" | awk 'NF' | sort -V | tail -n1
+}
+
+node_tag_major() {
+  local t="${1:-}"
+  [[ "$t" =~ ^v?([0-9]+)\. ]] && echo "${BASH_REMATCH[1]}" || echo ""
+}
+
+# Заполняет REALITY_MIN_CLIENT_VER по выбранному тегу образа.
+#
+# Мажор 3+ → пишем "0.0.0": иначе новый Xray внутри образа режет клиентов на
+# старых версиях. Мажор 2 → поле не нужно, конфиг остаётся как раньше.
+# Неразобранный тег (latest, dev, кастомный) считаем новым — сейчас latest это
+# как раз 3.x, и лишний minClientVer безвреден, а его отсутствие ломает клиентов.
+resolve_min_client_ver() {
+  local major
+  major="$(node_tag_major "${NODE_IMAGE_TAG:-latest}")"
+
+  if [[ -z "$major" ]] || (( major >= 3 )); then
+    REALITY_MIN_CLIENT_VER="0.0.0"
+  else
+    REALITY_MIN_CLIENT_VER=""
+  fi
+}
+
+# Спрашивает тег образа ноды. Печатает меню и заполняет NODE_IMAGE_TAG,
+# REALITY_MIN_CLIENT_VER, сохраняет выбор в state.
+ask_node_image_version() {
+  section "Версия образа ноды (remnawave/node)"
+
+  local tags latest_tag stable_tag choice input
+
+  tags="$(node_image_tags || true)"
+  latest_tag="$(node_tag_pick "$tags" '')"
+  stable_tag="$(node_tag_pick "$tags" '2')"
+  [[ -n "$stable_tag" ]] || stable_tag="$DEFAULT_NODE_IMAGE_STABLE"
+
+  if [[ -z "$tags" ]]; then
+    warn "Список тегов с Docker Hub получить не удалось — показываю известные версии."
+  fi
+
+  echo
+  info "Ветка 3.x ломает совместимость со старыми клиентами (внутри новый Xray,"
+  info "REALITY отбраковывает клиентов по версии). Если клиенты не обновлены —"
+  info "бери стабильную 2.x."
+  echo
+  echo "  ${C_GREEN}1${C_RESET}) Стабильная: ${stable_tag}  ${C_DIM}(рекомендуется, старые клиенты работают)${C_RESET}"
+  echo "  ${C_GREEN}2${C_RESET}) Актуальная: ${latest_tag:-latest}  ${C_DIM}(допишу minClientVer 0.0.0 в REALITY)${C_RESET}"
+  echo "  ${C_GREEN}3${C_RESET}) Ввести тег вручную ${C_DIM}(например 2.7.4 или latest)${C_RESET}"
+  echo
+
+  while true; do
+    ask choice "  Выбор [1/2/3]: "
+
+    case "${choice:-1}" in
+      1) NODE_IMAGE_TAG="$stable_tag"; break ;;
+      2) NODE_IMAGE_TAG="${latest_tag:-latest}"; break ;;
+      3)
+        ask input "  Тег образа: "
+        input="$(echo "${input:-}" | tr -d '[:space:]')"
+        if [[ -n "$input" && "$input" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+          NODE_IMAGE_TAG="$input"
+          break
+        fi
+        warn "Некорректный тег."
+        ;;
+      *) warn "Некорректный выбор. Введи 1, 2 или 3." ;;
+    esac
+  done
+
+  save_node_image_tag
+  resolve_min_client_ver
+
+  ok "Образ ноды: $(node_image)"
+  if [[ -n "$REALITY_MIN_CLIENT_VER" ]]; then
+    info "В realitySettings будет добавлено \"minClientVer\": \"$REALITY_MIN_CLIENT_VER\" — без него старые клиенты отвалятся."
+  fi
+}
+
 # Пишет docker-compose.yml ноды. $1/$2 — лимиты nofile/nproc. Если аргументов
 # нет, блок ulimits не пишется вовсе — это аварийный откат, когда ядро не даёт
 # выставить даже расчётный потолок.
@@ -7010,6 +7175,10 @@ write_node_compose() {
   # дефолту docker — json-file без потолка на старых установках.
   ensure_log_budget
   log_driver="$(resolve_node_log_driver)"
+
+  # Аварийный перезапуск без ulimits тоже проходит здесь — тег образа должен
+  # остаться тем же, что выбрали при установке, а не откатиться на latest.
+  [[ -n "$NODE_IMAGE_TAG" ]] || load_node_image_tag
 
   if [[ -n "$nofile" && -n "$nproc" ]]; then
     ulimits_block="    ulimits:
@@ -7028,7 +7197,7 @@ services:
   remnanode:
     container_name: $CONTAINER_NAME
     hostname: $CONTAINER_NAME
-    image: remnawave/node:latest
+    image: $(node_image)
     network_mode: host
     restart: always
     logging:
@@ -7057,6 +7226,7 @@ setup_remnanode() {
   section "12/12 · Remnawave Node"
 
   prepare_node_paths
+  ask_node_image_version
   ask_node_port
 
   if [[ "$NODE_INSTALL_TYPE" == "tls" ]]; then
@@ -7154,8 +7324,8 @@ EOF_ENV
 
   write_node_compose "$nofile_limit" "$nproc_limit"
 
-  if ! pull_docker_image_with_fallback "remnawave/node:latest"; then
-    warn "Образ remnawave/node:latest не удалось скачать заранее. docker compose up всё равно попробует сам."
+  if ! pull_docker_image_with_fallback "$(node_image)"; then
+    warn "Образ $(node_image) не удалось скачать заранее. docker compose up всё равно попробует сам."
   fi
 
   local up_ok=0 up_attempt=0 up_max=3 rlimit_fallback_done=0
@@ -7526,6 +7696,134 @@ update_xray_core() {
   fi
 
   ok "Обновление ядра Xray завершено."
+}
+
+# Приводит локальную копию panel-inbounds.json в соответствие с выбранным
+# образом: на 3.x добавляет minClientVer в каждый REALITY-инбаунд, на 2.x —
+# убирает. Файл на ноде — это КОПИЯ того, что лежит в панели, поэтому после
+# правки всё равно нужно перенести конфиг в панель руками.
+sync_panel_config_min_client_ver() {
+  local config="$1" tmp
+
+  [[ -f "$config" ]] || return 0
+  grep -q 'realitySettings' "$config" 2>/dev/null || return 0
+
+  if ! ensure_jq; then
+    warn "jq не установлен — panel-inbounds.json не правлю."
+    return 1
+  fi
+
+  tmp="$(mktemp)" || return 1
+
+  if [[ -n "$REALITY_MIN_CLIENT_VER" ]]; then
+    jq --arg v "$REALITY_MIN_CLIENT_VER" '
+      (.inbounds[]? | select(.streamSettings?.realitySettings) | .streamSettings.realitySettings.minClientVer) = $v
+    ' "$config" > "$tmp" || { rm -f "$tmp"; fail "jq не смог обновить $config"; return 1; }
+  else
+    jq '
+      (.inbounds[]? | select(.streamSettings?.realitySettings) | .streamSettings.realitySettings) |= del(.minClientVer)
+    ' "$config" > "$tmp" || { rm -f "$tmp"; fail "jq не смог обновить $config"; return 1; }
+  fi
+
+  if cmp -s "$tmp" "$config"; then
+    rm -f "$tmp"
+    ok "panel-inbounds.json уже соответствует выбранному образу."
+    return 0
+  fi
+
+  eclipse_backup_file "$config" > /dev/null || true
+  install -m 0600 "$tmp" "$config"
+  rm -f "$tmp"
+
+  if [[ -n "$REALITY_MIN_CLIENT_VER" ]]; then
+    ok "В $config проставлен \"minClientVer\": \"$REALITY_MIN_CLIENT_VER\"."
+  else
+    ok "Из $config убран minClientVer (для ветки 2.x он не нужен)."
+  fi
+
+  warn "Это локальная копия. Перенеси обновлённый конфиг в инбаунды ноды в панели Remnawave — иначе изменение ни на что не повлияет."
+}
+
+# Меняет версию образа remnawave/node у уже установленной ноды: правит
+# docker-compose.yml, тянет образ, пересоздаёт контейнер и синхронизирует
+# minClientVer в локальной копии конфига панели.
+manage_node_image() {
+  section "Версия образа ноды (remnawave/node)"
+
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Docker не установлен — менять образ ноды негде."
+    return 1
+  fi
+
+  local node_dir compose current_image
+  node_dir="$(find_node_dir || true)"
+
+  if [[ -z "$node_dir" ]]; then
+    warn "Не удалось найти установленную ноду (docker-compose.yml с remnawave/node)."
+    info "Сначала установи ноду (пункт 1 или 12)."
+    return 1
+  fi
+
+  REMNANODE_DIR="$node_dir"
+  compose="$REMNANODE_DIR/docker-compose.yml"
+  cd "$REMNANODE_DIR"
+  ok "Нода найдена: $REMNANODE_DIR"
+
+  current_image="$(grep -m1 -E '^[[:space:]]*image:[[:space:]]*remnawave/node' "$compose" 2>/dev/null \
+    | sed -E 's/^[[:space:]]*image:[[:space:]]*//' | tr -d '[:space:]')"
+  ok "Текущий образ в compose: ${current_image:-<не разобран>}"
+
+  local running_ver
+  running_ver="$(detect_current_xray_version || true)"
+  [[ -n "$running_ver" ]] && info "Xray внутри контейнера сейчас: $running_ver"
+
+  # Сбрасываем сохранённый тег, чтобы ask_node_image_version спросил заново,
+  # а не молча взял прошлый выбор.
+  NODE_IMAGE_TAG=""
+  ask_node_image_version
+
+  local new_image
+  new_image="$(node_image)"
+
+  if [[ "$current_image" == "$new_image" ]]; then
+    info "В compose уже прописан $new_image."
+  else
+    eclipse_backup_file "$compose" > /dev/null || true
+    sed -i -E "s~^([[:space:]]*image:[[:space:]]*)remnawave/node.*$~\1${new_image}~" "$compose"
+
+    if ! grep -qF "image: $new_image" "$compose"; then
+      fail "Не удалось переписать строку image в $compose — правь вручную."
+      return 1
+    fi
+    ok "В compose прописан образ $new_image."
+  fi
+
+  if ! pull_docker_image_with_fallback "$new_image"; then
+    warn "Образ $new_image скачать заранее не удалось. docker compose up всё равно попробует сам."
+  fi
+
+  run_cmd "Останавливаю ноду" docker_compose down || warn "docker compose down вернул ошибку — продолжаю."
+
+  if ! run_cmd "Запускаю ноду на образе $new_image" docker_compose up -d; then
+    warn "Нода не поднялась на новом образе. Смотри: cd $REMNANODE_DIR && docker compose logs -f --tail=100"
+    warn "Откатиться: верни строку image в $compose (копия в $ECLIPSE_BACKUP_DIR) и повтори docker compose up -d."
+    return 1
+  fi
+
+  sleep 3
+  local new_ver
+  new_ver="$(detect_current_xray_version || true)"
+  [[ -n "$new_ver" ]] && ok "Xray внутри контейнера после запуска: $new_ver"
+
+  sync_panel_config_min_client_ver "$REMNANODE_DIR/panel-inbounds.json" || true
+
+  echo
+  if [[ -n "$REALITY_MIN_CLIENT_VER" ]]; then
+    warn "Ветка 3.x: в REALITY-инбаунде в панели должно стоять \"minClientVer\": \"$REALITY_MIN_CLIENT_VER\", иначе старые клиенты отвалятся."
+  else
+    info "Ветка 2.x: minClientVer в конфиге не нужен."
+  fi
+  ok "Версия образа ноды изменена."
 }
 
 # Прописывает в rc-файлы функцию clear, которая чистит и буфер прокрутки.
@@ -9170,16 +9468,17 @@ main_menu() {
     echo "  ${C_CYAN}11${C_RESET}) Ограничение канала ${C_DIM}(исходящая скорость, Мбит/с)${C_RESET}"
     echo "  ${C_GREEN}12${C_RESET}) Установка ноды ${C_DIM}(только нода и конфиг, без тюнингов)${C_RESET}"
     echo "  ${C_CYAN}13${C_RESET}) Логи и диск ${C_DIM}(лимиты docker/journald/Suricata, ротация, защита диска)${C_RESET}"
+    echo "  ${C_CYAN}14${C_RESET}) Версия образа ноды ${C_DIM}(2.x — старые клиенты, 3.x — minClientVer)${C_RESET}"
     echo "  ${C_YELLOW}0${C_RESET}) Выход"
     echo
 
-    ask choice "  Выбор [1..13/0]: " || choice="0"
+    ask choice "  Выбор [1..14/0]: " || choice="0"
 
     # Перед выполнением пункта чистим экран, чтобы на нём остался только вывод
     # этого пункта. Неверный выбор сюда не попадает — его предупреждение должно
     # быть видно на фоне меню.
     case "${choice:-}" in
-      [1-9]|1[0-3]) clear_screen ;;
+      [1-9]|1[0-4]) clear_screen ;;
     esac
 
     case "${choice:-}" in
@@ -9231,6 +9530,10 @@ main_menu() {
         ;;
       13)
         logs_and_disk_menu
+        ;;
+      14)
+        manage_node_image
+        pause_menu
         ;;
       0|q|Q|exit|quit)
         echo "Выход."
@@ -9310,6 +9613,10 @@ case "${1:-}" in
     need_root
     update_xray_core
     ;;
+  --node-image|--node-version|node-image)
+    need_root
+    manage_node_image
+    ;;
   --firewall|--ufw|firewall|ufw)
     need_root
     manage_firewall
@@ -9349,6 +9656,7 @@ case "${1:-}" in
   $0 --rollback-logs    откатить все изменения логирования из резервных копий
   $0 --bandwidth        ограничение исходящей скорости (Мбит/с)
   $0 --xray-core        обновить ядро Xray в контейнере ноды
+  $0 --node-image       сменить версию образа ноды (2.x / 3.x + minClientVer)
   $0 --firewall         настройка портов (UFW)
   $0 --panel-port       порт ноды только для панели (nftables)
 
